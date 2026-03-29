@@ -4,15 +4,6 @@
 binary format. That lets CBMC act as a verification back-end for any language
 that can emit LLVM IR.
 
-```text
-LLVM IR / bitcode
-  -> inkwell
-  -> llvm2cprover lowering
-  -> cprover_bindings
-  -> GOTO binary
-  -> CBMC
-```
-
 ## Prerequisites
 
 - **LLVM 22 or later** — inkwell links against LLVM via llvm-sys; the headers
@@ -84,6 +75,31 @@ Supported directives:
 - `ensures`: inserts a post-call `__CPROVER_assert(...)`
 - `model`: redirects direct calls to a helper function
 - `assigns`: attaches CBMC assigns metadata and generates extern stub bodies
+
+## Design
+
+Overview of the current design:
+
+```text
+LLVM IR / bitcode
+  -> inkwell
+  -> llvm2cprover lowering
+  -> cprover_bindings
+  -> GOTO binary
+  -> CBMC
+```
+
+For contracts, instead of inventing a new expression language, `llvm2cprover`
+expects contract helpers to be ordinary compiled LLVM functions and uses a
+small TOML manifest only to map those helper symbols onto target functions.
+
+Unsupported LLVM features produce deterministic translation errors at the point
+where lowering would become unsound, rather than silently approximating away
+behavior. The one explicit escape hatch is `--unsound`.
+
+## Related Work
+
+- [llvm2goto](https://github.com/sbjoshi/llvm2goto)
 
 ## License
 
