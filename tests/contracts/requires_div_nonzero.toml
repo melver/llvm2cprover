@@ -1,0 +1,2 @@
+[functions.reciprocal]
+requires = "contract_requires_reciprocal"

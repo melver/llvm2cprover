@@ -1,0 +1,15 @@
+[package]
+name = "llvm2cprover"
+version = "0.1.0"
+edition = "2024"
+authors = ["Marco Elver <me@marcoelver.com>"]
+license = "Apache-2.0"
+description = "LLVM to GOTO-C translator"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cprover_bindings = { path = "third_party/kani/cprover_bindings" }
+inkwell = { git = "https://github.com/TheDan64/inkwell.git", rev = "07fa9f2435a9ee0521b88008324f229ff51a5b3e", features = ["llvm22-1"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1.1.0"

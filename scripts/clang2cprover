@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026, Marco Elver <me@marcoelver.com>
+
+"""Clang wrapper that also emits a sibling `.goto` file for compile-only steps."""
+
+from __future__ import annotations
+
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+FLAGS_WITH_VALUES = {
+    "-o",
+    "-x",
+    "-target",
+    "-arch",
+    "-isysroot",
+    "-isystem",
+    "-include",
+    "-imacros",
+    "-idirafter",
+    "-iquote",
+    "-iprefix",
+    "-iwithprefix",
+    "-iwithprefixbefore",
+    "-iwithsysroot",
+    "-iframework",
+    "-F",
+    "-I",
+    "-D",
+    "-U",
+    "-L",
+    "-MF",
+    "-MT",
+    "-MQ",
+    "-MJ",
+    "-Xclang",
+    "-Xpreprocessor",
+    "-Xassembler",
+    "-Xlinker",
+    "-Xanalyzer",
+    "-mllvm",
+    "-stdlib",
+    "--sysroot",
+    "--config",
+    "-resource-dir",
+    "-working-directory",
+    "-ivfsoverlay",
+    "-dependency-file",
+    "-serialize-diagnostics",
+    "-fprofile-use",
+    "-fprofile-sample-use",
+    "-fprofile-remapping-file",
+    "-fmodule-map-file",
+    "-fdebug-compilation-dir",
+    "-fmacro-prefix-map",
+    "-ffile-prefix-map",
+    "-fcoverage-compilation-dir",
+    "-fcrash-diagnostics-dir",
+    "-gcc-toolchain",
+}
+
+DEPENDENCY_ONLY_FLAGS = {"-M", "-MM"}
+DEPENDENCY_FLAGS = DEPENDENCY_ONLY_FLAGS | {"-MD", "-MMD", "-MP", "-MV", "-MG"}
+SKIP_FLAGS = {"-E", "-S", "-###", "--analyze", "-fsyntax-only"}
+SOURCE_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cp",
+    ".cpp",
+    ".cxx",
+    ".c++",
+    ".m",
+    ".mm",
+    ".i",
+    ".ii",
+    ".bc",
+    ".ll",
+}
+
+
+@dataclass(frozen=True)
+class Invocation:
+    compile_only: bool
+    source_files: tuple[str, ...]
+    output: Path | None
+    can_emit_goto: bool
+
+
+def iter_args(args: list[str]):
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in FLAGS_WITH_VALUES:
+            value = args[i + 1] if i + 1 < len(args) else None
+            raw = (arg, value) if value is not None else (arg,)
+            yield raw, arg, value
+            i += len(raw)
+            continue
+        for flag in ("-o", "-MF", "-MT", "-MQ", "-MJ"):
+            if arg.startswith(flag) and arg != flag:
+                yield (arg,), flag, arg[len(flag):]
+                break
+        else:
+            yield (arg,), arg, None
+        i += 1
+
+
+def is_source_arg(arg: str) -> bool:
+    if arg == "-":
+        return True
+    if arg.startswith("-"):
+        return False
+    return Path(arg).suffix in SOURCE_SUFFIXES
+
+
+def parse_invocation(args: list[str]) -> Invocation:
+    compile_only = False
+    source_files: list[str] = []
+    output: Path | None = None
+    skip = False
+    for raw, flag, value in iter_args(args):
+        arg = raw[0]
+        if flag == "-c":
+            compile_only = True
+        # Dependency side effects like `-MMD -MF dep.d` still come with a real object build and
+        # should therefore emit a sibling `.goto`. Only dependency-only modes skip translation.
+        elif flag in SKIP_FLAGS or flag in DEPENDENCY_ONLY_FLAGS:
+            skip = True
+        elif flag == "-emit-llvm":
+            pass
+        elif flag == "-o" and value is not None:
+            output = Path(value)
+        elif flag in FLAGS_WITH_VALUES or flag in {"-MF", "-MT", "-MQ", "-MJ"}:
+            pass
+        elif is_source_arg(arg):
+            source_files.append(arg)
+
+    can_emit_goto = compile_only and not skip and len(source_files) == 1
+    if output == Path("-"):
+        can_emit_goto = False
+    return Invocation(compile_only, tuple(source_files), output, can_emit_goto)
+
+
+def inferred_object_output(source: str) -> Path | None:
+    if source == "-":
+        return None
+    return Path(Path(source).stem + ".o")
+
+
+def goto_output_path(invocation: Invocation) -> Path | None:
+    output = invocation.output
+    if output is None:
+        output = inferred_object_output(invocation.source_files[0])
+    if output is None:
+        return None
+    if output.suffix:
+        return output.with_suffix(".goto")
+    return output.with_name(output.name + ".goto")
+
+
+def locate_clang() -> str:
+    configured = os.environ.get("CLANG2CPROVER_CLANG")
+    if configured:
+        return configured
+
+    self_path = Path(__file__).resolve()
+    for candidate in ("clang", "/usr/bin/clang", "/bin/clang", "clang-22", "clang-21", "clang-20", "clang-19"):
+        resolved = shutil.which(
+            candidate) if not candidate.startswith("/") else candidate
+        if not resolved:
+            continue
+        if Path(resolved).resolve() != self_path:
+            return resolved
+    raise SystemExit("clang2cprover: failed to locate the real clang")
+
+
+def locate_llvm2cprover() -> str:
+    configured = os.environ.get("CLANG2CPROVER_LLVM2CPROVER")
+    if configured:
+        return configured
+
+    for candidate in (
+        ROOT / "target" / "release" / "llvm2cprover",
+        ROOT / "target" / "debug" / "llvm2cprover",
+    ):
+        if candidate.is_file():
+            return str(candidate)
+
+    resolved = shutil.which("llvm2cprover")
+    if resolved:
+        return resolved
+    raise SystemExit("clang2cprover: failed to locate llvm2cprover")
+
+
+def llvm2cprover_extra_args() -> list[str]:
+    extra = os.environ.get("CLANG2CPROVER_ARGS", "")
+    return shlex.split(extra) if extra else []
+
+
+def llvm_emit_args(args: list[str]) -> list[str]:
+    forwarded: list[str] = []
+    for raw, flag, _ in iter_args(args):
+        arg = raw[0]
+        if flag in SKIP_FLAGS or flag in DEPENDENCY_FLAGS or flag in {"-emit-llvm", "-save-temps"}:
+            continue
+        if arg.startswith("-save-temps="):
+            continue
+        if flag == "-o":
+            continue
+        if flag in {"-MF", "-MT", "-MQ", "-MJ", "-dependency-file", "-serialize-diagnostics"}:
+            continue
+        # The second clang run should only produce LLVM on stdout. Strip flags that would
+        # overwrite depfiles or other side outputs from the original build step.
+        forwarded.extend(raw)
+    forwarded.extend(["-emit-llvm", "-o", "-"])
+    return forwarded
+
+
+def run_passthrough(clang: str, args: list[str]) -> int:
+    return subprocess.run([clang, *args]).returncode
+
+
+def run_goto_pipeline(clang: str, llvm2cprover: str, args: list[str], output: Path) -> int:
+    clang_args = llvm_emit_args(args)
+    extra_args = llvm2cprover_extra_args()
+    with subprocess.Popen([clang, *clang_args], stdout=subprocess.PIPE) as clang_proc:
+        assert clang_proc.stdout is not None
+        with subprocess.Popen(
+            [llvm2cprover, "-", "--input-format",
+                "bc", *extra_args, "-o", str(output)],
+            stdin=clang_proc.stdout,
+        ) as goto_proc:
+            clang_proc.stdout.close()
+            goto_rc = goto_proc.wait()
+        clang_rc = clang_proc.wait()
+    return clang_rc or goto_rc
+
+
+def print_failed_command(args: list[str]) -> None:
+    command = shlex.join([str(Path(__file__).resolve()), *args])
+    sys.stderr.write(
+        "clang2cprover: translation failed for compile command:\n")
+    sys.stderr.write(f"  cd {shlex.quote(os.getcwd())} && {command}\n")
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    clang = locate_clang()
+    rc = run_passthrough(clang, args)
+    if rc != 0:
+        return rc
+
+    if os.environ.get("CLANG2CPROVER_SKIP"):
+        return 0
+
+    invocation = parse_invocation(args)
+    if not invocation.can_emit_goto:
+        return 0
+
+    goto_path = goto_output_path(invocation)
+    if goto_path is None:
+        return 0
+
+    llvm2cprover = locate_llvm2cprover()
+    rc = run_goto_pipeline(clang, llvm2cprover, args, goto_path)
+    if rc != 0:
+        print_failed_command(args)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

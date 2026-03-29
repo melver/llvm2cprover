@@ -1,0 +1,142 @@
+diff --git a/cprover_bindings/Cargo.toml b/cprover_bindings/Cargo.toml
+index 60362ad3e..7ab822071 100644
+--- a/cprover_bindings/Cargo.toml
++++ b/cprover_bindings/Cargo.toml
+@@ -26,5 +26,3 @@ rustc-hash = "2.1.1"
+ serde_test = "1"
+ memuse = "0.2.1"
+ 
+-[lints]
+-workspace = true
+diff --git a/cprover_bindings/src/cbmc_string.rs b/cprover_bindings/src/cbmc_string.rs
+index a12014e90..6d6bd2217 100644
+--- a/cprover_bindings/src/cbmc_string.rs
++++ b/cprover_bindings/src/cbmc_string.rs
+@@ -120,11 +120,10 @@ fn intern(self) -> Option<InternedString> {
+ pub(crate) mod sync {
+     use string_interner::{StringInterner, backend::StringBackend};
+ 
+-    use crate::{InternedString, cbmc_string::INTERNER};
++    use crate::cbmc_string::INTERNER;
+ 
+-    /// The value of an [InternedString] is defined based on a thread local [INTERNER] so they cannot safely
+-    /// be sent between threads.
+-    impl !Send for InternedString {}
++    // NOTE: On stable Rust, we cannot use `impl !Send`. The thread-local
++    // INTERNER provides safety for single-threaded use.
+ 
+     /// A type that is only `!Send` because it contains types specific to a thread local [INTERNER]
+     /// (e.g. [InternedString]s). This forces users to annotate that the types they want to wrap in [WithInterner]
+diff --git a/cprover_bindings/src/goto_program/expr.rs b/cprover_bindings/src/goto_program/expr.rs
+index 72c01338c..0c8a44723 100644
+--- a/cprover_bindings/src/goto_program/expr.rs
++++ b/cprover_bindings/src/goto_program/expr.rs
+@@ -98,11 +98,11 @@ pub enum ExprValue {
+     // {}
+     EmptyUnion,
+     /// `1.0f`
+-    Float16Constant(f16),
++    Float16Constant(u16),
+     /// `1.0f`
+     FloatConstant(f32),
+     /// `Float 128 example`
+-    Float128Constant(f128),
++    Float128Constant(u128),
+     /// `function(arguments)`
+     FunctionCall {
+         function: Expr,
+@@ -609,25 +609,23 @@ pub fn empty_union(typ: Type, st: &SymbolTable) -> Self {
+     }
+ 
+     /// `3.14f`
+-    pub fn float16_constant(c: f16) -> Self {
++    pub fn float16_constant(c: u16) -> Self {
+         expr!(Float16Constant(c), Type::float16())
+     }
+ 
+     /// `union {_Float16 f; uint16_t bp} u = {.bp = 0x1234}; >>> u.f <<<`
+     pub fn float16_constant_from_bitpattern(bp: u16) -> Self {
+-        let c = f16::from_bits(bp);
+-        Self::float16_constant(c)
++        Self::float16_constant(bp)
+     }
+ 
+     /// `3.14159265358979323846264338327950288L`
+-    pub fn float128_constant(c: f128) -> Self {
++    pub fn float128_constant(c: u128) -> Self {
+         expr!(Float128Constant(c), Type::float128())
+     }
+ 
+     /// `union {_Float128 f; __uint128_t bp} u = {.bp = 0x1234}; >>> u.f <<<`
+     pub fn float128_constant_from_bitpattern(bp: u128) -> Self {
+-        let c = f128::from_bits(bp);
+-        Self::float128_constant(c)
++        Self::float128_constant(bp)
+     }
+ 
+     /// `1.0f`
+diff --git a/cprover_bindings/src/goto_program/typ.rs b/cprover_bindings/src/goto_program/typ.rs
+index 01148089e..cdba1b2a3 100644
+--- a/cprover_bindings/src/goto_program/typ.rs
++++ b/cprover_bindings/src/goto_program/typ.rs
+@@ -1326,9 +1326,9 @@ pub fn one(&self) -> Expr {
+         } else if self.is_float() {
+             Expr::float_constant(1.0)
+         } else if self.is_float_16() {
+-            Expr::float16_constant(1.0)
++            Expr::float16_constant_from_bitpattern(0x3C00) // 1.0 as f16
+         } else if self.is_float_128() {
+-            Expr::float128_constant(1.0)
++            Expr::float128_constant_from_bitpattern(0x3FFF0000000000000000000000000000) // 1.0 as f128
+         } else if self.is_double() {
+             Expr::double_constant(1.0)
+         } else {
+@@ -1346,9 +1346,9 @@ pub fn zero(&self) -> Expr {
+         } else if self.is_float() {
+             Expr::float_constant(0.0)
+         } else if self.is_float_16() {
+-            Expr::float16_constant(0.0)
++            Expr::float16_constant_from_bitpattern(0x0000) // 0.0 as f16
+         } else if self.is_float_128() {
+-            Expr::float128_constant(0.0)
++            Expr::float128_constant_from_bitpattern(0) // 0.0 as f128
+         } else if self.is_double() {
+             Expr::double_constant(0.0)
+         } else if self.is_pointer() {
+diff --git a/cprover_bindings/src/irep/to_irep.rs b/cprover_bindings/src/irep/to_irep.rs
+index cd263e2a3..7cf9832cf 100644
+--- a/cprover_bindings/src/irep/to_irep.rs
++++ b/cprover_bindings/src/irep/to_irep.rs
+@@ -265,7 +265,7 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
+                 }
+             }
+             ExprValue::Float16Constant(i) => {
+-                let c: u16 = i.to_bits();
++                let c: u16 = *i;
+                 Irep {
+                     id: IrepId::Constant,
+                     sub: vec![],
+@@ -273,7 +273,7 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
+                 }
+             }
+             ExprValue::Float128Constant(i) => {
+-                let c: u128 = i.to_bits();
++                let c: u128 = *i;
+                 Irep {
+                     id: IrepId::Constant,
+                     sub: vec![],
+diff --git a/cprover_bindings/src/lib.rs b/cprover_bindings/src/lib.rs
+index c22bcb5eb..458fa6ee9 100644
+--- a/cprover_bindings/src/lib.rs
++++ b/cprover_bindings/src/lib.rs
+@@ -29,10 +29,6 @@
+ //! Speical [irep::Irep::id]s include:
+ //! 1. [irep::IrepId::Empty] and [irep::IrepId::Nil] behaves like \[null\].
+ 
+-#![feature(f128)]
+-#![feature(f16)]
+-#![feature(negative_impls)]
+-
+ mod env;
+ pub use env::global_dead_object;
+ pub mod goto_program;

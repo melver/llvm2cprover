@@ -1,0 +1,4 @@
+[submodule "third_party/kani"]
+	path = third_party/kani
+	url = https://github.com/model-checking/kani.git
+	ignore = dirty

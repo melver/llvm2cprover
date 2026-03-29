@@ -1,0 +1,2 @@
+[functions.never_called]
+requires = "contract_requires_missing"

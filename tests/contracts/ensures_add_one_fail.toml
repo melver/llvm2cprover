@@ -1,0 +1,2 @@
+[functions.add_one]
+ensures = "contract_ensures_add_one"

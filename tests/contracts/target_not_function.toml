@@ -1,0 +1,2 @@
+[functions.not_a_function]
+requires = "contract_requires_not_a_function"
