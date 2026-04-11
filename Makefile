@@ -23,7 +23,7 @@ test: patch-deps
 .PHONY: test-e2e
 test-e2e: patch-deps
 	cargo build --bin llvm2cprover
-	python3 tests/run.py
+	./tests/run.py
 
 .PHONY: clippy
 clippy: patch-deps
