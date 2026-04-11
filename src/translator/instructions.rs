@@ -253,6 +253,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             | InstructionOpcode::FPToUI
             | InstructionOpcode::SIToFP
             | InstructionOpcode::UIToFP => self.lower_cast(instruction, body),
+            InstructionOpcode::Freeze => self.lower_freeze(instruction, body),
             InstructionOpcode::Select => self.lower_select(instruction, body),
             InstructionOpcode::Return => self.lower_return(instruction, body),
             InstructionOpcode::Call => self.lower_call(instruction, body),
@@ -967,6 +968,18 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             loc,
         ));
         Ok(())
+    }
+
+    fn lower_freeze(
+        &mut self,
+        instruction: InstructionValue<'ctx>,
+        body: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let value = self.lower_operand(instruction, 0)?;
+        // `freeze` only differs from identity on poison/undef inputs. The current translator does
+        // not model LLVM poison explicitly, so preserve all defined executions by reusing the
+        // operand as-is.
+        self.assign_result(instruction, body, value)
     }
 
     fn lower_return(
