@@ -31,7 +31,7 @@ use inkwell::llvm_sys::core::{
     LLVMIsAInlineAsm, LLVMIsCleanup,
 };
 use inkwell::llvm_sys::prelude::LLVMValueRef;
-use inkwell::types::FunctionType;
+use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
     AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue, InstructionOpcode,
     InstructionValue, PhiValue,
@@ -523,19 +523,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         })?;
         let lhs = self.lower_operand(instruction, 0)?;
         let rhs = self.lower_operand(instruction, 1)?;
-        let (lhs, rhs) = self.normalize_icmp_operands(lhs, rhs);
         let result = self.declare_instruction_result(instruction)?;
-        let value = match pred {
-            IntPredicate::EQ => lhs.eq(rhs),
-            IntPredicate::NE => lhs.neq(rhs),
-            IntPredicate::UGT => lhs.gt(rhs),
-            IntPredicate::UGE => lhs.ge(rhs),
-            IntPredicate::ULT => lhs.lt(rhs),
-            IntPredicate::ULE => lhs.le(rhs),
-            IntPredicate::SGT => self.signed_view(lhs)?.gt(self.signed_view(rhs)?),
-            IntPredicate::SGE => self.signed_view(lhs)?.ge(self.signed_view(rhs)?),
-            IntPredicate::SLT => self.signed_view(lhs)?.lt(self.signed_view(rhs)?),
-            IntPredicate::SLE => self.signed_view(lhs)?.le(self.signed_view(rhs)?),
+        let value = if lhs.typ().is_vector() || rhs.typ().is_vector() {
+            self.lower_vector_icmp_value(pred, lhs, rhs, result.typ().clone())?
+        } else {
+            self.lower_scalar_icmp_value(pred, lhs, rhs)?
         };
         body.push(Stmt::assign(
             result.clone(),
@@ -555,6 +547,68 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             );
         }
         (lhs, rhs)
+    }
+
+    fn lower_scalar_icmp_value(&self, pred: IntPredicate, lhs: Expr, rhs: Expr) -> Result<Expr> {
+        let (lhs, rhs) = self.normalize_icmp_operands(lhs, rhs);
+        let value = match pred {
+            IntPredicate::EQ => lhs.eq(rhs),
+            IntPredicate::NE => lhs.neq(rhs),
+            IntPredicate::UGT => lhs.gt(rhs),
+            IntPredicate::UGE => lhs.ge(rhs),
+            IntPredicate::ULT => lhs.lt(rhs),
+            IntPredicate::ULE => lhs.le(rhs),
+            IntPredicate::SGT => self.signed_view(lhs)?.gt(self.signed_view(rhs)?),
+            IntPredicate::SGE => self.signed_view(lhs)?.ge(self.signed_view(rhs)?),
+            IntPredicate::SLT => self.signed_view(lhs)?.lt(self.signed_view(rhs)?),
+            IntPredicate::SLE => self.signed_view(lhs)?.le(self.signed_view(rhs)?),
+        };
+        Ok(value)
+    }
+
+    fn lower_vector_icmp_value(
+        &self,
+        pred: IntPredicate,
+        lhs: Expr,
+        rhs: Expr,
+        result_type: Type,
+    ) -> Result<Expr> {
+        let lhs_len = lhs
+            .typ()
+            .len()
+            .ok_or_else(|| self.vector_icmp_err("vector icmp expects vector operands"))?;
+        let rhs_len = rhs
+            .typ()
+            .len()
+            .ok_or_else(|| self.vector_icmp_err("vector icmp expects vector operands"))?;
+        let result_lane_type = result_type
+            .base_type()
+            .cloned()
+            .ok_or_else(|| self.vector_icmp_err("vector icmp expects a vector result"))?;
+        let result_len = result_type
+            .len()
+            .ok_or_else(|| self.vector_icmp_err("vector icmp expects a vector result"))?;
+        debug_assert_eq!(lhs_len, rhs_len);
+        debug_assert_eq!(lhs_len, result_len);
+
+        let elems = (0..lhs_len)
+            .map(|lane| {
+                let lhs_lane = self.aggregate_component(lhs.clone(), lane as usize)?;
+                let rhs_lane = self.aggregate_component(rhs.clone(), lane as usize)?;
+                Ok(self
+                    .lower_scalar_icmp_value(pred, lhs_lane, rhs_lane)?
+                    .cast_to(result_lane_type.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Expr::vector_expr(result_type, elems))
+    }
+
+    fn vector_icmp_err(&self, msg: &str) -> Diagnostic {
+        Diagnostic::unsupported_feature(
+            UnsupportedFeature::Instruction,
+            format!("{msg} in {}", self.function_name),
+        )
+        .with_symbol(self.function_name.clone())
     }
 
     fn lower_fcmp(
@@ -760,7 +814,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .cast_to(result.typ().clone()),
             InstructionOpcode::ZExt
             | InstructionOpcode::Trunc
-            | InstructionOpcode::BitCast
             | InstructionOpcode::PtrToInt
             | InstructionOpcode::IntToPtr
             | InstructionOpcode::AddrSpaceCast
@@ -770,10 +823,128 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             | InstructionOpcode::FPToUI
             | InstructionOpcode::SIToFP
             | InstructionOpcode::UIToFP => value.cast_to(result.typ().clone()),
+            InstructionOpcode::BitCast => {
+                self.lower_bitcast_value(instruction, value, result.typ().clone())?
+            }
             _ => unreachable!("cast opcode dispatched incorrectly"),
         };
         body.push(Stmt::assign(result, cast, loc));
         Ok(())
+    }
+
+    fn lower_bitcast_value(
+        &self,
+        instruction: InstructionValue<'ctx>,
+        value: Expr,
+        result_type: Type,
+    ) -> Result<Expr> {
+        if value.typ().is_vector() && result_type.is_integer() {
+            // Bitcast width is defined by the original LLVM types, not the lowered GOTO types.
+            // In particular, LLVM `i1` currently lowers to `c_bool`, which would otherwise hide
+            // the single-bit lane width needed for `<N x i1> -> iN` masks.
+            let source_value = self.operand_value(
+                instruction,
+                0,
+                UnsupportedFeature::Instruction,
+                "malformed bitcast source",
+            )?;
+            let (lane_count, lane_bits) = self.llvm_fixed_vector_layout(source_value.get_type())?;
+            let result_bits = self.llvm_scalar_bit_width(instruction.get_type())?;
+            return self.lower_vector_to_scalar_bitcast(
+                value,
+                result_type,
+                lane_count,
+                lane_bits,
+                result_bits,
+            );
+        }
+        Ok(value.cast_to(result_type))
+    }
+
+    fn lower_vector_to_scalar_bitcast(
+        &self,
+        value: Expr,
+        result_type: Type,
+        lane_count: u64,
+        lane_bits: u64,
+        result_bits: u64,
+    ) -> Result<Expr> {
+        let lowered_lane_count = value.typ().len().ok_or_else(|| {
+            Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!(
+                    "vector bitcast expects a vector source in {}",
+                    self.function_name
+                ),
+            )
+            .with_symbol(self.function_name.clone())
+        })?;
+        let total_bits = lane_count.checked_mul(lane_bits).ok_or_else(|| {
+            Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!("vector bitcast width overflow in {}", self.function_name),
+            )
+            .with_symbol(self.function_name.clone())
+        })?;
+        debug_assert_eq!(lowered_lane_count, lane_count);
+        if total_bits != result_bits {
+            return Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!(
+                    "vector bitcast requires equal source/result bit widths in {}",
+                    self.function_name
+                ),
+            )
+            .with_symbol(self.function_name.clone())
+            .into());
+        }
+
+        // LLVM bitcast preserves lane bit patterns. For the little-endian machine models we
+        // currently target, lane 0 occupies the least-significant bits of the scalar mask.
+        let mut packed = Expr::int_constant(0, result_type.clone());
+        for lane in 0..lane_count {
+            let shift = lane * lane_bits;
+            let lane_expr = self
+                .aggregate_component(value.clone(), lane as usize)?
+                .cast_to(result_type.clone());
+            let shifted = if shift == 0 {
+                lane_expr
+            } else {
+                lane_expr.shl(Expr::int_constant(shift, result_type.clone()))
+            };
+            packed = packed.bitor(shifted);
+        }
+        Ok(packed)
+    }
+
+    fn llvm_fixed_vector_layout(&self, typ: BasicTypeEnum<'ctx>) -> Result<(u64, u64)> {
+        let AnyTypeEnum::VectorType(vector) = typ.as_any_type_enum() else {
+            return Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!("expected fixed vector type in {}", self.function_name),
+            )
+            .with_symbol(self.function_name.clone())
+            .into());
+        };
+        Ok((
+            vector.get_size().into(),
+            self.llvm_scalar_bit_width(vector.get_element_type().as_any_type_enum())?,
+        ))
+    }
+
+    fn llvm_scalar_bit_width(&self, typ: AnyTypeEnum<'ctx>) -> Result<u64> {
+        match typ {
+            AnyTypeEnum::IntType(int) => Ok(int.get_bit_width().into()),
+            _ => Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!(
+                    "unsupported LLVM bitcast width query in {}",
+                    self.function_name
+                ),
+            )
+            .with_symbol(self.function_name.clone())
+            .into()),
+        }
     }
 
     fn lower_select(
