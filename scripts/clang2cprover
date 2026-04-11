@@ -231,6 +231,11 @@ def llvm_emit_args(args: list[str]) -> list[str]:
         # The second clang run should only produce LLVM on stdout. Strip flags that would
         # overwrite depfiles or other side outputs from the original build step.
         forwarded.extend(raw)
+
+    cflags = os.environ.get("CLANG2CPROVER_CFLAGS")
+    if cflags:
+        forwarded.extend(cflags.split())
+
     # Let source files expose translation-only harnesses without polluting the native build.
     forwarded.append("-DLLVM2CPROVER")
     forwarded.extend(["-emit-llvm", "-o", "-"])
