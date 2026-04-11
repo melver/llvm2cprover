@@ -13,3 +13,4 @@ cprover_bindings = { path = "third_party/kani/cprover_bindings" }
 inkwell = { git = "https://github.com/TheDan64/inkwell.git", rev = "07fa9f2435a9ee0521b88008324f229ff51a5b3e", features = ["llvm22-1"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1.0"
+num = "0.4.3"

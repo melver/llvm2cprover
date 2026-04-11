@@ -36,6 +36,7 @@ use inkwell::values::{
     AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue, InstructionOpcode,
     InstructionValue, PhiValue,
 };
+use num::bigint::BigInt;
 
 use super::globals::GlobalLowerer;
 use super::types::TypeLowerer;
@@ -1633,6 +1634,15 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.uadd.sat")
+            || callee_name.starts_with("llvm.usub.sat")
+            || callee_name.starts_with("llvm.sadd.sat")
+            || callee_name.starts_with("llvm.ssub.sat")
+        {
+            self.lower_saturating_intrinsic(callee_name, instruction, args, body)?;
+            return Ok(true);
+        }
+
         if let Some((double_fn, float_fn)) = self.float_builtin(callee_name) {
             self.lower_float_builtin_call(
                 callee_name,
@@ -2015,6 +2025,140 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         self.aggregates
             .insert(instruction.as_value_ref() as usize, vec![value, overflowed]);
         Ok(())
+    }
+
+    fn lower_saturating_intrinsic(
+        &mut self,
+        callee_name: &str,
+        instruction: InstructionValue<'ctx>,
+        args: &[Expr],
+        body: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        debug_assert_eq!(args.len(), 2);
+        let lhs = args[0].clone();
+        let rhs = args[1].clone();
+
+        if lhs.typ().is_vector() || rhs.typ().is_vector() {
+            return Err(self
+                .unsupported_intrinsic(
+                    callee_name,
+                    "vector saturating arithmetic intrinsics are unsupported",
+                )
+                .into());
+        }
+
+        let result_type = lhs.typ().clone();
+        if !result_type.is_integer() {
+            return Err(self
+                .unsupported_intrinsic(
+                    callee_name,
+                    "saturating arithmetic intrinsics expect integer operands",
+                )
+                .into());
+        }
+        let value = if callee_name.starts_with("llvm.uadd.sat") {
+            self.saturating_overflow_value(
+                lhs,
+                rhs,
+                result_type.clone(),
+                Expr::add_overflow_result,
+                self.integer_max_value(&result_type)?,
+            )?
+        } else if callee_name.starts_with("llvm.usub.sat") {
+            self.saturating_overflow_value(
+                lhs,
+                rhs,
+                result_type.clone(),
+                Expr::sub_overflow_result,
+                result_type.zero(),
+            )?
+        } else {
+            let lhs_signed = self.signed_view(lhs.clone())?;
+            let rhs_signed = self.signed_view(rhs)?;
+            let saturation = lhs_signed.clone().lt(lhs_signed.typ().zero()).ternary(
+                self.integer_signed_min_value(&result_type)?,
+                self.integer_signed_max_value(&result_type)?,
+            );
+            if callee_name.starts_with("llvm.sadd.sat") {
+                self.saturating_overflow_value(
+                    lhs_signed,
+                    rhs_signed,
+                    result_type,
+                    Expr::add_overflow_result,
+                    saturation,
+                )?
+            } else {
+                self.saturating_overflow_value(
+                    lhs_signed,
+                    rhs_signed,
+                    result_type,
+                    Expr::sub_overflow_result,
+                    saturation,
+                )?
+            }
+        };
+
+        self.assign_result(instruction, body, value)?;
+        Ok(())
+    }
+
+    fn saturating_overflow_value(
+        &mut self,
+        lhs: Expr,
+        rhs: Expr,
+        result_type: Type,
+        op: fn(Expr, Expr) -> Expr,
+        on_overflow: Expr,
+    ) -> Result<Expr> {
+        self.ensure_overflow_result_symbol(lhs.typ().clone());
+        let overflow = op(lhs, rhs);
+        let value = overflow
+            .clone()
+            .member("result", self.symbols)
+            .cast_to(result_type);
+        let overflowed = overflow
+            .member("overflowed", self.symbols)
+            .cast_to(Type::bool());
+        Ok(overflowed.ternary(on_overflow, value))
+    }
+
+    fn integer_max_value(&self, typ: &Type) -> Result<Expr> {
+        let width = self.integer_width(typ)?;
+        Ok(Expr::int_constant(
+            (BigInt::from(1u8) << width) - 1u8,
+            typ.clone(),
+        ))
+    }
+
+    fn integer_signed_max_value(&self, typ: &Type) -> Result<Expr> {
+        let width = self.integer_width(typ)?;
+        Ok(Expr::int_constant(
+            (BigInt::from(1u8) << (width - 1)) - 1u8,
+            typ.clone(),
+        ))
+    }
+
+    fn integer_signed_min_value(&self, typ: &Type) -> Result<Expr> {
+        let width = self.integer_width(typ)?;
+        Ok(Expr::int_constant(
+            -(BigInt::from(1u8) << (width - 1)),
+            typ.clone(),
+        ))
+    }
+
+    fn integer_width(&self, typ: &Type) -> Result<u64> {
+        typ.native_width(self.symbols.machine_model())
+            .ok_or_else(|| {
+                Diagnostic::unsupported_feature(
+                    UnsupportedFeature::Intrinsic,
+                    format!(
+                        "expected fixed-width integer type for intrinsic in {}",
+                        self.function_name
+                    ),
+                )
+                .with_symbol(self.function_name.clone())
+                .into()
+            })
     }
 
     fn ensure_overflow_result_symbol(&mut self, operand_type: Type) {
