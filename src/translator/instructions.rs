@@ -1611,6 +1611,15 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.umin")
+            || callee_name.starts_with("llvm.umax")
+            || callee_name.starts_with("llvm.smin")
+            || callee_name.starts_with("llvm.smax")
+        {
+            self.lower_minmax_intrinsic(callee_name, instruction, args, body)?;
+            return Ok(true);
+        }
+
         if let Some((double_fn, float_fn)) = self.float_builtin(callee_name) {
             self.lower_float_builtin_call(
                 callee_name,
@@ -1870,6 +1879,50 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             }
         };
         body.push(Stmt::function_call(lhs, function, arguments, loc));
+        Ok(())
+    }
+
+    fn lower_minmax_intrinsic(
+        &mut self,
+        callee_name: &str,
+        instruction: InstructionValue<'ctx>,
+        args: &[Expr],
+        body: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        debug_assert_eq!(args.len(), 2);
+        let lhs = args
+            .first()
+            .cloned()
+            .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing min/max lhs"))?;
+        let rhs = args
+            .get(1)
+            .cloned()
+            .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing min/max rhs"))?;
+        let (lhs, rhs) = self.normalize_icmp_operands(lhs, rhs);
+
+        if lhs.typ().is_vector() || rhs.typ().is_vector() {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "vector min/max intrinsics are unsupported")
+                .into());
+        }
+
+        let is_signed = callee_name.starts_with("llvm.s");
+        let is_min = callee_name.starts_with("llvm.umin") || callee_name.starts_with("llvm.smin");
+        let cmp = if is_signed {
+            let lhs_cmp = self.signed_view(lhs.clone())?;
+            let rhs_cmp = self.signed_view(rhs.clone())?;
+            if is_min {
+                lhs_cmp.lt(rhs_cmp)
+            } else {
+                lhs_cmp.gt(rhs_cmp)
+            }
+        } else if is_min {
+            lhs.clone().lt(rhs.clone())
+        } else {
+            lhs.clone().gt(rhs.clone())
+        };
+
+        self.assign_result(instruction, body, cmp.ternary(lhs, rhs))?;
         Ok(())
     }
 
