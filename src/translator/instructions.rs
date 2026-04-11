@@ -613,6 +613,55 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         .with_symbol(self.function_name.clone())
     }
 
+    fn lower_vector_minmax_value(
+        &self,
+        callee_name: &str,
+        lhs: Expr,
+        rhs: Expr,
+        result_type: Type,
+    ) -> Result<Expr> {
+        let lhs_len = lhs.typ().len().ok_or_else(|| {
+            self.unsupported_intrinsic(callee_name, "vector min/max expects vector operands")
+        })?;
+        let rhs_len = rhs.typ().len().ok_or_else(|| {
+            self.unsupported_intrinsic(callee_name, "vector min/max expects vector operands")
+        })?;
+        let result_lane_type = result_type.base_type().cloned().ok_or_else(|| {
+            self.unsupported_intrinsic(callee_name, "vector min/max expects a vector result")
+        })?;
+        if !result_lane_type.is_integer() {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "vector min/max expects integer lanes")
+                .into());
+        }
+        debug_assert_eq!(lhs_len, rhs_len);
+        debug_assert_eq!(Some(lhs_len), result_type.len());
+
+        let is_signed = callee_name.starts_with("llvm.s");
+        let is_min = callee_name.starts_with("llvm.umin") || callee_name.starts_with("llvm.smin");
+        let elems = (0..lhs_len)
+            .map(|lane| {
+                let lhs_lane = self.aggregate_component(lhs.clone(), lane as usize)?;
+                let rhs_lane = self.aggregate_component(rhs.clone(), lane as usize)?;
+                let cmp = if is_signed {
+                    let lhs_cmp = self.signed_view(lhs_lane.clone())?;
+                    let rhs_cmp = self.signed_view(rhs_lane.clone())?;
+                    if is_min {
+                        lhs_cmp.lt(rhs_cmp)
+                    } else {
+                        lhs_cmp.gt(rhs_cmp)
+                    }
+                } else if is_min {
+                    lhs_lane.clone().lt(rhs_lane.clone())
+                } else {
+                    lhs_lane.clone().gt(rhs_lane.clone())
+                };
+                Ok(cmp.ternary(lhs_lane, rhs_lane))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Expr::vector_expr(result_type, elems))
+    }
+
     fn lower_fcmp(
         &mut self,
         instruction: InstructionValue<'ctx>,
@@ -1924,9 +1973,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let (lhs, rhs) = self.normalize_icmp_operands(lhs, rhs);
 
         if lhs.typ().is_vector() || rhs.typ().is_vector() {
-            return Err(self
-                .unsupported_intrinsic(callee_name, "vector min/max intrinsics are unsupported")
-                .into());
+            return self.assign_result(
+                instruction,
+                body,
+                self.lower_vector_minmax_value(callee_name, lhs.clone(), rhs, lhs.typ().clone())?,
+            );
         }
 
         let is_signed = callee_name.starts_with("llvm.s");
