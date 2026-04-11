@@ -28,7 +28,7 @@ use inkwell::llvm_sys::core::{
     LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause, LLVMGetInlineAsmAsmString,
     LLVMGetInlineAsmCanUnwind, LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands,
     LLVMGetNumClauses, LLVMGetNumMaskElements, LLVMGetSwitchCaseValue, LLVMGetUnwindDest,
-    LLVMIsAInlineAsm, LLVMIsCleanup,
+    LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
 };
 use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
@@ -2777,6 +2777,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         let typ = self.types.lower_value(value)?;
+
+        // undef in a function body means "any value" — unlike global undef which
+        // follows C static-storage zero-init (handled in GlobalLowerer).
+        if unsafe { LLVMIsUndef(value.as_value_ref()) } != 0 {
+            return Ok(Expr::nondet(typ));
+        }
+
         self.insert_pending_aggregate_symbols();
         self.globals
             .lower_initializer(
