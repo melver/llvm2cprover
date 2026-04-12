@@ -33,8 +33,8 @@ use inkwell::llvm_sys::core::{
 use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
-    AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue, InstructionOpcode,
-    InstructionValue, PhiValue,
+    AnyValue, AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue,
+    InstructionOpcode, InstructionValue, PhiValue,
 };
 use num::bigint::BigInt;
 
@@ -2845,7 +2845,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 self.symbols,
                 &self.current_location(),
             )
-            .map_err(Into::into)
+            .map_err(|err| {
+                let rendered = value.print_to_string().to_string();
+                anyhow::anyhow!("{err} [while lowering value: {rendered}]")
+            })
     }
 
     fn phi_edge_assignments(
@@ -3087,7 +3090,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             UnsupportedFeature::Instruction,
             "malformed instruction operand",
         )?;
-        self.lower_value(value)
+        self.lower_value(value).map_err(|err| {
+            let consumer = instruction.print_to_string().to_string();
+            anyhow::anyhow!("{err} [operand of instruction: {consumer}]")
+        })
     }
 
     fn direct_store_slot(&self, ptr: &Expr, pointee: &Type) -> Option<Expr> {

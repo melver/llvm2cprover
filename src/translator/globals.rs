@@ -200,22 +200,25 @@ impl GlobalLowerer {
             return Ok(Expr::int_constant(value, typ.clone()));
         }
 
-        if bits <= 128 {
-            // LLVM's C API only exposes direct ConstantInt extractors up to 64 bits. Current LLVM
-            // textual printing formats wider ConstantInt values as "<type> <decimal>", e.g.
-            // "i128 -1", so parse just the final decimal token in this rare wider-than-u64 path.
-            let rendered = value.print_to_string().to_string();
-            if let Some(literal) = rendered.split_whitespace().last() {
-                if let Ok(value) = literal.parse::<u128>() {
-                    return Ok(Expr::int_constant(value, typ.clone()));
-                }
-                if let Ok(value) = literal.parse::<i128>() {
-                    return Ok(Expr::int_constant(value as u128, typ.clone()));
-                }
+        // LLVM's C API only exposes direct ConstantInt extractors up to 64 bits. Current LLVM
+        // textual printing formats wider ConstantInt values as "<type> <decimal>", e.g.
+        // "i128 -1", so parse just the final decimal token in this rare wider-than-u64 path.
+        let rendered = value.print_to_string().to_string();
+        if bits <= 128
+            && let Some(literal) = rendered.split_whitespace().last()
+        {
+            if let Ok(value) = literal.parse::<u128>() {
+                return Ok(Expr::int_constant(value, typ.clone()));
+            }
+            if let Ok(value) = literal.parse::<i128>() {
+                return Ok(Expr::int_constant(value as u128, typ.clone()));
             }
         }
 
-        Err(self.unsupported(symbol, "expected constant integer initializer"))
+        Err(self.unsupported(
+            symbol,
+            format!("expected constant integer initializer: {rendered}"),
+        ))
     }
 
     fn lower_float<'ctx>(
