@@ -3481,16 +3481,30 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     }
 
     fn signed_view(&self, expr: Expr) -> Result<Expr> {
-        let typ = expr.typ().to_signed().ok_or_else(|| {
-            Diagnostic::unsupported_feature(
-                UnsupportedFeature::Instruction,
-                format!(
-                    "expected signed-capable integer type in {}",
-                    self.function_name
-                ),
-            )
-            .with_symbol(self.function_name.clone())
-        })?;
+        // LLVM `i1` currently lowers to `c_bool` for general scalar use, but signed LLVM
+        // operations still interpret that value as a 1-bit two's-complement integer where
+        // `true` is `-1` and `false` is `0`. Keep `bool` here as a defensive fallback in case
+        // an earlier lowering step already normalized the value to CBMC's native boolean type.
+        let typ = expr
+            .typ()
+            .to_signed()
+            .or_else(|| {
+                if expr.typ().is_c_bool() || expr.typ().is_bool() {
+                    Some(Type::signed_int(1_u32))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                Diagnostic::unsupported_feature(
+                    UnsupportedFeature::Instruction,
+                    format!(
+                        "expected signed-capable integer type in {}",
+                        self.function_name
+                    ),
+                )
+                .with_symbol(self.function_name.clone())
+            })?;
         Ok(expr.cast_to(typ))
     }
 
