@@ -1360,11 +1360,16 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         let loc = self.instruction_location(instruction);
         let asm = self.inline_asm_string(raw_callee);
-        if asm.is_empty() && unsafe { LLVMGetInlineAsmCanUnwind(raw_callee) == 0 } {
-            // Empty inline asm with only clobbers is a compiler barrier, not a stateful machine
-            // instruction. Lowering it away keeps verifier state unchanged without pretending to
-            // understand real target assembly.
+        if self.inline_asm_is_empty(&asm) && unsafe { LLVMGetInlineAsmCanUnwind(raw_callee) == 0 } {
+            // Empty inline asm, including comment-only compiler barriers, is not a stateful
+            // machine instruction. Lowering it away keeps verifier state unchanged without
+            // pretending to understand real target assembly.
             if instruction.get_type().is_void_type() {
+                return Ok(true);
+            }
+            if unsafe { LLVMGetNumArgOperands(instruction.as_value_ref()) } == 1 {
+                let value = self.lower_operand(instruction, 0)?;
+                self.assign_result(instruction, body, value)?;
                 return Ok(true);
             }
         }
@@ -3234,6 +3239,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
         String::from_utf8_lossy(unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) })
             .into_owned()
+    }
+
+    fn inline_asm_is_empty(&self, asm: &str) -> bool {
+        asm.lines().all(|line| {
+            let trimmed = line.trim();
+            trimmed.is_empty() || trimmed.starts_with('#')
+        })
     }
 
     fn instruction_location(&self, instruction: InstructionValue<'ctx>) -> Location {
