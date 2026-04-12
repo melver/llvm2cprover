@@ -1755,6 +1755,17 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if let Some(is_left) = if callee_name.starts_with("llvm.fshl") {
+            Some(true)
+        } else if callee_name.starts_with("llvm.fshr") {
+            Some(false)
+        } else {
+            None
+        } {
+            self.lower_funnel_shift_intrinsic(is_left, callee_name, instruction, args, body)?;
+            return Ok(true);
+        }
+
         if callee_name.starts_with("llvm.umin")
             || callee_name.starts_with("llvm.umax")
             || callee_name.starts_with("llvm.smin")
@@ -2079,6 +2090,64 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         self.assign_result(instruction, body, cmp.ternary(lhs, rhs))?;
         Ok(())
+    }
+
+    fn lower_funnel_shift_intrinsic(
+        &mut self,
+        is_left: bool,
+        callee_name: &str,
+        instruction: InstructionValue<'ctx>,
+        args: &[Expr],
+        body: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        debug_assert_eq!(args.len(), 3);
+        let lhs = args[0].clone();
+        let rhs = args[1].clone();
+        let shift = args[2].clone();
+
+        if lhs.typ().is_vector() {
+            return Err(self
+                .unsupported_intrinsic(
+                    callee_name,
+                    "vector funnel shift intrinsics are unsupported",
+                )
+                .into());
+        }
+
+        let result_type = lhs.typ().clone();
+        if !result_type.is_integer() {
+            return Err(self
+                .unsupported_intrinsic(
+                    callee_name,
+                    "funnel shift intrinsics expect integer operands",
+                )
+                .into());
+        }
+
+        let width = self.integer_width(&result_type)?;
+        let width_expr = Expr::int_constant(width, result_type.clone());
+        let zero = result_type.zero();
+        let shift_mod = shift.cast_to(result_type.clone()).rem(width_expr.clone());
+        let shift_is_zero = shift_mod.clone().eq(zero.clone());
+        let unclamped_reverse_shift = width_expr.sub(shift_mod.clone());
+        let reverse_shift = shift_is_zero
+            .clone()
+            .ternary(zero.clone(), unclamped_reverse_shift);
+        debug_assert_eq!(rhs.typ(), &result_type);
+
+        let shifted = if is_left {
+            lhs.clone()
+                .shl(shift_mod.clone())
+                .bitor(rhs.clone().lshr(reverse_shift))
+        } else {
+            lhs.clone()
+                .shl(reverse_shift)
+                .bitor(rhs.clone().lshr(shift_mod.clone()))
+        };
+        let identity = if is_left { lhs } else { rhs };
+        let value = shift_is_zero.ternary(identity, shifted);
+
+        self.assign_result(instruction, body, value)
     }
 
     fn lower_overflow_intrinsic(

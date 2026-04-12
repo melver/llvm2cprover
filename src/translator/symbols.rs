@@ -1557,20 +1557,20 @@ mod tests {
             br#"
             source_filename = "/tmp/unsupported_intrinsic.ll"
 
-            declare i32 @llvm.fshl.i32(i32, i32, i32)
+            declare i64 @llvm.readcyclecounter()
 
-            define i32 @f(i32 %x) {
+            define i64 @f() {
             entry:
-              %y = call i32 @llvm.fshl.i32(i32 %x, i32 %x, i32 1)
-              ret i32 %y
+              %y = call i64 @llvm.readcyclecounter()
+              ret i64 %y
             }
         "#,
         )
         .expect_err("unsupported intrinsic should fail closed");
 
         let debug = format!("{err:#}");
-        assert!(debug.contains("unsupported intrinsic call to llvm.fshl.i32"));
-        assert!(debug.contains("llvm.fshl.i32"));
+        assert!(debug.contains("unsupported intrinsic call to llvm.readcyclecounter"));
+        assert!(debug.contains("llvm.readcyclecounter"));
         assert!(debug.contains("/tmp/unsupported_intrinsic.ll:1"));
     }
 

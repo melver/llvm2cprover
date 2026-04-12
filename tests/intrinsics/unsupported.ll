@@ -6,10 +6,11 @@
 
 source_filename = "/tmp/unsupported_intrinsic.ll"
 
-declare i32 @llvm.fshl.i32(i32, i32, i32)
+declare i64 @llvm.readcyclecounter()
 
 define i32 @main() {
 entry:
-  %x = call i32 @llvm.fshl.i32(i32 1, i32 2, i32 3)
-  ret i32 %x
+  %x = call i64 @llvm.readcyclecounter()
+  %y = trunc i64 %x to i32
+  ret i32 %y
 }
