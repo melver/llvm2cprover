@@ -76,10 +76,97 @@ index 72c01338c..0c8a44723 100644
  
      /// `1.0f`
 diff --git a/cprover_bindings/src/goto_program/typ.rs b/cprover_bindings/src/goto_program/typ.rs
-index 01148089e..cdba1b2a3 100644
+index 01148089e..1f10f885b 100644
 --- a/cprover_bindings/src/goto_program/typ.rs
 +++ b/cprover_bindings/src/goto_program/typ.rs
-@@ -1326,9 +1326,9 @@ pub fn one(&self) -> Expr {
+@@ -22,6 +22,8 @@
+ pub enum Type {
+     /// `typ x[size]`. E.g. `unsigned int x[3]`
+     Array { typ: Box<Type>, size: u64 },
++    /// `typ x[size_symbol]` where the runtime bound is materialized in a separate symbol.
++    VariableArray { typ: Box<Type>, size: InternedString },
+     /// CBMC specific. `__CPROVER_bool x`. A single bit boolean
+     Bool,
+     /// `typ x : width`. e.g. `unsigned int x: 3`.
+@@ -194,6 +196,7 @@ fn typecheck_datatype_field(typ: &Type) -> bool {
+             | IncompleteStruct { .. }
+             | IncompleteUnion { .. }
+             | InfiniteArray { .. }
++            | VariableArray { .. }
+             | VariadicCode { .. } => false,
+ 
+             TypeDef { .. } => unreachable!("typedefs should have been unwrapped"),
+@@ -293,6 +296,7 @@ pub fn base_type(&self) -> Option<&Type> {
+             Array { typ, .. }
+             | CBitField { typ, .. }
+             | FlexibleArray { typ }
++            | VariableArray { typ, .. }
+             | Pointer { typ }
+             | Vector { typ, .. } => Some(typ),
+             _ => None,
+@@ -368,6 +372,7 @@ pub fn sizeof_in_bits(&self, st: &SymbolTable) -> u64 {
+         let concrete = self.unwrap_typedef();
+         match concrete {
+             Array { typ, size } => typ.sizeof_in_bits(st) * size,
++            VariableArray { .. } => unreachable!("VariableArray doesn't have a fixed sizeof"),
+             Bool => unreachable!("Bool doesn't have a sizeof"),
+             CBitField { .. } => todo!("implement sizeof for bitfields"),
+             CInteger(t) => t.sizeof_in_bits(st),
+@@ -453,7 +458,7 @@ impl Type {
+     pub fn is_array(&self) -> bool {
+         let concrete = self.unwrap_typedef();
+         match concrete {
+-            Array { .. } => true,
++            Array { .. } | VariableArray { .. } => true,
+             _ => false,
+         }
+     }
+@@ -461,7 +466,7 @@ pub fn is_array(&self) -> bool {
+     pub fn is_array_like(&self) -> bool {
+         let concrete = self.unwrap_typedef();
+         match concrete {
+-            Array { .. } | FlexibleArray { .. } | Vector { .. } => true,
++            Array { .. } | FlexibleArray { .. } | VariableArray { .. } | Vector { .. } => true,
+             _ => false,
+         }
+     }
+@@ -611,6 +616,7 @@ pub fn can_be_lvalue(&self) -> bool {
+         let concrete = self.unwrap_typedef();
+         match concrete {
+             Array { .. }
++            | VariableArray { .. }
+             | Bool
+             | CBitField { .. }
+             | CInteger(_)
+@@ -691,6 +697,7 @@ pub fn is_scalar(&self) -> bool {
+             | StructTag(_)
+             | Union { .. }
+             | UnionTag(_)
++            | VariableArray { .. }
+             | VariadicCode { .. }
+             | Vector { .. } => false,
+ 
+@@ -953,6 +960,7 @@ impl Type {
+     fn typecheck_array_elem(&self) -> bool {
+         match self.unwrap_typedef() {
+             Array { .. }
++            | VariableArray { .. }
+             | Bool
+             | CBitField { .. }
+             | CInteger(_)
+@@ -994,6 +1002,11 @@ pub fn array_of<T>(self, size: T) -> Self
+         Array { typ: Box::new(self), size }
+     }
+ 
++    pub fn variable_array_of<T: Into<InternedString>>(self, size: T) -> Self {
++        assert!(self.typecheck_array_elem(), "Can't make array of type {self:?}");
++        VariableArray { typ: Box::new(self), size: size.into() }
++    }
++
+     pub fn as_bitfield(self, width: u64) -> Self {
+         assert!(width > 0);
+         assert!(self.is_integer());
+@@ -1326,9 +1339,9 @@ pub fn one(&self) -> Expr {
          } else if self.is_float() {
              Expr::float_constant(1.0)
          } else if self.is_float_16() {
@@ -91,7 +178,7 @@ index 01148089e..cdba1b2a3 100644
          } else if self.is_double() {
              Expr::double_constant(1.0)
          } else {
-@@ -1346,9 +1346,9 @@ pub fn zero(&self) -> Expr {
+@@ -1346,9 +1359,9 @@ pub fn zero(&self) -> Expr {
          } else if self.is_float() {
              Expr::float_constant(0.0)
          } else if self.is_float_16() {
@@ -103,8 +190,16 @@ index 01148089e..cdba1b2a3 100644
          } else if self.is_double() {
              Expr::double_constant(0.0)
          } else if self.is_pointer() {
+@@ -1413,6 +1426,7 @@ pub fn zero_initializer(&self, st: &SymbolTable) -> Expr {
+             | FlexibleArray { .. }
+             | IncompleteStruct { .. }
+             | IncompleteUnion { .. }
++            | VariableArray { .. }
+             | VariadicCode { .. } => panic!("Can't zero init {self:?}"),
+         }
+     }
 diff --git a/cprover_bindings/src/irep/to_irep.rs b/cprover_bindings/src/irep/to_irep.rs
-index cd263e2a3..7cf9832cf 100644
+index cd263e2a3..37d257ecb 100644
 --- a/cprover_bindings/src/irep/to_irep.rs
 +++ b/cprover_bindings/src/irep/to_irep.rs
 @@ -265,7 +265,7 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
@@ -125,6 +220,21 @@ index cd263e2a3..7cf9832cf 100644
                  Irep {
                      id: IrepId::Constant,
                      sub: vec![],
+@@ -720,6 +720,14 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
+                     named_sub: linear_map![(IrepId::Size, size.to_irep(mm))],
+                 }
+             }
++            Type::VariableArray { typ, size } => Irep {
++                id: IrepId::Array,
++                sub: vec![typ.to_irep(mm)],
++                named_sub: linear_map![(
++                    IrepId::Size,
++                    Expr::symbol_expression(*size, Type::size_t()).to_irep(mm),
++                )],
++            },
+             //TODO make from_irep that matches this.
+             Type::CBitField { typ, width } => Irep {
+                 id: IrepId::CBitField,
 diff --git a/cprover_bindings/src/lib.rs b/cprover_bindings/src/lib.rs
 index c22bcb5eb..458fa6ee9 100644
 --- a/cprover_bindings/src/lib.rs

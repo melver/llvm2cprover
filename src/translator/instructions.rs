@@ -19,6 +19,7 @@ use std::{
 };
 
 use anyhow::Result;
+use cprover_bindings::InternedString;
 use cprover_bindings::goto_program::{
     BuiltinFn, Expr, ExprValue, Location, Stmt, SwitchCase, Symbol, SymbolTable, Type,
     arithmetic_overflow_result_type,
@@ -792,14 +793,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         instruction: InstructionValue<'ctx>,
         body: &mut Vec<Stmt>,
     ) -> Result<()> {
-        let _ = body;
         let loc = self.instruction_location(instruction);
-        let count = instruction
-            .get_operand(0)
-            .and_then(|operand| operand.value())
-            .map(|value| self.const_usize(value))
-            .transpose()?
-            .unwrap_or(1);
+        let count_value = self.operand_value(
+            instruction,
+            0,
+            UnsupportedFeature::Instruction,
+            "malformed alloca element count",
+        )?;
         let mut allocated = self
             .types
             .lower_basic(instruction.get_allocated_type().map_err(|_| {
@@ -810,19 +810,53 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .with_symbol(self.function_name.clone())
             })?)?;
         self.insert_pending_aggregate_symbols();
-        if count != 1 {
-            allocated = allocated.array_of(count);
-        }
-
-        let slot = self.declare_hidden_local("alloca", allocated, loc);
         let result_type = self.types.lower_instruction_result(instruction)?;
-        // Model `%p = alloca T` as a hidden local `T slot;` plus the SSA value `%p = &slot`.
-        // That matches the shape CBMC's C frontend emits for ordinary stack locals and keeps
-        // later load/store simplifications local instead of routing everything through a
-        // synthetic pointer temporary.
+        let ptr = match count_value {
+            BasicValueEnum::IntValue(count) => {
+                if let Some(count) = count.get_zero_extended_constant() {
+                    if count != 1 {
+                        allocated = allocated.array_of(count as usize);
+                    }
+                    let slot = self.declare_hidden_local("alloca", allocated, loc);
+                    if count != 1 {
+                        slot.array_to_ptr()
+                    } else {
+                        slot.address_of()
+                    }
+                } else {
+                    let count_expr = self.lower_operand(instruction, 0)?.cast_to(Type::size_t());
+                    // Exact VLA types refer to a named bound symbol, so materialize the runtime
+                    // count in a hidden local before constructing the array type.
+                    let (size_local, size_name) = self.declare_hidden_local_at_point(
+                        body,
+                        "alloca_size",
+                        Type::size_t(),
+                        loc,
+                    );
+                    body.push(Stmt::assign(size_local.clone(), count_expr, loc));
+                    let vla_type = allocated.variable_array_of(size_name);
+                    let (slot, _) =
+                        self.declare_hidden_local_at_point(body, "alloca", vla_type, loc);
+                    slot.array_to_ptr()
+                }
+            }
+            _ => {
+                return Err(Diagnostic::unsupported_feature(
+                    UnsupportedFeature::Instruction,
+                    format!("expected integer operand in {}", self.function_name),
+                )
+                .with_symbol(self.function_name.clone())
+                .into());
+            }
+        };
+        // Model `%p = alloca T` as a hidden local plus the SSA value for the resulting pointer.
+        // `alloca T, 1` returns `&slot`, while counted allocas return a pointer to the first
+        // element of the synthesized array object (`&slot[0]`) rather than a pointer to the
+        // array itself cast to `T *`. That matches LLVM's result type and gives CBMC the same
+        // object/bounds shape it uses for exact VLAs.
         self.values.insert(
             instruction.as_value_ref() as usize,
-            slot.address_of().cast_to(result_type).with_location(loc),
+            ptr.cast_to(result_type).with_location(loc),
         );
         Ok(())
     }
@@ -885,7 +919,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         body: &mut Vec<Stmt>,
     ) -> Result<()> {
         let loc = self.instruction_location(instruction);
-        let result = self.declare_instruction_result(instruction)?;
         let base = self.lower_operand(instruction, 0)?;
         let source_type =
             self.types
@@ -899,6 +932,17 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         self.insert_pending_aggregate_symbols();
 
         let ptr = self.compute_gep_address(instruction, base, source_type)?;
+        let result_type = self.types.lower_instruction_result(instruction)?;
+        if self.is_direct_address_expr(&ptr) {
+            // Preserve direct address expressions as SSA values so later loads and stores can
+            // keep array/member structure instead of falling back to generic pointer arithmetic.
+            self.values.insert(
+                instruction.as_value_ref() as usize,
+                ptr.cast_to(result_type).with_location(loc),
+            );
+            return Ok(());
+        }
+        let result = self.declare_instruction_result(instruction)?;
         body.push(Stmt::assign(
             result.clone(),
             ptr.cast_to(result.typ().clone()),
@@ -3063,13 +3107,26 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         base: Expr,
         mut current_type: Type,
     ) -> Result<Expr> {
-        let mut ptr = base.cast_to(current_type.clone().to_pointer());
+        let mut ptr = base.clone().cast_to(current_type.clone().to_pointer());
         let indices = (1..instruction.get_num_operands())
             .map(|i| self.lower_operand(instruction, i))
             .collect::<Result<Vec<_>>>()?;
 
         for (position, index) in indices.into_iter().enumerate() {
             if position == 0 {
+                if let Some((array, base_index)) = self.decayed_array_base(&base, &current_type) {
+                    let index = index.cast_to(Type::ssize_t());
+                    let total_index = if base_index
+                        .int_constant_value()
+                        .is_some_and(|value| value == 0.into())
+                    {
+                        index
+                    } else {
+                        base_index.plus(index)
+                    };
+                    ptr = array.index(total_index).address_of();
+                    continue;
+                }
                 ptr = ptr.index(index.cast_to(Type::ssize_t())).address_of();
                 continue;
             }
@@ -3115,6 +3172,37 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(ptr)
     }
 
+    /// Recognize pointers that came from array decay (`&array[0]`) so the first GEP index can be
+    /// folded back into `&array[i]`.
+    ///
+    /// The current lowering only inserts at most one pointer typecast around such addresses, so a
+    /// single `Typecast(AddressOf(...))` peel is sufficient here.
+    fn decayed_array_base(&self, base: &Expr, pointee: &Type) -> Option<(Expr, Expr)> {
+        let peeled = match base.value() {
+            ExprValue::AddressOf(inner) => inner.clone(),
+            ExprValue::Typecast(inner) => match inner.value() {
+                ExprValue::AddressOf(inner) => inner.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let ExprValue::Index { array, index } = peeled.value() else {
+            return None;
+        };
+        (array.typ().is_array_like() && array.typ().base_type() == Some(pointee))
+            .then(|| (array.clone(), index.clone()))
+    }
+
+    /// Returns true when the expression is already a plain address and does not need a temporary
+    /// local to preserve SSA semantics.
+    fn is_direct_address_expr(&self, expr: &Expr) -> bool {
+        match expr.value() {
+            ExprValue::AddressOf(_) => true,
+            ExprValue::Typecast(inner) => matches!(inner.value(), ExprValue::AddressOf(_)),
+            _ => false,
+        }
+    }
+
     fn function_expr(&self, name: &str, location: Location) -> Result<Expr> {
         let symbol = self.symbols.lookup(name).ok_or_else(|| {
             Diagnostic::unsupported_feature(
@@ -3153,11 +3241,40 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     }
 
     fn declare_hidden_local(&mut self, stem: &str, typ: Type, location: Location) -> Expr {
-        let base = format!("{stem}{}", self.next_tmp);
-        self.next_tmp += 1;
-        let expr = self.insert_local_symbol(&base, typ, false, true, location);
+        let (expr, _) = self.hidden_local_symbol(stem, typ, location);
         self.prologue.push(Stmt::decl(expr.clone(), None, location));
         expr
+    }
+
+    fn declare_hidden_local_at_point(
+        &mut self,
+        body: &mut Vec<Stmt>,
+        stem: &str,
+        typ: Type,
+        location: Location,
+    ) -> (Expr, InternedString) {
+        // Some lowering paths need both the expression and the raw symbol identifier so the same
+        // name can be referenced from a generated type, e.g. a VLA bound.
+        let (expr, identifier) = self.hidden_local_symbol(stem, typ, location);
+        body.push(Stmt::decl(expr.clone(), None, location));
+        (expr, identifier)
+    }
+
+    fn hidden_local_symbol(
+        &mut self,
+        stem: &str,
+        typ: Type,
+        location: Location,
+    ) -> (Expr, InternedString) {
+        let base = format!("{stem}{}", self.next_tmp);
+        self.next_tmp += 1;
+        let identifier = self.make_local_identifier(&base);
+        let expr = self.insert_local_symbol(&base, typ, false, true, location);
+        (expr, identifier)
+    }
+
+    fn make_local_identifier(&self, base_name: &str) -> InternedString {
+        format!("{}::{}", self.function_name, base_name).into()
     }
 
     fn insert_local_symbol(
@@ -3168,8 +3285,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         hidden: bool,
         location: Location,
     ) -> Expr {
-        let name = format!("{}::{}", self.function_name, base_name);
-        let symbol = Symbol::variable(name.clone(), base_name.to_owned(), typ.clone(), location)
+        let name = self.make_local_identifier(base_name);
+        let symbol = Symbol::variable(name, base_name.to_owned(), typ.clone(), location)
             .with_is_parameter(is_parameter)
             .with_is_hidden(hidden)
             .with_is_state_var(false)
@@ -3177,7 +3294,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         self.symbols.insert(symbol);
         if is_parameter {
             self.symbols
-                .insert_parameter(self.function_name.clone(), name.clone());
+                .insert_parameter(self.function_name.clone(), name);
         }
         Expr::symbol_expression(name, typ).with_location(location)
     }
@@ -3353,28 +3470,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .with_symbol(self.function_name.clone())
         })?;
         Ok(expr.cast_to(typ))
-    }
-
-    fn const_usize(&self, value: BasicValueEnum<'ctx>) -> Result<usize> {
-        match value {
-            BasicValueEnum::IntValue(value) => value
-                .get_zero_extended_constant()
-                .map(|value| value as usize)
-                .ok_or_else(|| {
-                    Diagnostic::unsupported_feature(
-                        UnsupportedFeature::Instruction,
-                        format!("expected constant integer in {}", self.function_name),
-                    )
-                    .with_symbol(self.function_name.clone())
-                    .into()
-                }),
-            _ => Err(Diagnostic::unsupported_feature(
-                UnsupportedFeature::Instruction,
-                format!("expected integer operand in {}", self.function_name),
-            )
-            .with_symbol(self.function_name.clone())
-            .into()),
-        }
     }
 
     fn const_field_index(&self, expr: &Expr, typ: &Type) -> Result<usize> {

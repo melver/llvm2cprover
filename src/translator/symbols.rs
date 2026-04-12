@@ -243,7 +243,7 @@ impl SymbolBuilder {
     }
 
     fn collect_alloca_hint<'ctx>(&mut self, instruction: InstructionValue<'ctx>) -> Result<bool> {
-        let mut pointee = self
+        let pointee = self
             .lowerer
             .lower_basic(instruction.get_allocated_type().map_err(|_| {
                 super::Diagnostic::unsupported_feature(
@@ -251,14 +251,6 @@ impl SymbolBuilder {
                     "malformed alloca while recovering pointer types",
                 )
             })?)?;
-        if let Some(count) = instruction
-            .get_operand(0)
-            .and_then(|operand| operand.value())
-            .and_then(Self::constant_usize)
-            && count != 1
-        {
-            pointee = pointee.array_of(count);
-        }
         Ok(self
             .lowerer
             .note_pointer_pointee(instruction.as_value_ref() as usize, pointee))
@@ -1320,9 +1312,16 @@ mod tests {
                 .then_some(symbol)
             })
             .expect("alloca slot");
-        let field = symbols.lookup("f::field").expect("gep result");
+        let debug = stmt_debug(&symbols, "f");
+        let function = symbols.lookup("f").expect("function symbol");
         assert!(slot.is_auxiliary);
-        assert_eq!(field.typ.base_type(), Some(&Type::unsigned_int(32_u32)));
+        assert!(symbols.lookup("f::field").is_none());
+        assert!(debug.contains("Member"));
+        assert!(debug.contains("AddressOf"));
+        assert_eq!(
+            function.typ.return_type().and_then(Type::base_type),
+            Some(&Type::unsigned_int(32_u32))
+        );
     }
 
     #[test]
