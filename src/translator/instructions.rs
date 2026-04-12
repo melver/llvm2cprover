@@ -1060,15 +1060,24 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .with_location(loc)
         })?;
 
-        let args = (0..call.count_arguments())
-            .map(|index| self.lower_operand(instruction, index))
-            .collect::<Result<Vec<_>>>()?;
         let raw_callee = unsafe { LLVMGetCalledValue(call.as_value_ref()) };
         if self.try_lower_inline_asm_call(instruction, raw_callee, body)? {
             return Ok(());
         }
+        if let Some(callee) = unsafe { FunctionValue::new(raw_callee) } {
+            let callee_name = callee.get_name().to_string_lossy().into_owned();
+            if callee_name.starts_with("llvm.dbg.") {
+                // LLVM debug intrinsics carry source-level bookkeeping only. Drop them before
+                // lowering operands so optimized debug records with `poison` never enter the
+                // semantic translation path.
+                return Ok(());
+            }
+        }
         if let Some(callee) = call.get_called_fn_value() {
             let callee_name = callee.get_name().to_string_lossy().into_owned();
+            let args = (0..call.count_arguments())
+                .map(|index| self.lower_operand(instruction, index))
+                .collect::<Result<Vec<_>>>()?;
             if self.try_lower_special_call(instruction, &callee_name, &args, body)? {
                 return Ok(());
             }
@@ -1098,6 +1107,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(());
         }
 
+        let args = (0..call.count_arguments())
+            .map(|index| self.lower_operand(instruction, index))
+            .collect::<Result<Vec<_>>>()?;
         let function_expr = self.indirect_callee_expr(call, loc)?;
         let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
             &function_expr,
