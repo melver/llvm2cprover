@@ -1895,6 +1895,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         if callee_name.starts_with("llvm.memcpy") {
+            if self.is_zero_length_memory_intrinsic(args) {
+                return Ok(true);
+            }
             self.lower_builtin_call(
                 BuiltinFn::Memcpy,
                 args.get(0..3).unwrap_or(&[]),
@@ -1905,6 +1908,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         if callee_name.starts_with("llvm.memmove") || callee_name == "memmove" {
+            // Keep plain libc `memmove` on the normal builtin path; this zero-length short-circuit
+            // is only for LLVM intrinsics, where null pointers are allowed when `len == 0`.
+            if callee_name.starts_with("llvm.memmove") && self.is_zero_length_memory_intrinsic(args)
+            {
+                return Ok(true);
+            }
             self.lower_builtin_call(
                 BuiltinFn::Memmove,
                 args.get(0..3).unwrap_or(&[]),
@@ -1915,6 +1924,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         if callee_name.starts_with("llvm.memset") {
+            if self.is_zero_length_memory_intrinsic(args) {
+                return Ok(true);
+            }
             self.lower_builtin_call(
                 BuiltinFn::Memset,
                 args.get(0..3).unwrap_or(&[]),
@@ -1959,6 +1971,16 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         Ok(false)
+    }
+
+    fn is_zero_length_memory_intrinsic(&self, args: &[Expr]) -> bool {
+        // LLVM memory intrinsics are defined as no-ops when `len == 0`, even if the pointer
+        // operands are null or otherwise invalid. CBMC's C library preconditions reject those
+        // pointers before considering the zero length, so keep zero-length intrinsics in LLVM
+        // space and drop them here.
+        args.get(2)
+            .and_then(Expr::int_constant_value)
+            .is_some_and(|len| len == 0.into())
     }
 
     fn intrinsic_allow_zero(&self, callee_name: &str, args: &[Expr], kind: &str) -> Result<bool> {
