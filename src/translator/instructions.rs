@@ -13,7 +13,10 @@
 //! Unsupported instructions fail where they are encountered, which keeps
 //! diagnostics specific and avoids a second feature-classification pass.
 
-use std::{collections::HashMap, slice};
+use std::{
+    collections::{HashMap, HashSet},
+    slice,
+};
 
 use anyhow::Result;
 use cprover_bindings::goto_program::{
@@ -25,12 +28,13 @@ use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::core::{
-    LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause, LLVMGetInlineAsmAsmString,
-    LLVMGetInlineAsmCanUnwind, LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands,
-    LLVMGetNumClauses, LLVMGetNumMaskElements, LLVMGetSwitchCaseValue, LLVMGetUnwindDest,
-    LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
+    LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
+    LLVMGetInlineAsmAsmString, LLVMGetInlineAsmCanUnwind, LLVMGetMaskValue, LLVMGetNormalDest,
+    LLVMGetNumArgOperands, LLVMGetNumClauses, LLVMGetNumMaskElements, LLVMGetNumSuccessors,
+    LLVMGetSuccessor, LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAInlineAsm, LLVMIsCleanup,
+    LLVMIsUndef,
 };
-use inkwell::llvm_sys::prelude::LLVMValueRef;
+use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
     AnyValue, AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue,
@@ -128,17 +132,77 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
     }
 
+    /// Returns the function's basic blocks in reverse post-order (RPO).
+    ///
+    /// RPO guarantees every dominator is visited before the blocks it dominates.
+    /// That is required so that when `phi_edge_assignments` resolves an incoming
+    /// SSA value `[%v, %pred]`, the definition of `%v` has already been lowered
+    /// and is present in `self.values`.  The IR textual order produced by the
+    /// optimizer may place loop-exit blocks before the loop body, breaking the
+    /// assumption that definitions precede their uses in block order.
+    fn blocks_in_rpo(&self) -> Vec<BasicBlock<'ctx>> {
+        let entry = match self.function.get_first_basic_block() {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+
+        let mut post_order: Vec<LLVMBasicBlockRef> = Vec::new();
+        let mut visited: HashSet<LLVMBasicBlockRef> = HashSet::new();
+
+        // Stack entries: (block, terminator, next-successor-index).
+        // Storing the terminator avoids re-fetching it on every iteration.
+        // Marking blocks visited at push-time prevents them from being pushed twice.
+        let entry_ptr = entry.as_mut_ptr();
+        let entry_term = unsafe { LLVMGetBasicBlockTerminator(entry_ptr) };
+        visited.insert(entry_ptr);
+        let mut stack: Vec<(LLVMBasicBlockRef, LLVMValueRef, u32)> =
+            vec![(entry_ptr, entry_term, 0)];
+
+        while let Some((bb, term, next_succ)) = stack.last_mut() {
+            let (bb, term) = (*bb, *term);
+            let n_succs = if term.is_null() {
+                0
+            } else {
+                unsafe { LLVMGetNumSuccessors(term) }
+            };
+            let idx = *next_succ;
+            if idx < n_succs {
+                *next_succ += 1;
+                let succ = unsafe { LLVMGetSuccessor(term, idx) };
+                if visited.insert(succ) {
+                    let succ_term = unsafe { LLVMGetBasicBlockTerminator(succ) };
+                    stack.push((succ, succ_term, 0));
+                }
+            } else {
+                post_order.push(bb);
+                stack.pop();
+            }
+        }
+
+        // RPO = reverse of post-order.  Map raw refs back to inkwell wrappers.
+        post_order
+            .into_iter()
+            .rev()
+            .map(|bb| unsafe { BasicBlock::new(bb).expect("valid basic block") })
+            .collect()
+    }
+
     fn lower(mut self) -> Result<()> {
         self.declare_parameters()?;
-        let blocks = self.function.get_basic_blocks();
-        if blocks.is_empty() {
+        let all_blocks = self.function.get_basic_blocks();
+        if all_blocks.is_empty() {
             return Ok(());
         }
-        self.init_block_labels(&blocks);
-
+        // `init_block_labels` and `declare_phi_results` are order-independent;
+        // use the plain IR list so every block gets a label even if unreachable.
+        self.init_block_labels(&all_blocks);
         self.declare_phi_results()?;
+
+        // Lower blocks in RPO so that every SSA definition is available before
+        // phi_edge_assignments tries to reference it on a successor edge.
+        let rpo_blocks = self.blocks_in_rpo();
         let mut body = Vec::new();
-        for block in blocks {
+        for block in rpo_blocks {
             body.push(self.lower_basic_block(block)?);
         }
         // Many SSA temps and hidden locals are only discovered while lowering instructions, so
