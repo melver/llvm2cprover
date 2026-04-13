@@ -17,6 +17,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use cprover_bindings::goto_program::{DatatypeComponent, Symbol, Type};
+use inkwell::targets::TargetData;
 use inkwell::types::{AnyType, AnyTypeEnum, AsTypeRef, BasicTypeEnum, FunctionType, StructType};
 use inkwell::values::{AsValueRef, BasicValueEnum, FunctionValue, InstructionValue};
 
@@ -42,9 +43,23 @@ pub struct TypeLowerer {
     next_anonymous_struct: usize,
     pointer_hints: HashMap<usize, PointerHint>,
     function_return_hints: HashMap<usize, PointerHint>,
+    target_data: Option<TargetData>,
 }
 
 impl TypeLowerer {
+    /// Set the LLVM data layout used for struct padding computation.
+    ///
+    /// Without a data layout the lowerer emits struct fields with no explicit
+    /// padding.  CBMC's static bounds checker then computes a sizeof by summing
+    /// field sizes without alignment gaps, which is incorrect for structs that
+    /// contain fields requiring non-trivial alignment.  Providing the module's
+    /// data layout string lets the lowerer insert explicit `$pad` components
+    /// that match the gaps LLVM itself would place, so CBMC sees the correct
+    /// layout.
+    pub fn set_target_data(&mut self, data_layout: &str) {
+        self.target_data = Some(TargetData::create(data_layout));
+    }
+
     /// Lower any LLVM type into its GOTO representation.
     pub fn lower_any<'ctx>(
         &mut self,
@@ -226,17 +241,64 @@ impl TypeLowerer {
         &mut self,
         typ: StructType<'ctx>,
     ) -> std::result::Result<Type, Diagnostic> {
-        let components = typ
-            .get_field_types()
-            .into_iter()
-            .enumerate()
-            .map(|(index, field)| {
-                Ok(DatatypeComponent::field(
-                    format!("field{index}"),
-                    self.lower_basic(field)?,
-                ))
-            })
+        // Lower each LLVM field to its GOTO type first so we can query
+        // target_data for field offsets and sizes without borrow conflicts.
+        let field_types = typ.get_field_types();
+        let goto_fields: Vec<Type> = field_types
+            .iter()
+            .map(|&f| self.lower_basic(f))
             .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Build components, inserting explicit padding wherever the data layout
+        // leaves a gap between consecutive fields (and after the last field).
+        // Without explicit padding CBMC's static sizeof sums field widths with
+        // no alignment gaps, producing a value smaller than the real struct
+        // size; its bounds checker then statically proves byte-offset accesses
+        // are out-of-range and emits `ASSERT false`.
+        let nfields = field_types.len();
+        let mut components: Vec<DatatypeComponent> = Vec::new();
+        let mut pad_counter: usize = 0;
+
+        if let Some(td) = &self.target_data {
+            let mut cursor: u64 = 0; // running byte offset
+            for i in 0..nfields {
+                let field_offset = td.offset_of_element(&typ, i as u32).unwrap_or(cursor);
+                // Insert padding between cursor and this field's actual start.
+                if field_offset > cursor {
+                    let pad_bits = (field_offset - cursor) * 8;
+                    components.push(DatatypeComponent::padding(
+                        format!("$pad{pad_counter}"),
+                        pad_bits,
+                    ));
+                    pad_counter += 1;
+                }
+                components.push(DatatypeComponent::field(
+                    format!("field{i}"),
+                    goto_fields[i].clone(),
+                ));
+                cursor = field_offset + td.get_abi_size(&field_types[i]);
+            }
+            // Trailing padding to reach the struct's total ABI size.
+            let struct_size = td.get_abi_size(&typ);
+            if struct_size > cursor {
+                let pad_bits = (struct_size - cursor) * 8;
+                components.push(DatatypeComponent::padding(
+                    format!("$pad{pad_counter}"),
+                    pad_bits,
+                ));
+            }
+        } else {
+            // No data layout available; emit fields without padding.  CBMC
+            // will compute an incorrect sizeof for structs with alignment gaps,
+            // but this path is only hit for unusual translation configurations.
+            components = goto_fields
+                .into_iter()
+                .enumerate()
+                .map(|(index, goto_type)| {
+                    DatatypeComponent::field(format!("field{index}"), goto_type)
+                })
+                .collect();
+        }
 
         let tag = match typ.get_name().and_then(|name| name.to_str().ok()) {
             Some(name) => {

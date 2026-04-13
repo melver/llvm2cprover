@@ -10,10 +10,11 @@
 
 use cprover_bindings::goto_program::{Expr, Location, SymbolTable, Type};
 use inkwell::llvm_sys::LLVMOpcode;
+use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
-    LLVMAliasGetAliasee, LLVMGetAggregateElement, LLVMGetConstOpcode, LLVMGetNumOperands,
-    LLVMGetOperand, LLVMIsAConstantDataSequential, LLVMIsAConstantExpr, LLVMIsAGlobalAlias,
-    LLVMIsAGlobalVariable,
+    LLVMAliasGetAliasee, LLVMGetAggregateElement, LLVMGetConstOpcode, LLVMGetGEPSourceElementType,
+    LLVMGetIntTypeWidth, LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind,
+    LLVMIsAConstantDataSequential, LLVMIsAConstantExpr, LLVMIsAGlobalAlias, LLVMIsAGlobalVariable,
 };
 use inkwell::values::{
     AnyValue, ArrayValue, AsValueRef, BasicValueEnum, FloatValue, FunctionValue, GlobalValue,
@@ -487,6 +488,38 @@ impl GlobalLowerer {
             .split_first()
             .ok_or_else(|| self.unsupported(symbol, "malformed constant GEP initializer"))?;
         let mut current = self.lower_gep_root(symbol, *base, lowerer, location)?;
+
+        // With opaque pointers, byte-granularity GEPs use `i8` as the source element type
+        // and a single index that is a raw byte offset.  Typed GEPs (struct field navigation)
+        // have a non-i8 element type.  CBMC's array bounds checker uses element-count indexing,
+        // so byte GEPs must go through a `(char *)&base` cast rather than `base[byte_offset]`
+        // (which would be out of bounds for a 1-element wrapper array such as `fd_vm_t vm[1]`).
+        let src_elem_type = unsafe { LLVMGetGEPSourceElementType(value.as_value_ref()) };
+        let is_byte_gep = !src_elem_type.is_null()
+            && unsafe { LLVMGetTypeKind(src_elem_type) == LLVMTypeKind::LLVMIntegerTypeKind }
+            && unsafe { LLVMGetIntTypeWidth(src_elem_type) == 8 };
+
+        // Byte GEP: `getelementptr i8, ptr base, i64 N` — index is a raw byte offset.
+        // Use direct pointer arithmetic (`char* + N`) rather than array indexing
+        // (`char*[N]` = `address_of(*(char*+N))`).  The index/address_of round-trip
+        // creates a pointer that CBMC tracks as a 1-byte object; goto-instrument then
+        // statically proves wider loads/stores are out of bounds (`ASSERT false`) for
+        // large offsets into complex structs with embedded arrays.  Direct `+N` on a
+        // char* inherits the original allocation's full bounds.
+        if is_byte_gep {
+            let n = indexes
+                .first()
+                .map(|&idx| self.constant_index(symbol, idx))
+                .transpose()?
+                .unwrap_or(0);
+            let char_ptr = current.address_of().cast_to(Type::c_char().to_pointer());
+            let result = if n == 0 {
+                char_ptr
+            } else {
+                char_ptr.plus(Expr::int_constant(n as u64, Type::ssize_t()))
+            };
+            return Ok(result.with_location(*location).cast_to(typ.clone()));
+        }
 
         for (position, index) in indexes.iter().enumerate() {
             let index = self.constant_index(symbol, *index)?;
