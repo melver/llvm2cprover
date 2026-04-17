@@ -1154,9 +1154,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         body: &mut Vec<Stmt>,
     ) -> Result<()> {
         let loc = self.instruction_location(instruction);
+        // Opaque-pointer values can pick up more specific pointee hints than the function
+        // signature at individual return sites. Cast them back to the declared return
+        // type so all exits use one CBMC pointer sort.
+        let return_type = self.lowered_return_type();
         let value = (instruction.get_num_operands() != 0)
             .then(|| self.lower_operand(instruction, 0))
-            .transpose()?;
+            .transpose()?
+            .map(|value| value.cast_to(return_type));
         body.push(Stmt::ret(value, loc));
         Ok(())
     }
@@ -3058,11 +3063,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     }
 
     fn exceptional_return(&mut self, loc: Location) -> Result<Stmt> {
-        let return_type = self
-            .symbols
-            .lookup(self.function_name.as_str())
-            .and_then(|symbol| symbol.typ.return_type().cloned())
-            .unwrap_or_else(Type::empty);
+        let return_type = self.lowered_return_type();
         Ok(if return_type == Type::empty() {
             Stmt::ret(None, loc)
         } else {
@@ -3490,6 +3491,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
     fn instruction_location(&self, instruction: InstructionValue<'ctx>) -> Location {
         util::instruction_location(instruction, &self.function_name)
+    }
+
+    fn lowered_return_type(&self) -> Type {
+        self.symbols
+            .lookup(self.function_name.as_str())
+            .and_then(|symbol| symbol.typ.return_type().cloned())
+            .unwrap_or_else(Type::empty)
     }
 
     fn block_location(&self, block: BasicBlock<'ctx>) -> Location {
