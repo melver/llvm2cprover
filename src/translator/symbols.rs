@@ -49,15 +49,19 @@ impl SymbolBuilder {
         contracts: &ContractMap,
         unsound: bool,
     ) -> Result<SymbolTable> {
-        self.collect_pointer_hints(module)?;
         // Provide the LLVM data layout so the type lowerer can insert explicit
         // struct padding fields.  Without this CBMC computes a sizeof that sums
         // field sizes without alignment gaps and produces wrong bounds checks.
+        // This must happen before pointer-hint collection because hint recovery
+        // lowers pointee types for `alloca`, GEP, loads, and stores; if a named
+        // struct is first interned there without target data, the unpadded tag
+        // gets cached and later body lowering reuses the wrong layout.
         let data_layout = module.get_data_layout();
         let data_layout_str = data_layout.as_str().to_str().unwrap_or_default();
         if !data_layout_str.is_empty() {
             self.lowerer.set_target_data(data_layout_str);
         }
+        self.collect_pointer_hints(module)?;
         let mut symbols = SymbolTable::new(machine_model);
         insert_runtime_symbols(&mut symbols);
 
