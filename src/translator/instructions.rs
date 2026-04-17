@@ -101,6 +101,10 @@ struct FunctionLowerer<'a, 'ctx, 'c> {
     aggregates: HashMap<usize, Vec<Expr>>,
     prologue: Vec<Stmt>,
     next_tmp: usize,
+    // Stack of (stacksave value-ref key, VLA slot exprs allocated since that save).
+    // Innermost active save is last; stackrestore pops up to its matching entry and
+    // emits Stmt::dead for each tracked VLA slot.
+    stack_saves: Vec<(usize, Vec<Expr>)>,
 }
 
 impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
@@ -130,6 +134,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             aggregates: HashMap::new(),
             prologue: Vec::new(),
             next_tmp: 0,
+            stack_saves: Vec::new(),
         }
     }
 
@@ -837,6 +842,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                     let vla_type = allocated.variable_array_of(size_name);
                     let (slot, _) =
                         self.declare_hidden_local_at_point(body, "alloca", vla_type, loc);
+                    if let Some((_, slots)) = self.stack_saves.last_mut() {
+                        slots.push(slot.clone());
+                    }
                     slot.array_to_ptr()
                 }
             }
@@ -1933,6 +1941,30 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 instruction,
                 body,
             )?;
+            return Ok(true);
+        }
+
+        if callee_name.starts_with("llvm.stacksave") {
+            let key = instruction.as_value_ref() as usize;
+            self.stack_saves.push((key, vec![]));
+            // Opaque scope token used only by stackrestore; null keeps the SSA value defined.
+            self.assign_result(instruction, body, Type::void_pointer().null())?;
+            return Ok(true);
+        }
+
+        if callee_name.starts_with("llvm.stackrestore") {
+            let save_key = instruction
+                .get_operand(0)
+                .and_then(|op| op.value())
+                .map(|v| v.as_value_ref() as usize);
+            if let Some(key) = save_key {
+                // rposition handles non-LIFO restores; for well-nested scopes it's always last.
+                if let Some(pos) = self.stack_saves.iter().rposition(|(k, _)| *k == key) {
+                    for slot in self.stack_saves.drain(pos..).flat_map(|(_, slots)| slots) {
+                        body.push(Stmt::dead(slot, loc));
+                    }
+                }
+            }
             return Ok(true);
         }
 
