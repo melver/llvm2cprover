@@ -14,8 +14,12 @@ That runs formatting checks, unit tests, the E2E suite, and clippy.
 
 - Prefer simple, maintainable, idiomatic Rust over extra feature coverage that
   would add disproportionate complexity.
-- Keep translation code direct. Avoid speculative abstractions.
-- Prefer explicit error handling over panics in production paths.
+- Avoid speculative abstractions.
+- Prefer explicit error handling over panics in production paths. Use concrete
+  error types at internal domain boundaries where callers branch on error kind.
+  `Result<_, String>` can be used at display boundaries where callers never
+  inspect the error variant (e.g. CLI entry points and trait methods that
+  terminate in user-facing output).
 - Add dependencies incrementally, only when the implementation needs them.
 
 ## Tests
@@ -40,6 +44,8 @@ TAP. Run with `make test-e2e`.
 ## Documentation
 
 - Keep public rustdoc minimal and useful.
+- Add executable rustdoc examples for public APIs where a short example clarifies
+  intended use or important semantics.
 - Add short rationale comments on non-trivial code paths when future readers
   would otherwise have to reconstruct the invariant or semantic constraint from
   scratch.
