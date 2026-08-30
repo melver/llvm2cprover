@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026, Marco Elver <me@marcoelver.com>
+// Copyright 2026 The llvm2cprover Authors
 
 //! Symbol discovery for globals, functions, and aggregate tags.
 //!

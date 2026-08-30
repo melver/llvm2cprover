@@ -2,7 +2,7 @@
 name = "llvm2cprover"
 version = "0.1.0"
 edition = "2024"
-authors = ["Marco Elver <me@marcoelver.com>"]
+authors = ["The llvm2cprover Authors"]
 license = "Apache-2.0"
 description = "LLVM to GOTO-C translator"
 

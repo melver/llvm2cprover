@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026, Marco Elver <me@marcoelver.com>
+# Copyright 2026 The llvm2cprover Authors
 
 """Run end-to-end translator tests and print TAP."""
 
