@@ -21,7 +21,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::{fs, io::Read};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use cprover_bindings::goto_program::Location;
 use cprover_bindings::irep::goto_binary_serde::write_goto_binary_file;
 use inkwell::context::Context;
@@ -36,6 +36,7 @@ use crate::{Config, InputFormat};
 
 pub mod globals;
 pub mod instructions;
+mod rename;
 pub mod symbols;
 pub mod types;
 
@@ -144,8 +145,18 @@ impl Translator {
         let module = parse_module(&context, &input, self.config.input_format, &bytes)?;
         reject_module_inline_asm(&module)?;
         let contracts = contracts::load_contracts(&self.config.contracts)?;
-        let output = util::output_path(&input, self.config.output.as_deref());
         let machine_model = util::resolve_machine_model(&module, self.config.machine_model)?;
+        if let Some(prefix) = self.config.rename_prefix.as_deref()
+            && !prefix.is_empty()
+        {
+            if !contracts.is_empty() {
+                bail!(
+                    "--rename-prefix cannot currently be combined with --contracts; contract manifests name original LLVM symbols"
+                );
+            }
+            rename::rename_module_symbols(&module, &machine_model, prefix)?;
+        }
+        let output = util::output_path(&input, self.config.output.as_deref());
         let mut symbols = SymbolBuilder::default().build(
             &module,
             machine_model,

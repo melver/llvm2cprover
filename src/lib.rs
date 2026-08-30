@@ -50,6 +50,12 @@ pub struct Config {
     pub output: Option<PathBuf>,
     /// TOML contract manifests loaded alongside the translated module.
     pub contracts: Vec<PathBuf>,
+    /// Prefix applied to translated LLVM function and global definitions.
+    ///
+    /// External declarations, LLVM intrinsics, and verifier/runtime symbols remain unprefixed.
+    /// Contract manifests cannot currently be combined with renaming because their symbol bindings
+    /// use original LLVM names.
+    pub rename_prefix: Option<String>,
     /// Machine model used for emitted GOTO types and builtins. `Auto` infers from the module.
     pub machine_model: MachineModel,
     /// LLVM input format override. `Auto` detects bitcode vs textual IR.

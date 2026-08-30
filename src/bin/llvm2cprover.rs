@@ -65,6 +65,10 @@ struct Cli {
     #[arg(long = "contracts")]
     contracts: Vec<PathBuf>,
 
+    /// Prefix translated LLVM function and global definitions.
+    #[arg(long)]
+    rename_prefix: Option<String>,
+
     #[arg(long, value_enum, default_value_t = CliMachineModel::Auto)]
     machine_model: CliMachineModel,
 
@@ -85,6 +89,7 @@ fn main() -> std::process::ExitCode {
     let config = Config {
         output: cli.output,
         contracts: cli.contracts,
+        rename_prefix: cli.rename_prefix,
         machine_model: cli.machine_model.into(),
         input_format: cli.input_format.into(),
         unsound: cli.unsound,

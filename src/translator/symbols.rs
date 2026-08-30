@@ -496,7 +496,7 @@ fn pthread_t_type() -> Type {
     Type::c_size_t().to_typedef("pthread_t")
 }
 
-fn insert_runtime_symbols(symbols: &mut SymbolTable) {
+pub(super) fn insert_runtime_symbols(symbols: &mut SymbolTable) {
     if symbols.lookup("__CPROVER_deallocated").is_none() {
         // CBMC's own C front-end seeds this pointer before library instrumentation runs.
         // LLVM-originated GOTO lacks that path, so we add the same global explicitly.

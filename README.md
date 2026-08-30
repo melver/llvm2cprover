@@ -41,6 +41,20 @@ Translate textual LLVM IR:
 llvm2cprover --input-format ll input.ll -o input.goto
 ```
 
+Prefix module-level symbols for independently translated variants:
+
+```sh
+llvm2cprover --rename-prefix old_ old.bc -o old.goto
+cbmc old.goto --function old_main
+```
+
+Renaming applies to function and global definitions and every reference to those definitions.
+External declarations remain shared so unresolved dependencies keep their normal runtime and
+library bindings. LLVM intrinsics, `__CPROVER_*` builtins, and llvm2cprover runtime symbols also
+remain shared. An empty prefix is a no-op. Contract manifests cannot currently be combined with a
+nonempty prefix because manifests refer to original LLVM symbol names; the translator rejects that
+combination instead of silently dropping contracts.
+
 For automation, `--diagnostics json` writes exactly one JSON object to stderr
 when translation fails. The object always has `kind` and `message` fields.
 Unsupported-feature errors additionally have an `unsupported_feature` field,

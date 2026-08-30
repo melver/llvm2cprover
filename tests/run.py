@@ -36,6 +36,7 @@ class TestCase:
     clang_flags: tuple[str, ...] = ()
     rustc_flags: tuple[str, ...] = ()
     cbmc_flags: tuple[str, ...] = ()
+    translator_flags: tuple[str, ...] = ()
     skip: bool = False
     skip_reason: str = ""
     todo: str = ""
@@ -82,6 +83,7 @@ def load_test(path: Path) -> TestCase:
         clang_flags=tuple(metadata.get("clang_flags", [])),
         rustc_flags=tuple(metadata.get("rustc_flags", [])),
         cbmc_flags=tuple(metadata.get("cbmc_flags", [])),
+        translator_flags=tuple(metadata.get("translator_flags", [])),
         skip=bool(metadata.get("skip", False)),
         skip_reason=metadata.get("skip_reason", ""),
         todo=str(metadata.get("todo", "")),
@@ -180,6 +182,7 @@ def translate_module(
     args: argparse.Namespace,
     goto_path: Path,
     contract_flags: list[str],
+    translator_flags: tuple[str, ...],
 ) -> tuple[str, subprocess.CompletedProcess[str]]:
     translate = decode_result(
         subprocess.run(
@@ -189,6 +192,7 @@ def translate_module(
                 "--input-format",
                 input_format,
                 *contract_flags,
+                *translator_flags,
                 "-o",
                 str(goto_path),
             ],
@@ -227,6 +231,7 @@ def translate_test(
                     "--input-format",
                     "ll",
                     *contract_flags,
+                    *test.translator_flags,
                     "-o",
                     str(goto_path),
                 ],
@@ -239,7 +244,14 @@ def translate_test(
     module = run_binary_command(command, cwd=ROOT)
     if module.returncode != 0:
         return (tool, decode_result(module))
-    return translate_module(module, input_format, args, goto_path, contract_flags)
+    return translate_module(
+        module,
+        input_format,
+        args,
+        goto_path,
+        contract_flags,
+        test.translator_flags,
+    )
 
 
 def run_cbmc(test: TestCase, args: argparse.Namespace, goto_path: Path) -> subprocess.CompletedProcess[str]:
