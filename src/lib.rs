@@ -54,7 +54,10 @@ pub struct Config {
     pub machine_model: MachineModel,
     /// LLVM input format override. `Auto` detects bitcode vs textual IR.
     pub input_format: InputFormat,
-    /// Enable explicitly unsound fallbacks for unsupported constructs when probing coverage.
+    /// Enable selected, explicitly documented unsound fallbacks when probing coverage.
+    ///
+    /// Constructs whose effects cannot be bounded, such as target inline assembly, still fail
+    /// closed.
     pub unsound: bool,
 }
 

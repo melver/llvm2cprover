@@ -1431,19 +1431,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             }
         }
 
-        if self.unsound {
-            if instruction.get_type().is_void_type() {
-                return Ok(true);
-            }
-            let lhs = self.declare_instruction_result(instruction)?;
-            body.push(Stmt::assign(
-                lhs.clone(),
-                Expr::nondet(lhs.typ().clone()),
-                loc,
-            ));
-            return Ok(true);
-        }
-
+        // Real target assembly may read or mutate memory through constraints and clobbers that
+        // are not represented by its LLVM return value. Dropping it is therefore unsound even
+        // when the caller permits selected approximations with `--unsound`; always fail closed.
         Err(Diagnostic::unsupported_feature(
             UnsupportedFeature::InlineAsm,
             format!("unsupported inline asm call in {}", self.function_name),

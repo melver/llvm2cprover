@@ -565,6 +565,7 @@ fn insert_eh_runtime_symbol(symbols: &mut SymbolTable, name: &str, typ: Type, in
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translator::DiagnosticKind;
     use inkwell::context::Context;
     use inkwell::memory_buffer::MemoryBuffer;
 
@@ -939,6 +940,56 @@ mod tests {
 
         let debug = stmt_debug(&symbols, "f");
         assert!(debug.contains("Return"));
+    }
+
+    #[test]
+    fn rejects_void_inline_asm_in_unsound_mode() {
+        let error = build_symbols_result_with_config_from_ir(
+            br#"
+            define void @f(ptr %p) {
+            entry:
+              call void asm sideeffect "movq $$0, ($0)", "r,~{memory}"(ptr %p)
+              ret void
+            }
+        "#,
+            true,
+        )
+        .expect_err("unsound mode must not discard stateful void inline asm");
+
+        let diagnostic = error
+            .downcast_ref::<Diagnostic>()
+            .expect("expected structured diagnostic");
+        assert_eq!(
+            diagnostic.kind,
+            DiagnosticKind::UnsupportedFeature(UnsupportedFeature::InlineAsm)
+        );
+        assert_eq!(diagnostic.symbol.as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn rejects_result_inline_asm_in_unsound_mode() {
+        let error = build_symbols_result_with_config_from_ir(
+            br#"
+            define i64 @f(ptr %p) {
+            entry:
+              %result = call i64 asm sideeffect "movq ($1), $0", "=r,r,~{memory}"(ptr %p)
+              ret i64 %result
+            }
+        "#,
+            true,
+        )
+        .expect_err(
+            "unsound mode must not replace stateful inline asm results with nondeterminism",
+        );
+
+        let diagnostic = error
+            .downcast_ref::<Diagnostic>()
+            .expect("expected structured diagnostic");
+        assert_eq!(
+            diagnostic.kind,
+            DiagnosticKind::UnsupportedFeature(UnsupportedFeature::InlineAsm)
+        );
+        assert_eq!(diagnostic.symbol.as_deref(), Some("f"));
     }
 
     #[test]
