@@ -1,0 +1,3 @@
+[functions.__CPROVER_nondet_int]
+ensures = "contract_ensures_nondet_int"
+assigns = []

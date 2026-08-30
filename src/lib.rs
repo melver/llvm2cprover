@@ -115,6 +115,11 @@ pub struct Config {
     pub output: Option<PathBuf>,
     /// TOML contract manifests loaded alongside the translated module.
     pub contracts: Vec<PathBuf>,
+    /// Functions whose direct calls are replaced by their manifest contracts.
+    ///
+    /// Replacement is explicit per translation. Each selected function must have a contract
+    /// with an explicitly present `assigns` clause, including `assigns = []` for a pure function.
+    pub replace_with_contract: BTreeSet<String>,
     /// Prefix applied to translated LLVM function and global definitions.
     ///
     /// External declarations, LLVM intrinsics, and verifier/runtime symbols remain unprefixed.

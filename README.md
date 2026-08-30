@@ -75,8 +75,9 @@ after successful translation. It contains:
 - referenced-but-undefined input functions (unused declarations are omitted)
 - every enabled approximation actually taken, including its enclosing function
   and best-effort source location
-- every contract applied at a direct call site and its discharge status; all currently report
-  `discharged: false` because contract enforcement is not yet implemented
+- every contract applied at a direct call site, whether it was instrumentation or an explicit
+  replacement, and whether the contract has been checked against the preserved implementation;
+  replacements currently report `discharged: false`
 - the resolved machine model and the input module's raw target triple and data layout
 
 The report has a numeric `schema_version` field for consumers. A report path
@@ -110,12 +111,26 @@ Contract workflow:
 2. Compile and link them into the module under test.
 3. Pass the manifest with `--contracts`.
 
+To replace selected direct calls with their contracts, repeat
+`--replace-with-contract <function>` as needed. Replacement is deliberately opt-in per run; the
+original function body remains in the GOTO program for separate contract checking. A replacement
+asserts `requires`, executes the `assigns` helpers to havoc exactly the declared frame, creates a
+nondeterministic return value, and assumes `ensures`. The manifest must explicitly include an
+`assigns` key: use `assigns = []` to declare that the replacement is pure. Replacement and `model`
+are mutually exclusive. For variadic targets, helpers summarize the fixed parameters and the
+replacement ignores extra arguments. The current bindings cannot attach native assigns metadata to
+a variadic symbol, so a selected variadic replacement enforces its frame through the replacement
+body; an unselected variadic contract with `assigns` fails closed. Address-taken/indirect uses and
+`invoke` uses of selected functions fail closed until their replacement semantics are supported.
+
 Supported directives:
 
 - `requires`: inserts a pre-call `__CPROVER_assume(...)`
 - `ensures`: inserts a post-call `__CPROVER_assert(...)`
 - `model`: redirects direct calls to a helper function
-- `assigns`: attaches CBMC assigns metadata and generates extern stub bodies
+- `assigns`: attaches CBMC assigns metadata to defined and external functions, generates stub bodies
+  only for unselected external declarations with a nonempty frame, and supplies the writable frame
+  for explicit contract replacement; defined function bodies remain intact
 
 ## Design
 

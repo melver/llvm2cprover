@@ -8,7 +8,8 @@
 //! - SSA values become declared temporaries
 //! - PHI nodes are lowered on predecessor edges
 //! - basic blocks become labeled GOTO blocks
-//! - contracts are injected at call sites, not parsed as a separate DSL
+//! - ordinary contracts are injected at call sites, while explicitly selected calls redirect
+//!   to internal replacement functions synthesized from the compiled helpers
 //!
 //! Unsupported instructions fail where they are encountered, which keeps
 //! diagnostics specific and avoids a second feature-classification pass.
@@ -47,6 +48,7 @@ use super::globals::GlobalLowerer;
 use super::report::ReportCollector;
 use super::types::TypeLowerer;
 use super::{Diagnostic, EH_ACTIVE_SYMBOL, EH_PTR_SYMBOL, EH_SELECTOR_SYMBOL, UnsupportedFeature};
+use crate::contracts::inject::ReplacementMap;
 use crate::contracts::{ContractMap, FunctionContract};
 use crate::util;
 use crate::{UnsoundFeature, UnsoundOptions};
@@ -58,6 +60,7 @@ use crate::{UnsoundFeature, UnsoundOptions};
 #[derive(Debug)]
 pub struct InstructionLowerer<'a> {
     contracts: &'a ContractMap,
+    replacements: &'a ReplacementMap,
     unsound: &'a UnsoundOptions,
     report: &'a mut ReportCollector,
 }
@@ -66,11 +69,13 @@ impl<'a> InstructionLowerer<'a> {
     /// Create an instruction lowerer with the active contract map.
     pub(crate) fn new(
         contracts: &'a ContractMap,
+        replacements: &'a ReplacementMap,
         unsound: &'a UnsoundOptions,
         report: &'a mut ReportCollector,
     ) -> Self {
         Self {
             contracts,
+            replacements,
             unsound,
             report,
         }
@@ -90,6 +95,7 @@ impl<'a> InstructionLowerer<'a> {
             types,
             globals,
             self.contracts,
+            self.replacements,
             self.unsound,
             self.report,
         )
@@ -105,6 +111,7 @@ struct FunctionLowerer<'a, 'ctx, 'c> {
     types: &'a mut TypeLowerer,
     globals: &'a mut GlobalLowerer,
     contracts: &'c ContractMap,
+    replacements: &'c ReplacementMap,
     unsound: &'c UnsoundOptions,
     report: &'c mut ReportCollector,
     suppress_contracts: bool,
@@ -127,6 +134,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         types: &'a mut TypeLowerer,
         globals: &'a mut GlobalLowerer,
         contracts: &'c ContractMap,
+        replacements: &'c ReplacementMap,
         unsound: &'c UnsoundOptions,
         report: &'c mut ReportCollector,
     ) -> Self {
@@ -141,6 +149,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             types,
             globals,
             contracts,
+            replacements,
             unsound,
             report,
             block_labels: HashMap::new(),
@@ -151,6 +160,17 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             next_tmp: 0,
             stack_saves: Vec::new(),
         }
+    }
+
+    /// The internal symbol a direct call to `callee_name` is redirected to, if any.
+    ///
+    /// Contract helpers are compiled as ordinary code, so a helper that calls its own target
+    /// must not recursively re-enter the replacement it implements.
+    fn replacement_symbol(&self, callee_name: &str) -> Option<&'c str> {
+        if self.suppress_contracts {
+            return None;
+        }
+        self.replacements.get(callee_name).map(String::as_str)
     }
 
     /// Returns the function's basic blocks in reverse post-order (RPO).
@@ -1214,7 +1234,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             let args = (0..call.count_arguments())
                 .map(|index| self.lower_operand(instruction, index))
                 .collect::<Result<Vec<_>>>()?;
-            if self.try_lower_special_call(instruction, &callee_name, &args, body)? {
+            let replacement = self.replacement_symbol(&callee_name);
+            if replacement.is_none()
+                && self.try_lower_special_call(instruction, &callee_name, &args, body)?
+            {
                 self.report.resolved_function(&callee_name);
                 return Ok(());
             }
@@ -1224,16 +1247,21 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .flatten()
                 .cloned();
             if contract.is_some() {
-                self.report.relied_contract(&callee_name);
+                self.report
+                    .relied_contract(&callee_name, replacement.is_some());
             }
-            if let Some(contract) = &contract {
+            if let Some(contract) = &contract
+                && replacement.is_none()
+            {
                 self.lower_requires_helper(contract, &callee_name, &args, body, loc)?;
             }
 
-            let effective_callee = contract
-                .as_ref()
-                .and_then(|contract| contract.model.as_deref())
-                .unwrap_or(callee_name.as_str());
+            let effective_callee = replacement.unwrap_or_else(|| {
+                contract
+                    .as_ref()
+                    .and_then(|contract| contract.model.as_deref())
+                    .unwrap_or(callee_name.as_str())
+            });
             let function_expr = self.function_expr(effective_callee, loc)?;
             let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
                 &function_expr,
@@ -1241,7 +1269,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 self.symbols.machine_model(),
             );
             self.emit_call_result(instruction, function_expr, arguments, body, loc)?;
-            if let Some(contract) = &contract {
+            if let Some(contract) = &contract
+                && replacement.is_none()
+            {
                 self.lower_ensures_helper(contract, &callee_name, &args, instruction, body, loc)?;
             }
             return Ok(());
@@ -1304,7 +1334,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         if let Some(callee) = unsafe { FunctionValue::new(raw_callee) } {
             let callee_name = callee.get_name().to_string_lossy().into_owned();
-            if self.try_lower_special_call(instruction, &callee_name, &args, body)? {
+            let replacement = self.replacement_symbol(&callee_name);
+            if replacement.is_none()
+                && self.try_lower_special_call(instruction, &callee_name, &args, body)?
+            {
                 self.report.resolved_function(&callee_name);
                 body.push(self.branch_on_exception(predecessor, normal_dest, unwind_dest)?);
                 return Ok(());
@@ -1315,7 +1348,18 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .flatten()
                 .cloned();
             if contract.is_some() {
-                self.report.relied_contract(&callee_name);
+                self.report.relied_contract(&callee_name, false);
+            }
+            // `validate_contract_replacement_uses` rejects these before lowering; stay
+            // fail-closed here rather than silently ignoring the requested replacement.
+            if replacement.is_some() {
+                return Err(Diagnostic::unsupported_feature(
+                    UnsupportedFeature::Instruction,
+                    super::invoke_replacement_message(&callee_name),
+                )
+                .with_symbol(callee_name)
+                .with_location(loc)
+                .into());
             }
             if let Some(contract) = &contract {
                 self.lower_requires_helper(contract, &callee_name, &args, body, loc)?;
@@ -1990,7 +2034,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             || callee_name.starts_with("llvm.lifetime.end")
         {
             // Lifetime markers only guide optimization. Dropping them keeps the memory state
-            // unchanged, which is the intended Phase 1 fail-open behavior for these intrinsics.
+            // unchanged, which is the intended behavior for these metadata-only intrinsics.
             return Ok(true);
         }
 

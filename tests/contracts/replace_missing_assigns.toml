@@ -1,0 +1,2 @@
+[functions.target]
+ensures = "contract_ensures_target"

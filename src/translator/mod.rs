@@ -17,6 +17,7 @@
 //! implementation fail-closed without duplicating feature knowledge in two
 //! places.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::{fs, io::Read};
@@ -25,9 +26,14 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use cprover_bindings::goto_program::Location;
 use cprover_bindings::irep::goto_binary_serde::write_goto_binary_file;
 use inkwell::context::Context;
-use inkwell::llvm_sys::core::LLVMGetModuleInlineAsm;
+use inkwell::llvm_sys::core::{
+    LLVMGetCalledValue, LLVMGetFirstUse, LLVMGetModuleInlineAsm, LLVMGetNextUse,
+    LLVMGetNumOperands, LLVMGetOperand, LLVMGetUser, LLVMIsACallInst, LLVMIsAInvokeInst,
+};
+use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::Module;
+use inkwell::values::AsValueRef;
 use serde::Serialize;
 
 use crate::contracts;
@@ -75,7 +81,7 @@ pub enum DiagnosticKind {
     UnsupportedType,
 }
 
-/// Phase 1 feature classes that currently fail closed.
+/// LLVM feature classes that currently fail closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedFeature {
     ControlFlow,
@@ -146,6 +152,7 @@ impl Translator {
         let module = parse_module(&context, &input, self.config.input_format, &bytes)?;
         reject_module_inline_asm(&module)?;
         let contracts = contracts::load_contracts(&self.config.contracts)?;
+        validate_contract_replacement_uses(&module, &self.config.replace_with_contract)?;
         let resolved_machine_model =
             util::resolve_machine_model_kind(&module, self.config.machine_model)?;
         let machine_model = util::machine_model_for(&module, resolved_machine_model);
@@ -168,10 +175,15 @@ impl Translator {
             &module,
             machine_model,
             &contracts,
+            &self.config.replace_with_contract,
             &self.config.unsound,
             &mut report,
         )?;
-        contracts::inject::inject_contracts(&mut symbols, &contracts)?;
+        contracts::inject::inject_contracts_with_replacements(
+            &mut symbols,
+            &contracts,
+            &self.config.replace_with_contract,
+        )?;
         write_goto_binary_file(output.as_path(), &symbols);
         if let Some(path) = self.config.report.as_deref() {
             report::write_report(
@@ -185,6 +197,51 @@ impl Translator {
         }
         Ok(())
     }
+}
+
+fn validate_contract_replacement_uses(
+    module: &Module<'_>,
+    replacements: &BTreeSet<String>,
+) -> Result<()> {
+    for name in replacements {
+        let Some(function) = module.get_function(name) else {
+            continue;
+        };
+        let mut usage = unsafe { LLVMGetFirstUse(function.as_value_ref()) };
+        while !usage.is_null() {
+            let user = unsafe { LLVMGetUser(usage) };
+            let is_call = unsafe { !LLVMIsACallInst(user).is_null() };
+            let is_invoke = unsafe { !LLVMIsAInvokeInst(user).is_null() };
+            if is_invoke {
+                bail!("{}", invoke_replacement_message(name));
+            }
+            let direct_call =
+                is_call && unsafe { LLVMGetCalledValue(user) == function.as_value_ref() };
+            // A direct call must mention the callee exactly once; a second occurrence means the
+            // address is also passed as an argument.
+            if !direct_call || self_operand_count(user, function.as_value_ref()) != 1 {
+                bail!(
+                    "contract replacement for `{name}` requires direct calls only; its address is used indirectly"
+                );
+            }
+            usage = unsafe { LLVMGetNextUse(usage) };
+        }
+    }
+    Ok(())
+}
+
+/// How many operands of `user` refer to `value`.
+fn self_operand_count(user: LLVMValueRef, value: LLVMValueRef) -> usize {
+    let operand_count = unsafe { LLVMGetNumOperands(user) };
+    debug_assert!(operand_count >= 0);
+    (0..operand_count as u32)
+        .filter(|index| unsafe { LLVMGetOperand(user, *index) == value })
+        .count()
+}
+
+/// Shared wording for the one unsupported replacement call form.
+pub(crate) fn invoke_replacement_message(name: &str) -> String {
+    format!("contract replacement for `{name}` does not support invoke")
 }
 
 fn read_input(input: &TranslationInput) -> Result<Vec<u8>> {

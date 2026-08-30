@@ -1,0 +1,3 @@
+[functions.target]
+requires = "contract_requires_target"
+assigns = []

@@ -6,7 +6,7 @@
 //! Reports are emitted only after lowering and GOTO serialization succeed, so a
 //! failed translation cannot leave behind a newly generated report.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -31,7 +31,7 @@ use super::JsonLocation;
 pub(crate) struct ReportCollector {
     enabled: bool,
     approximations: Vec<Approximation>,
-    relied_contracts: BTreeSet<String>,
+    relied_contracts: BTreeMap<String, bool>,
     resolved_functions: BTreeSet<String>,
 }
 
@@ -63,9 +63,12 @@ impl ReportCollector {
     }
 
     /// Record that a direct call site was lowered against a manifest contract.
-    pub(crate) fn relied_contract(&mut self, function: &str) {
+    pub(crate) fn relied_contract(&mut self, function: &str, replacement: bool) {
         if self.enabled {
-            self.relied_contracts.insert(function.to_owned());
+            *self
+                .relied_contracts
+                .entry(function.to_owned())
+                .or_default() |= replacement;
         }
     }
 
@@ -100,14 +103,15 @@ struct TranslationReport {
 #[derive(Debug, Serialize)]
 struct ContractAssumption {
     function: String,
+    reliance: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     requires: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ensures: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    assigns: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assigns: Option<Vec<String>>,
     discharged: bool,
 }
 
@@ -147,8 +151,10 @@ pub(crate) fn write_report(
         approximations,
         contracts: contracts
             .iter()
-            .filter(|(name, _)| relied_contracts.contains(*name))
-            .map(contract_assumption)
+            .filter_map(|(name, contract)| {
+                let replacement = *relied_contracts.get(name)?;
+                Some(contract_assumption((name, contract), replacement))
+            })
             .collect(),
     };
     let bytes = serde_json::to_vec_pretty(&report).expect("translation report is serializable");
@@ -159,7 +165,7 @@ pub(crate) fn write_report(
 fn undefined_functions(
     module: &Module<'_>,
     contracts: &ContractMap,
-    relied_contracts: &BTreeSet<String>,
+    relied_contracts: &BTreeMap<String, bool>,
     resolved_functions: &BTreeSet<String>,
     symbols: &SymbolTable,
 ) -> Vec<String> {
@@ -174,13 +180,18 @@ fn undefined_functions(
         })
         .collect::<BTreeSet<_>>();
 
-    for (target, contract) in contracts
-        .iter()
-        .filter(|(target, _)| relied_contracts.contains(*target))
-    {
+    for (target, contract, replaced) in contracts.iter().filter_map(|(target, contract)| {
+        relied_contracts
+            .get(target)
+            .map(|replaced| (target, contract, *replaced))
+    }) {
         // Models redirect the call, while assigns synthesizes a body for the
-        // external target. Neither leaves the original declaration as a stub.
-        if contract.model.is_some() || !contract.assigns.is_empty() {
+        // external target. Explicit replacements redirect even an empty-frame
+        // contract. None leaves the original declaration as a relied-upon stub.
+        if contract.model.is_some()
+            || contract.assigns.as_ref().is_some_and(|a| !a.is_empty())
+            || replaced
+        {
             undefined.remove(target);
         }
         for helper in [
@@ -190,7 +201,7 @@ fn undefined_functions(
         ]
         .into_iter()
         .flatten()
-        .chain(contract.assigns.iter().map(String::as_str))
+        .chain(contract.assigns.iter().flatten().map(String::as_str))
         {
             if is_unresolved_function(symbols, helper) {
                 undefined.insert(helper.to_owned());
@@ -211,15 +222,23 @@ fn is_referenced(function: FunctionValue<'_>) -> bool {
     unsafe { !LLVMGetFirstUse(function.as_value_ref()).is_null() }
 }
 
-fn contract_assumption((name, contract): (&str, &FunctionContract)) -> ContractAssumption {
+fn contract_assumption(
+    (name, contract): (&str, &FunctionContract),
+    replacement: bool,
+) -> ContractAssumption {
     ContractAssumption {
         function: name.to_owned(),
+        reliance: if replacement {
+            "replacement"
+        } else {
+            "instrumentation"
+        },
         requires: contract.requires.clone(),
         ensures: contract.ensures.clone(),
         model: contract.model.clone(),
         assigns: contract.assigns.clone(),
-        // E3 contract discharge is not implemented. Make trust explicit instead
-        // of implying that call-site instrumentation proves the helper contract.
+        // Contract discharge is not implemented. Make trust explicit instead of
+        // implying that call-site instrumentation proves the helper contract.
         discharged: false,
     }
 }

@@ -1,0 +1,4 @@
+[functions.target]
+requires = "contract_requires_target"
+ensures = "contract_ensures_target"
+assigns = ["contract_assigns_target"]

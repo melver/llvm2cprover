@@ -8,6 +8,8 @@
 //! module also runs the pointer-pointee recovery fixed point that reconstructs
 //! typed pointers from opaque LLVM `ptr` values.
 
+use std::collections::BTreeSet;
+
 use anyhow::Result;
 use cprover_bindings::MachineModel as GotoMachineModel;
 use cprover_bindings::goto_program::{
@@ -54,10 +56,12 @@ impl SymbolBuilder {
         contracts: &ContractMap,
         unsound: &UnsoundOptions,
     ) -> Result<SymbolTable> {
+        let replacements = BTreeSet::new();
         self.build_reporting(
             module,
             machine_model,
             contracts,
+            &replacements,
             unsound,
             &mut ReportCollector::default(),
         )
@@ -69,6 +73,7 @@ impl SymbolBuilder {
         module: &Module<'ctx>,
         machine_model: GotoMachineModel,
         contracts: &ContractMap,
+        replacements: &BTreeSet<String>,
         unsound: &UnsoundOptions,
         report: &mut ReportCollector,
     ) -> Result<SymbolTable> {
@@ -137,7 +142,9 @@ impl SymbolBuilder {
 
         self.insert_pending_aggregate_symbols(&mut symbols);
 
-        let mut instructions = InstructionLowerer::new(contracts, unsound, report);
+        let replacements =
+            crate::contracts::inject::prepare_replacements(&mut symbols, contracts, replacements)?;
+        let mut instructions = InstructionLowerer::new(contracts, &replacements, unsound, report);
         for function in module.get_functions() {
             if function.count_basic_blocks() != 0 {
                 instructions.lower_function(

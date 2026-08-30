@@ -37,8 +37,10 @@ pub struct FunctionContract {
     pub ensures: Option<String>,
     /// Helper function used instead of the original callee.
     pub model: Option<String>,
-    /// Void helper functions that describe the writable locations of an extern.
-    pub assigns: Vec<String>,
+    /// Void helper functions that describe writable locations.
+    ///
+    /// `None` distinguishes an omitted frame from an explicitly empty (pure) frame.
+    pub assigns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -119,7 +121,8 @@ impl ContractMap {
                     .into_iter()
                     .flatten(),
             );
-            self.helpers.extend(contract.assigns.iter().cloned());
+            self.helpers
+                .extend(contract.assigns.iter().flatten().cloned());
         }
         Ok(())
     }
@@ -129,7 +132,7 @@ fn validate_function_contract(path: &Path, name: &str, contract: &FunctionContra
     if contract.requires.is_none()
         && contract.ensures.is_none()
         && contract.model.is_none()
-        && contract.assigns.is_empty()
+        && contract.assigns.is_none()
     {
         bail!(
             "{}: contract for `{name}` must define at least one of `requires`, `ensures`, `model`, or `assigns`",
@@ -158,7 +161,7 @@ mod tests {
         assert_eq!(abs.requires.as_deref(), Some("__contract_requires_abs"));
         assert_eq!(abs.ensures.as_deref(), Some("__contract_ensures_abs"));
         assert_eq!(abs.model.as_deref(), Some("__contract_model_abs"));
-        assert_eq!(abs.assigns, vec!["__contract_assigns_abs"]);
+        assert_eq!(abs.assigns, Some(vec!["__contract_assigns_abs".to_owned()]));
         assert!(contracts.is_helper("__contract_requires_abs"));
         assert!(contracts.is_helper("__contract_assigns_abs"));
     }
@@ -192,5 +195,26 @@ mod tests {
             "#,
         )
         .expect_err("contracts should fail");
+    }
+
+    #[test]
+    fn distinguishes_omitted_and_explicitly_empty_assigns() {
+        let omitted = super::parse_contracts(
+            r#"
+            [functions.f]
+            requires = "requires_f"
+            "#,
+        )
+        .expect("failed to parse omitted assigns");
+        let explicit = super::parse_contracts(
+            r#"
+            [functions.f]
+            assigns = []
+            "#,
+        )
+        .expect("failed to parse empty assigns");
+
+        assert_eq!(omitted.function("f").unwrap().assigns, None);
+        assert_eq!(explicit.function("f").unwrap().assigns, Some(Vec::new()));
     }
 }

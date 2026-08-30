@@ -269,7 +269,75 @@ model = "model"
         "/tmp/report.c"
     );
     assert_eq!(report_json["contracts"][0]["function"], "contracted");
+    assert_eq!(report_json["contracts"][0]["reliance"], "instrumentation");
     assert_eq!(report_json["contracts"][0]["model"], "model");
+    assert_eq!(report_json["contracts"][0]["discharged"], false);
+
+    for path in [&input, &manifest, &goto, &report] {
+        fs::remove_file(path).expect("failed to remove test artifact");
+    }
+}
+
+#[test]
+fn report_distinguishes_contract_replacement_reliance() {
+    let input = input_file(
+        r#"
+define i32 @target(i32 %x) {
+entry:
+  ret i32 %x
+}
+define i1 @ensures_target(i32 %x, i32 %result) {
+entry:
+  %same = icmp eq i32 %x, %result
+  ret i1 %same
+}
+define i32 @main() {
+entry:
+  %result = call i32 @target(i32 1)
+  ret i32 %result
+}
+"#,
+    );
+    let manifest = input.with_extension("toml");
+    let goto = input.with_extension("goto");
+    let report = input.with_extension("report.json");
+    fs::write(
+        &manifest,
+        r#"
+[functions.target]
+ensures = "ensures_target"
+assigns = []
+"#,
+    )
+    .expect("failed to write contract manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--contracts")
+        .arg(&manifest)
+        .arg("--replace-with-contract")
+        .arg("target")
+        .arg("--output")
+        .arg(&goto)
+        .arg("--report")
+        .arg(&report)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
+        .expect("invalid report");
+    assert_eq!(report_json["contracts"][0]["function"], "target");
+    assert_eq!(report_json["contracts"][0]["reliance"], "replacement");
+    assert_eq!(
+        report_json["contracts"][0]["assigns"],
+        serde_json::json!([])
+    );
     assert_eq!(report_json["contracts"][0]["discharged"], false);
 
     for path in [&input, &manifest, &goto, &report] {

@@ -72,6 +72,10 @@ struct Cli {
     #[arg(long = "contracts")]
     contracts: Vec<PathBuf>,
 
+    /// Replace direct calls to this function with its manifest contract.
+    #[arg(long = "replace-with-contract")]
+    replace_with_contract: Vec<String>,
+
     /// Prefix translated LLVM function and global definitions.
     #[arg(long)]
     rename_prefix: Option<String>,
@@ -117,6 +121,7 @@ fn main() -> std::process::ExitCode {
     let config = Config {
         output: cli.output,
         contracts: cli.contracts,
+        replace_with_contract: cli.replace_with_contract.into_iter().collect(),
         rename_prefix: cli.rename_prefix,
         machine_model: cli.machine_model.into(),
         input_format: cli.input_format.into(),
