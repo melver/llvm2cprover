@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-pub use translator::{Diagnostic, TranslationInput, Translator};
+pub use translator::{Diagnostic, JsonDiagnostic, TranslationInput, Translator};
 
 /// Input encoding selection for LLVM ingestion.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

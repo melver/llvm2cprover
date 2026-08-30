@@ -28,6 +28,7 @@ use inkwell::context::Context;
 use inkwell::llvm_sys::core::LLVMGetModuleInlineAsm;
 use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::Module;
+use serde::Serialize;
 
 use crate::contracts;
 use crate::util;
@@ -80,6 +81,45 @@ pub enum UnsupportedFeature {
     Intrinsic,
     InlineAsm,
     VarArgs,
+}
+
+/// Stable machine-readable representation of a translation failure.
+///
+/// Callers should use [`JsonDiagnostic::from_error`] rather than serializing
+/// [`Diagnostic`] directly. This also gives non-translation failures, such as
+/// malformed input or unreadable contract manifests, a consistent shape.
+#[derive(Debug, Serialize)]
+pub struct JsonDiagnostic {
+    /// Stable, coarse failure category.
+    pub kind: &'static str,
+    /// Human-readable error including its context chain.
+    pub message: String,
+    /// More specific class for `unsupported_feature` diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsupported_feature: Option<&'static str>,
+    /// LLVM symbol being lowered when the error occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Source coordinates recovered from LLVM debug metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<JsonLocation>,
+}
+
+/// Stable source-location fields exposed in JSON diagnostics.
+#[derive(Debug, Default, Serialize)]
+pub struct JsonLocation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_column: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<u64>,
 }
 
 /// Translation driver for one LLVM module.
@@ -229,6 +269,93 @@ impl Diagnostic {
     }
 }
 
+impl JsonDiagnostic {
+    /// Convert any translation pipeline error into the stable JSON schema.
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        let Some(diagnostic) = error.downcast_ref::<Diagnostic>() else {
+            return Self {
+                kind: "error",
+                message: format!("{error:#}"),
+                unsupported_feature: None,
+                symbol: None,
+                location: None,
+            };
+        };
+
+        let (kind, unsupported_feature) = match diagnostic.kind {
+            DiagnosticKind::UnsupportedFeature(feature) => {
+                ("unsupported_feature", Some(feature.as_str()))
+            }
+            DiagnosticKind::UnsupportedInitializer => ("unsupported_initializer", None),
+            DiagnosticKind::UnsupportedType => ("unsupported_type", None),
+        };
+        Self {
+            kind,
+            message: diagnostic.message.clone(),
+            unsupported_feature,
+            symbol: diagnostic.symbol.clone(),
+            location: diagnostic.location.as_deref().map(JsonLocation::from),
+        }
+    }
+}
+
+impl UnsupportedFeature {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ControlFlow => "control_flow",
+            Self::Instruction => "instruction",
+            Self::Intrinsic => "intrinsic",
+            Self::InlineAsm => "inline_asm",
+            Self::VarArgs => "varargs",
+        }
+    }
+}
+
+impl From<&Location> for JsonLocation {
+    fn from(location: &Location) -> Self {
+        match location {
+            Location::None | Location::PropertyUnknownLocation { .. } => Self::default(),
+            Location::BuiltinFunction {
+                function_name,
+                line,
+            } => Self {
+                function: Some(function_name.to_string()),
+                start_line: *line,
+                ..Self::default()
+            },
+            Location::Loc {
+                file,
+                function,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                ..
+            } => Self {
+                file: Some(file.to_string()),
+                function: function.map(|name| name.to_string()),
+                start_line: Some(*start_line),
+                start_column: *start_col,
+                end_line: Some(*end_line),
+                end_column: *end_col,
+            },
+            Location::Property {
+                file,
+                function,
+                line,
+                col,
+                ..
+            } => Self {
+                file: Some(file.to_string()),
+                function: function.map(|name| name.to_string()),
+                start_line: Some(*line),
+                start_column: *col,
+                ..Self::default()
+            },
+        }
+    }
+}
+
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.message)?;
@@ -368,6 +495,18 @@ mod tests {
             diagnostic.kind,
             DiagnosticKind::UnsupportedFeature(UnsupportedFeature::InlineAsm)
         );
+    }
+
+    #[test]
+    fn json_uses_stable_varargs_feature_name() {
+        let error = anyhow::Error::new(Diagnostic::unsupported_feature(
+            UnsupportedFeature::VarArgs,
+            "unsupported variadic setup",
+        ));
+        let diagnostic = JsonDiagnostic::from_error(&error);
+
+        assert_eq!(diagnostic.kind, "unsupported_feature");
+        assert_eq!(diagnostic.unsupported_feature, Some("varargs"));
     }
 
     #[test]

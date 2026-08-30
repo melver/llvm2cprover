@@ -41,6 +41,12 @@ Translate textual LLVM IR:
 llvm2cprover --input-format ll input.ll -o input.goto
 ```
 
+For automation, `--diagnostics json` writes exactly one JSON object to stderr
+when translation fails. The object always has `kind` and `message` fields.
+Unsupported-feature errors additionally have an `unsupported_feature` field,
+and may include `symbol` and structured `location` context when available.
+The default, `--diagnostics text`, preserves human-readable error output.
+
 Machine model:
 
 - `--machine-model auto` infers the target model from the module's data layout

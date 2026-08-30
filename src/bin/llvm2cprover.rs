@@ -3,9 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use llvm2cprover::{Config, InputFormat, MachineModel, TranslationInput, translate};
+use llvm2cprover::{
+    Config, InputFormat, JsonDiagnostic, MachineModel, TranslationInput, translate,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum CliInputFormat {
@@ -32,6 +33,13 @@ enum CliMachineModel {
     Ilp32,
     Lp64,
     Llp64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum DiagnosticFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 impl From<CliMachineModel> for MachineModel {
@@ -65,10 +73,15 @@ struct Cli {
 
     #[arg(long)]
     unsound: bool,
+
+    /// Select human-readable or machine-readable error diagnostics.
+    #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
+    diagnostics: DiagnosticFormat,
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    let diagnostics = cli.diagnostics;
     let config = Config {
         output: cli.output,
         contracts: cli.contracts,
@@ -77,7 +90,24 @@ fn main() -> Result<()> {
         unsound: cli.unsound,
     };
 
-    translate(input_from_cli(cli.input), config)
+    match translate(input_from_cli(cli.input), config) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            match diagnostics {
+                DiagnosticFormat::Text => eprintln!("Error: {error:?}"),
+                DiagnosticFormat::Json => {
+                    let diagnostic = JsonDiagnostic::from_error(&error);
+                    // This schema contains only serializable owned strings and integers.
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string(&diagnostic)
+                            .expect("JSON diagnostic serialization cannot fail")
+                    );
+                }
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 fn input_from_cli(input: Option<PathBuf>) -> TranslationInput {
