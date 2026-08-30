@@ -37,6 +37,7 @@ use crate::{Config, InputFormat};
 pub mod globals;
 pub mod instructions;
 mod rename;
+mod report;
 pub mod symbols;
 pub mod types;
 
@@ -145,7 +146,9 @@ impl Translator {
         let module = parse_module(&context, &input, self.config.input_format, &bytes)?;
         reject_module_inline_asm(&module)?;
         let contracts = contracts::load_contracts(&self.config.contracts)?;
-        let machine_model = util::resolve_machine_model(&module, self.config.machine_model)?;
+        let resolved_machine_model =
+            util::resolve_machine_model_kind(&module, self.config.machine_model)?;
+        let machine_model = util::machine_model_for(&module, resolved_machine_model);
         if let Some(prefix) = self.config.rename_prefix.as_deref()
             && !prefix.is_empty()
         {
@@ -157,14 +160,29 @@ impl Translator {
             rename::rename_module_symbols(&module, &machine_model, prefix)?;
         }
         let output = util::output_path(&input, self.config.output.as_deref());
-        let mut symbols = SymbolBuilder::default().build(
+        if self.config.report.as_deref() == Some(output.as_path()) {
+            bail!("--report must not overwrite the GOTO output");
+        }
+        let mut report = report::ReportCollector::new(self.config.report.is_some());
+        let mut symbols = SymbolBuilder::default().build_reporting(
             &module,
             machine_model,
             &contracts,
-            self.config.unsound,
+            &self.config.unsound,
+            &mut report,
         )?;
         contracts::inject::inject_contracts(&mut symbols, &contracts)?;
         write_goto_binary_file(output.as_path(), &symbols);
+        if let Some(path) = self.config.report.as_deref() {
+            report::write_report(
+                path,
+                &module,
+                resolved_machine_model,
+                &contracts,
+                &symbols,
+                report,
+            )?;
+        }
         Ok(())
     }
 }
@@ -471,7 +489,7 @@ mod tests {
                 crate::util::resolve_machine_model(&module, crate::MachineModel::Auto)
                     .expect("failed to resolve machine model"),
                 &crate::contracts::ContractMap::default(),
-                false,
+                &crate::UnsoundOptions::default(),
             )
             .expect("failed to build symbol table");
         let printf = symbols.lookup("printf").expect("printf symbol");

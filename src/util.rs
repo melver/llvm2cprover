@@ -31,10 +31,25 @@ pub fn resolve_machine_model(
     module: &Module<'_>,
     requested: MachineModel,
 ) -> Result<GotoMachineModel> {
-    let model = match requested {
-        MachineModel::Auto => infer_machine_model(module)?,
-        model => model,
-    };
+    Ok(machine_model_for(
+        module,
+        resolve_machine_model_kind(module, requested)?,
+    ))
+}
+
+/// Resolve `auto` to a concrete model, retaining the public name for reports.
+pub fn resolve_machine_model_kind(
+    module: &Module<'_>,
+    requested: MachineModel,
+) -> Result<MachineModel> {
+    match requested {
+        MachineModel::Auto => infer_machine_model(module),
+        model => Ok(model),
+    }
+}
+
+/// Build the GOTO machine model for an already-resolved abstract model.
+pub fn machine_model_for(module: &Module<'_>, model: MachineModel) -> GotoMachineModel {
     let triple = module
         .get_triple()
         .as_str()
@@ -43,7 +58,7 @@ pub fn resolve_machine_model(
         .to_owned();
     let arch = triple_arch(&triple);
     let big_endian = is_big_endian(module);
-    Ok(machine_model(model, arch, big_endian))
+    machine_model(model, arch, big_endian)
 }
 
 /// Infer the abstract machine model from the LLVM module's triple and data layout.

@@ -61,6 +61,27 @@ Unsupported-feature errors additionally have an `unsupported_feature` field,
 and may include `symbol` and structured `location` context when available.
 The default, `--diagnostics text`, preserves human-readable error output.
 
+Unsupported approximations are opt-in by feature. The only currently available
+selector is `--unsound=varargs`, which ignores `va_start`, `va_end`, and
+`va_copy`. When `--report` is requested, every ignored intrinsic is recorded.
+Bare `--unsound` remains accepted as shorthand for all available approximations,
+but prints a warning after successful translation; scripts should use explicit
+selectors. Stateful inline assembly has no bounded approximation and remains
+fail-closed in every mode.
+
+`--report <file.json>` writes a deterministic assumption and stub inventory
+after successful translation. It contains:
+
+- referenced-but-undefined input functions (unused declarations are omitted)
+- every enabled approximation actually taken, including its enclosing function
+  and best-effort source location
+- every contract applied at a direct call site and its discharge status; all currently report
+  `discharged: false` because contract enforcement is not yet implemented
+- the resolved machine model and the input module's raw target triple and data layout
+
+The report has a numeric `schema_version` field for consumers. A report path
+cannot be the same as the GOTO output path.
+
 Machine model:
 
 - `--machine-model auto` infers the target model from the module's data layout
@@ -115,7 +136,8 @@ small TOML manifest only to map those helper symbols onto target functions.
 
 Unsupported LLVM features produce deterministic translation errors at the point
 where lowering would become unsound, rather than silently approximating away
-behavior. The one explicit escape hatch is `--unsound`.
+behavior. Explicit `--unsound=<feature>` selectors gate the small set of
+documented approximations and `--report` inventories each approximation used.
 
 ## Related Work
 

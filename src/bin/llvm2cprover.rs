@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 use llvm2cprover::{
-    Config, InputFormat, JsonDiagnostic, MachineModel, TranslationInput, translate,
+    Config, InputFormat, JsonDiagnostic, MachineModel, TranslationInput, UnsoundFeature,
+    UnsoundOptions, translate,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -42,6 +43,12 @@ enum DiagnosticFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CliUnsoundFeature {
+    All,
+    Varargs,
+}
+
 impl From<CliMachineModel> for MachineModel {
     fn from(value: CliMachineModel) -> Self {
         match value {
@@ -75,8 +82,20 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliInputFormat::Auto)]
     input_format: CliInputFormat,
 
+    /// Enable selected unsound approximations. Bare --unsound enables all and warns.
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        num_args = 0..=1,
+        default_missing_value = "all",
+        require_equals = true
+    )]
+    unsound: Vec<CliUnsoundFeature>,
+
+    /// Write a JSON assumption and stub inventory after successful translation.
     #[arg(long)]
-    unsound: bool,
+    report: Option<PathBuf>,
 
     /// Select human-readable or machine-readable error diagnostics.
     #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
@@ -86,17 +105,34 @@ struct Cli {
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let diagnostics = cli.diagnostics;
+    let bare_unsound = cli.unsound.contains(&CliUnsoundFeature::All);
+    let unsound = if bare_unsound {
+        UnsoundOptions::all()
+    } else {
+        UnsoundOptions::new(cli.unsound.into_iter().filter_map(|feature| match feature {
+            CliUnsoundFeature::All => None,
+            CliUnsoundFeature::Varargs => Some(UnsoundFeature::VarArgs),
+        }))
+    };
     let config = Config {
         output: cli.output,
         contracts: cli.contracts,
         rename_prefix: cli.rename_prefix,
         machine_model: cli.machine_model.into(),
         input_format: cli.input_format.into(),
-        unsound: cli.unsound,
+        unsound,
+        report: cli.report,
     };
 
     match translate(input_from_cli(cli.input), config) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => {
+            if bare_unsound {
+                eprintln!(
+                    "Warning: bare --unsound enables every available approximation; prefer --unsound=varargs"
+                );
+            }
+            std::process::ExitCode::SUCCESS
+        }
         Err(error) => {
             match diagnostics {
                 DiagnosticFormat::Text => eprintln!("Error: {error:?}"),

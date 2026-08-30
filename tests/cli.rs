@@ -163,3 +163,183 @@ requires = "requires_f"
         "{stderr}"
     );
 }
+
+#[test]
+fn granular_unsound_report_inventories_translation_assumptions() {
+    let input = input_file(
+        r#"
+source_filename = "/tmp/report.c"
+target datalayout = "e-m:e-p:64:64-i64:64-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+declare void @llvm.va_start.p0(ptr)
+declare void @llvm.va_end.p0(ptr)
+declare i32 @missing()
+declare i32 @unused()
+declare i32 @contracted(i32)
+declare void @__CPROVER_assert(i1, ptr)
+declare ptr @malloc(i64)
+
+define i32 @model(i32 %x) {
+entry:
+  ret i32 %x
+}
+
+define i32 @f(ptr %ap, ...) !dbg !10 {
+entry:
+  call void @llvm.va_start.p0(ptr %ap), !dbg !18
+  %a = call i32 @missing(), !dbg !19
+  %b = call i32 @contracted(i32 %a), !dbg !20
+  call void @__CPROVER_assert(i1 true, ptr null), !dbg !20
+  %allocation = call ptr @malloc(i64 1), !dbg !20
+  call void @llvm.va_end.p0(ptr %ap), !dbg !21
+  ret i32 %b, !dbg !22
+}
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3}
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, producer: "clang", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)
+!1 = !DIFile(filename: "/tmp/report.c", directory: "")
+!2 = !{i32 7, !"Dwarf Version", i32 5}
+!3 = !{i32 2, !"Debug Info Version", i32 3}
+!10 = distinct !DISubprogram(name: "f", scope: !1, file: !1, line: 3, type: !12, scopeLine: 3, spFlags: DISPFlagDefinition, unit: !0)
+!12 = !DISubroutineType(types: !13)
+!13 = !{!14, !15}
+!14 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!15 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: null, size: 64)
+!18 = !DILocation(line: 4, column: 3, scope: !10)
+!19 = !DILocation(line: 5, column: 11, scope: !10)
+!20 = !DILocation(line: 6, column: 11, scope: !10)
+!21 = !DILocation(line: 7, column: 3, scope: !10)
+!22 = !DILocation(line: 8, column: 3, scope: !10)
+"#,
+    );
+    let manifest = input.with_extension("toml");
+    let goto = input.with_extension("goto");
+    let report = input.with_extension("report.json");
+    fs::write(
+        &manifest,
+        r#"
+[functions.contracted]
+model = "model"
+"#,
+    )
+    .expect("failed to write contract manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--unsound=varargs")
+        .arg("--contracts")
+        .arg(&manifest)
+        .arg("--output")
+        .arg(&goto)
+        .arg("--report")
+        .arg(&report)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "granular selection should not warn"
+    );
+    let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
+        .expect("invalid report");
+    assert_eq!(report_json["schema_version"], 1);
+    assert_eq!(report_json["machine_model"], "lp64");
+    assert_eq!(report_json["target_triple"], "x86_64-unknown-linux-gnu");
+    assert_eq!(
+        report_json["data_layout"],
+        "e-m:e-p:64:64-i64:64-n8:16:32:64-S128"
+    );
+    assert_eq!(
+        report_json["undefined_functions"],
+        serde_json::json!(["missing"])
+    );
+    assert_eq!(report_json["approximations"].as_array().unwrap().len(), 2);
+    assert_eq!(report_json["approximations"][0]["feature"], "varargs");
+    assert_eq!(report_json["approximations"][0]["function"], "f");
+    assert_eq!(
+        report_json["approximations"][0]["location"]["file"],
+        "/tmp/report.c"
+    );
+    assert_eq!(report_json["contracts"][0]["function"], "contracted");
+    assert_eq!(report_json["contracts"][0]["model"], "model");
+    assert_eq!(report_json["contracts"][0]["discharged"], false);
+
+    for path in [&input, &manifest, &goto, &report] {
+        fs::remove_file(path).expect("failed to remove test artifact");
+    }
+}
+
+#[test]
+fn bare_unsound_warning_does_not_corrupt_json_failures() {
+    let input = input_file(
+        r#"
+define void @f() {
+entry:
+  call void asm sideeffect "nop", "~{memory}"()
+  ret void
+}
+"#,
+    );
+    let report = input.with_extension("report.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--unsound")
+        .arg("--diagnostics=json")
+        .arg("--report")
+        .arg(&report)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    fs::remove_file(input).expect("failed to remove test input");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not UTF-8");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    let diagnostic: Value = serde_json::from_str(stderr.trim()).expect("stderr was not JSON");
+    assert_eq!(diagnostic["unsupported_feature"], "inline_asm");
+    assert!(!stderr.contains("Warning:"), "{stderr}");
+    assert!(
+        !report.exists(),
+        "failed translation must not emit a report"
+    );
+}
+
+#[test]
+fn bare_unsound_warns_after_success() {
+    let input = input_file(
+        r#"
+define void @f(ptr %ap, ...) {
+entry:
+  call void @llvm.va_start.p0(ptr %ap)
+  ret void
+}
+declare void @llvm.va_start.p0(ptr)
+"#,
+    );
+    let goto = input.with_extension("goto");
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--unsound")
+        .arg("--output")
+        .arg(&goto)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bare --unsound"));
+    fs::remove_file(input).expect("failed to remove test input");
+    fs::remove_file(goto).expect("failed to remove goto output");
+}

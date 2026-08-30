@@ -44,10 +44,12 @@ use inkwell::values::{
 use num::bigint::BigInt;
 
 use super::globals::GlobalLowerer;
+use super::report::ReportCollector;
 use super::types::TypeLowerer;
 use super::{Diagnostic, EH_ACTIVE_SYMBOL, EH_PTR_SYMBOL, EH_SELECTOR_SYMBOL, UnsupportedFeature};
 use crate::contracts::{ContractMap, FunctionContract};
 use crate::util;
+use crate::{UnsoundFeature, UnsoundOptions};
 
 /// Lowers supported LLVM function bodies into GOTO statements.
 ///
@@ -56,13 +58,22 @@ use crate::util;
 #[derive(Debug)]
 pub struct InstructionLowerer<'a> {
     contracts: &'a ContractMap,
-    unsound: bool,
+    unsound: &'a UnsoundOptions,
+    report: &'a mut ReportCollector,
 }
 
 impl<'a> InstructionLowerer<'a> {
     /// Create an instruction lowerer with the active contract map.
-    pub fn new(contracts: &'a ContractMap, unsound: bool) -> Self {
-        Self { contracts, unsound }
+    pub(crate) fn new(
+        contracts: &'a ContractMap,
+        unsound: &'a UnsoundOptions,
+        report: &'a mut ReportCollector,
+    ) -> Self {
+        Self {
+            contracts,
+            unsound,
+            report,
+        }
     }
 
     /// Lower one defined LLVM function and attach its body to the symbol table.
@@ -80,6 +91,7 @@ impl<'a> InstructionLowerer<'a> {
             globals,
             self.contracts,
             self.unsound,
+            self.report,
         )
         .lower()
     }
@@ -93,7 +105,8 @@ struct FunctionLowerer<'a, 'ctx, 'c> {
     types: &'a mut TypeLowerer,
     globals: &'a mut GlobalLowerer,
     contracts: &'c ContractMap,
-    unsound: bool,
+    unsound: &'c UnsoundOptions,
+    report: &'c mut ReportCollector,
     suppress_contracts: bool,
     block_labels: HashMap<BasicBlock<'ctx>, String>,
     current_block: Option<BasicBlock<'ctx>>,
@@ -114,7 +127,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         types: &'a mut TypeLowerer,
         globals: &'a mut GlobalLowerer,
         contracts: &'c ContractMap,
-        unsound: bool,
+        unsound: &'c UnsoundOptions,
+        report: &'c mut ReportCollector,
     ) -> Self {
         let function_name = function.get_name().to_string_lossy().into_owned();
         Self {
@@ -128,6 +142,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             globals,
             contracts,
             unsound,
+            report,
             block_labels: HashMap::new(),
             current_block: None,
             values: HashMap::new(),
@@ -1200,6 +1215,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .map(|index| self.lower_operand(instruction, index))
                 .collect::<Result<Vec<_>>>()?;
             if self.try_lower_special_call(instruction, &callee_name, &args, body)? {
+                self.report.resolved_function(&callee_name);
                 return Ok(());
             }
 
@@ -1207,6 +1223,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .then(|| self.contracts.function(callee_name.as_str()))
                 .flatten()
                 .cloned();
+            if contract.is_some() {
+                self.report.relied_contract(&callee_name);
+            }
             if let Some(contract) = &contract {
                 self.lower_requires_helper(contract, &callee_name, &args, body, loc)?;
             }
@@ -1286,6 +1305,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         if let Some(callee) = unsafe { FunctionValue::new(raw_callee) } {
             let callee_name = callee.get_name().to_string_lossy().into_owned();
             if self.try_lower_special_call(instruction, &callee_name, &args, body)? {
+                self.report.resolved_function(&callee_name);
                 body.push(self.branch_on_exception(predecessor, normal_dest, unwind_dest)?);
                 return Ok(());
             }
@@ -1294,6 +1314,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .then(|| self.contracts.function(callee_name.as_str()))
                 .flatten()
                 .cloned();
+            if contract.is_some() {
+                self.report.relied_contract(&callee_name);
+            }
             if let Some(contract) = &contract {
                 self.lower_requires_helper(contract, &callee_name, &args, body, loc)?;
             }
@@ -1977,13 +2000,19 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
-        if self.unsound
+        if self.unsound.contains(UnsoundFeature::VarArgs)
             && (callee_name.starts_with("llvm.va_start")
                 || callee_name.starts_with("llvm.va_end")
                 || callee_name.starts_with("llvm.va_copy"))
         {
             // This is intentionally gated behind `--unsound`: variadic bodies that touch
             // `va_list` stay underconstrained until we model its target ABI precisely.
+            self.report.approximation(
+                UnsoundFeature::VarArgs,
+                callee_name,
+                &self.function_name,
+                &loc,
+            );
             return Ok(true);
         }
 

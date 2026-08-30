@@ -18,6 +18,7 @@ pub mod contracts;
 pub mod translator;
 pub mod util;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -43,6 +44,70 @@ pub enum MachineModel {
     Llp64,
 }
 
+/// An explicitly selectable translation approximation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum UnsoundFeature {
+    /// Ignore LLVM variadic-list setup and teardown intrinsics.
+    VarArgs,
+}
+
+impl UnsoundFeature {
+    /// Every approximation class implemented by this version of llvm2cprover.
+    pub const ALL: &'static [UnsoundFeature] = &[Self::VarArgs];
+
+    /// Stable command-line and report name for this approximation class.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VarArgs => "varargs",
+        }
+    }
+}
+
+impl MachineModel {
+    /// Stable command-line and report name for this model.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ilp32 => "ilp32",
+            Self::Lp64 => "lp64",
+            Self::Llp64 => "llp64",
+        }
+    }
+}
+
+/// Explicitly enabled unsound translation approximations.
+///
+/// The default is empty and therefore fail-closed. Stateful inline assembly is
+/// deliberately not represented here because it has no bounded approximation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UnsoundOptions {
+    features: BTreeSet<UnsoundFeature>,
+}
+
+impl UnsoundOptions {
+    /// Enable every approximation implemented by this version of llvm2cprover.
+    pub fn all() -> Self {
+        Self::new(UnsoundFeature::ALL.iter().copied())
+    }
+
+    /// Enable exactly the listed approximation classes.
+    pub fn new(features: impl IntoIterator<Item = UnsoundFeature>) -> Self {
+        Self {
+            features: features.into_iter().collect(),
+        }
+    }
+
+    /// Return whether one approximation class is enabled.
+    pub fn contains(&self, feature: UnsoundFeature) -> bool {
+        self.features.contains(&feature)
+    }
+
+    /// Return whether no unsound approximations are enabled.
+    pub fn is_empty(&self) -> bool {
+        self.features.is_empty()
+    }
+}
+
 /// Top-level translation configuration shared by the CLI and library API.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Config {
@@ -60,11 +125,13 @@ pub struct Config {
     pub machine_model: MachineModel,
     /// LLVM input format override. `Auto` detects bitcode vs textual IR.
     pub input_format: InputFormat,
-    /// Enable selected, explicitly documented unsound fallbacks when probing coverage.
+    /// Explicitly enabled, documented unsound fallbacks for coverage probing.
     ///
     /// Constructs whose effects cannot be bounded, such as target inline assembly, still fail
     /// closed.
-    pub unsound: bool,
+    pub unsound: UnsoundOptions,
+    /// Optional path for a deterministic JSON assumption and stub inventory.
+    pub report: Option<PathBuf>,
 }
 
 /// Translate one LLVM module into a `.goto` binary.

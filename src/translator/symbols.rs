@@ -19,11 +19,13 @@ use inkwell::values::{
     AsValueRef, BasicValueEnum, CallSiteValue, FunctionValue, InstructionOpcode, InstructionValue,
 };
 
+use crate::UnsoundOptions;
 use crate::contracts::ContractMap;
 use crate::util;
 
 use super::globals::GlobalLowerer;
 use super::instructions::InstructionLowerer;
+use super::report::ReportCollector;
 use super::types::TypeLowerer;
 use super::{Diagnostic, EH_ACTIVE_SYMBOL, EH_PTR_SYMBOL, EH_SELECTOR_SYMBOL, UnsupportedFeature};
 
@@ -42,12 +44,33 @@ pub struct SymbolBuilder {
 
 impl SymbolBuilder {
     /// Discover global and function declarations in one LLVM module.
+    ///
+    /// Report bookkeeping is discarded unless a recording [`ReportCollector`] is
+    /// supplied; see [`SymbolBuilder::build_reporting`].
     pub fn build<'ctx>(
         &mut self,
         module: &Module<'ctx>,
         machine_model: GotoMachineModel,
         contracts: &ContractMap,
-        unsound: bool,
+        unsound: &UnsoundOptions,
+    ) -> Result<SymbolTable> {
+        self.build_reporting(
+            module,
+            machine_model,
+            contracts,
+            unsound,
+            &mut ReportCollector::default(),
+        )
+    }
+
+    /// Discover declarations while recording translation-report inputs.
+    pub(crate) fn build_reporting<'ctx>(
+        &mut self,
+        module: &Module<'ctx>,
+        machine_model: GotoMachineModel,
+        contracts: &ContractMap,
+        unsound: &UnsoundOptions,
+        report: &mut ReportCollector,
     ) -> Result<SymbolTable> {
         // Provide the LLVM data layout so the type lowerer can insert explicit
         // struct padding fields.  Without this CBMC computes a sizeof that sums
@@ -114,7 +137,7 @@ impl SymbolBuilder {
 
         self.insert_pending_aggregate_symbols(&mut symbols);
 
-        let mut instructions = InstructionLowerer::new(contracts, unsound);
+        let mut instructions = InstructionLowerer::new(contracts, unsound, report);
         for function in module.get_functions() {
             if function.count_basic_blocks() != 0 {
                 instructions.lower_function(
@@ -125,7 +148,6 @@ impl SymbolBuilder {
                 )?;
             }
         }
-
         Ok(symbols)
     }
 
@@ -582,14 +604,23 @@ mod tests {
         build_symbols_with_config(module, false)
     }
 
+    fn unsound_options(all: bool) -> crate::UnsoundOptions {
+        if all {
+            crate::UnsoundOptions::all()
+        } else {
+            crate::UnsoundOptions::default()
+        }
+    }
+
     fn build_symbols_with_config(module: &Module<'_>, unsound: bool) -> SymbolTable {
+        let unsound = unsound_options(unsound);
         SymbolBuilder::default()
             .build(
                 module,
                 crate::util::resolve_machine_model(module, crate::MachineModel::Auto)
                     .expect("failed to resolve machine model"),
                 &ContractMap::default(),
-                unsound,
+                &unsound,
             )
             .expect("failed to build symbol table")
     }
@@ -607,12 +638,13 @@ mod tests {
     fn build_symbols_result_with_config_from_ir(ir: &[u8], unsound: bool) -> Result<SymbolTable> {
         let context = Context::create();
         let module = parse_module(&context, ir);
+        let unsound = unsound_options(unsound);
         SymbolBuilder::default().build(
             &module,
             crate::util::resolve_machine_model(&module, crate::MachineModel::Auto)
                 .expect("failed to resolve machine model"),
             &ContractMap::default(),
-            unsound,
+            &unsound,
         )
     }
 
@@ -1653,7 +1685,7 @@ mod tests {
                 crate::util::resolve_machine_model(&module, crate::MachineModel::Auto)
                     .expect("failed to resolve machine model"),
                 &crate::contracts::ContractMap::default(),
-                false,
+                &crate::UnsoundOptions::default(),
             )
             .expect("atomicrmw body should lower");
         let symbol = symbols.lookup("f").expect("missing function");
@@ -1689,7 +1721,7 @@ mod tests {
                 crate::util::resolve_machine_model(&module, crate::MachineModel::Auto)
                     .expect("failed to resolve machine model"),
                 &crate::contracts::ContractMap::default(),
-                false,
+                &crate::UnsoundOptions::default(),
             )
             .expect("cmpxchg body should lower");
         let symbol = symbols.lookup("f").expect("missing function");
