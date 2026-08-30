@@ -27,13 +27,7 @@ test-e2e: patch-deps
 
 .PHONY: clippy
 clippy: patch-deps
-	cargo clippy -- \
-		-A clippy::too_many_arguments \
-		-A clippy::comparison_chain \
-		-A clippy::manual_range_contains \
-		-A clippy::type_complexity \
-		-A clippy::uninlined-format-args \
-		-D warnings
+	cargo clippy --all-targets -- -D warnings
 
 .PHONY: clean
 clean:
