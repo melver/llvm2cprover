@@ -119,30 +119,6 @@ pub fn output_path(input: &TranslationInput, output: Option<&Path>) -> PathBuf {
     output.map_or_else(|| default_output_path(input), Path::to_path_buf)
 }
 
-/// Return a NUL-terminated copy of LLVM input bytes for APIs that require it.
-pub fn nul_terminated(bytes: &[u8]) -> Vec<u8> {
-    if bytes.last() == Some(&0) {
-        bytes.to_vec()
-    } else {
-        let mut terminated = Vec::with_capacity(bytes.len() + 1);
-        terminated.extend_from_slice(bytes);
-        terminated.push(0);
-        terminated
-    }
-}
-
-/// Return a copy with one extra trailing NUL byte, even if the payload already ends in `0`.
-///
-/// LLVM text buffers need a conventional terminator, but bitcode is binary and may legitimately
-/// end in `0x00`. Appending one extra byte keeps `MemoryBuffer::create_from_memory_range_copy`
-/// from silently dropping a real payload byte when it subtracts the terminator length.
-pub fn extra_nul_terminated(bytes: &[u8]) -> Vec<u8> {
-    let mut terminated = Vec::with_capacity(bytes.len() + 1);
-    terminated.extend_from_slice(bytes);
-    terminated.push(0);
-    terminated
-}
-
 /// Detect the LLVM input encoding, respecting any explicit caller override.
 pub fn detect_input_format(
     path: Option<&PathBuf>,
@@ -389,10 +365,7 @@ mod tests {
     "#;
 
     fn parse_module<'ctx>(context: &'ctx Context, ir: &str) -> inkwell::module::Module<'ctx> {
-        let buffer = MemoryBuffer::create_from_memory_range_copy(
-            &crate::util::nul_terminated(ir.as_bytes()),
-            "debug",
-        );
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "debug");
         context
             .create_module_from_ir(buffer)
             .expect("failed to parse debug IR")

@@ -571,10 +571,7 @@ mod tests {
     // Keep the IR fixture inline in each test; these helpers only remove the repeated
     // parse/build boilerplate so the assertion stays the focal point.
     fn parse_module<'ctx>(context: &'ctx Context, ir: &[u8]) -> Module<'ctx> {
-        let buffer = MemoryBuffer::create_from_memory_range_copy(
-            &crate::util::nul_terminated(ir),
-            "symbols",
-        );
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir, "symbols");
         context
             .create_module_from_ir(buffer)
             .expect("failed to parse test IR")
@@ -1588,22 +1585,16 @@ mod tests {
     #[test]
     fn lowers_atomicrmw_body() {
         let context = Context::create();
-        let module = context
-            .create_module_from_ir(
-                inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
-                    &crate::util::nul_terminated(
-                        br#"
+        let module = parse_module(
+            &context,
+            br#"
                         define i32 @f(ptr %p, i32 %v) {
                         entry:
                           %old = atomicrmw add ptr %p, i32 %v seq_cst
                           ret i32 %old
                         }
                     "#,
-                    ),
-                    "symbols",
-                ),
-            )
-            .expect("failed to parse atomicrmw body");
+        );
 
         let symbols = SymbolBuilder::default()
             .build(
@@ -1629,11 +1620,9 @@ mod tests {
     #[test]
     fn lowers_cmpxchg_extractvalue_body() {
         let context = Context::create();
-        let module = context
-            .create_module_from_ir(
-                inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
-                    &crate::util::nul_terminated(
-                        br#"
+        let module = parse_module(
+            &context,
+            br#"
                         define i32 @f(ptr %p, i32 %cmp, i32 %new) {
                         entry:
                           %pair = cmpxchg ptr %p, i32 %cmp, i32 %new seq_cst seq_cst
@@ -1641,11 +1630,7 @@ mod tests {
                           ret i32 %old
                         }
                     "#,
-                    ),
-                    "symbols",
-                ),
-            )
-            .expect("failed to parse cmpxchg body");
+        );
 
         let symbols = SymbolBuilder::default()
             .build(

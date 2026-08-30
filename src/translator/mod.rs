@@ -144,14 +144,9 @@ fn parse_module<'ctx>(
         .path_hint()
         .and_then(|path| path.as_path().to_str())
         .unwrap_or("stdin");
-    let buffer_bytes = match format {
-        // Raw bitcode often already ends in `0x00`, so always append one more byte before
-        // handing it to `MemoryBuffer::create_from_memory_range_copy`.
-        InputFormat::Bitcode => util::extra_nul_terminated(bytes),
-        InputFormat::LlvmIr => util::nul_terminated(bytes),
-        InputFormat::Auto => unreachable!("input format should be resolved before parsing"),
-    };
-    let buffer = MemoryBuffer::create_from_memory_range_copy(&buffer_bytes, name);
+    // Inkwell 0.10 passes the complete slice length to LLVM and arranges the buffer's trailing
+    // NUL itself. Supplying a terminator here would make it part of the bitcode payload.
+    let buffer = MemoryBuffer::create_from_memory_range_copy(bytes, name);
 
     match format {
         InputFormat::Bitcode => Module::parse_bitcode_from_buffer(&buffer, context)
@@ -283,7 +278,7 @@ mod tests {
         builder.build_return(None).expect("failed to build return");
 
         let bitcode = module.write_bitcode_to_memory();
-        let payload = &bitcode.as_slice()[..bitcode.as_slice().len() - 1];
+        let payload = bitcode.as_slice();
         let parsed = parse_module(
             &context,
             &TranslationInput::Stdin,
@@ -307,7 +302,7 @@ mod tests {
         builder.build_return(None).expect("failed to build return");
 
         let bitcode = module.write_bitcode_to_memory();
-        let payload = &bitcode.as_slice()[..bitcode.as_slice().len() - 1];
+        let payload = bitcode.as_slice();
         assert_eq!(payload.last(), Some(&0));
 
         let parsed = parse_module(
