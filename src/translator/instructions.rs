@@ -17,10 +17,7 @@
 //! Unsupported instructions fail where they are encountered, which keeps
 //! diagnostics specific and avoids a second feature-classification pass.
 
-use std::{
-    collections::{HashMap, HashSet},
-    slice,
-};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use cprover_bindings::InternedString;
@@ -34,8 +31,6 @@ use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
-    LLVMGetInlineAsmAsmString, LLVMGetInlineAsmCanUnwind, LLVMGetInlineAsmConstraintString,
-    LLVMGetInlineAsmDialect, LLVMGetInlineAsmHasSideEffects, LLVMGetInlineAsmNeedsAlignedStack,
     LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands, LLVMGetNumClauses,
     LLVMGetNumMaskElements, LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetSuccessor,
     LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
@@ -53,13 +48,9 @@ use super::report::ReportCollector;
 use super::types::TypeLowerer;
 use super::{Diagnostic, EH_ACTIVE_SYMBOL, EH_PTR_SYMBOL, EH_SELECTOR_SYMBOL, UnsupportedFeature};
 use crate::contracts::inject::ReplacementMap;
-use crate::contracts::{ContractMap, FunctionContract, InlineAsmDialect, InlineAsmSite};
+use crate::contracts::{ContractMap, FunctionContract, InlineAsmSite};
 use crate::util;
 use crate::{UnsoundFeature, UnsoundOptions};
-
-/// One of LLVM's `LLVMGetInlineAsm*String` pointer/length accessors.
-type InlineAsmStringGetter =
-    unsafe extern "C" fn(LLVMValueRef, *mut usize) -> *const std::os::raw::c_char;
 
 /// Lowers supported LLVM function bodies into GOTO statements.
 ///
@@ -1494,8 +1485,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         // Unlike an ordinary call, even empty asm in a callbr may select an indirect edge.
         // Require an exact compiled model for its state effects before conservatively allowing
         // every destination declared by the LLVM instruction.
-        let asm = self.inline_asm_string(raw_callee);
-        self.lower_inline_asm_model(instruction, raw_callee, &asm, body, loc)?;
+        let metadata = super::asm_manifest::decode_inline_asm(raw_callee)?;
+        self.lower_inline_asm_model(instruction, &metadata, body, loc)?;
         let branches = successors
             .into_iter()
             .map(|successor| self.branch_to(predecessor, successor))
@@ -1577,8 +1568,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(false);
         }
 
-        let asm = self.inline_asm_string(raw_callee);
-        if self.inline_asm_is_empty(&asm) && unsafe { LLVMGetInlineAsmCanUnwind(raw_callee) == 0 } {
+        let metadata = super::asm_manifest::decode_inline_asm(raw_callee)?;
+        if super::asm_manifest::inline_asm_is_empty(&metadata.asm) && !metadata.can_unwind {
             // Empty inline asm, including comment-only compiler barriers, is not a stateful
             // machine instruction. Lowering it away keeps verifier state unchanged without
             // pretending to understand real target assembly.
@@ -1593,7 +1584,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         let loc = self.instruction_location(instruction);
-        self.lower_inline_asm_model(instruction, raw_callee, &asm, body, loc)?;
+        self.lower_inline_asm_model(instruction, &metadata, body, loc)?;
         Ok(true)
     }
 
@@ -1601,34 +1592,25 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     fn lower_inline_asm_model(
         &mut self,
         instruction: InstructionValue<'ctx>,
-        raw_callee: LLVMValueRef,
-        asm: &str,
+        metadata: &super::asm_manifest::InlineAsmMetadata,
         body: &mut Vec<Stmt>,
         loc: Location,
     ) -> Result<()> {
-        // Skip the exact-match machinery entirely when no rules are configured, which is the
-        // common case and keeps unmodelled assembly on the direct fail-closed path.
-        let site = self.contracts.has_inline_asm_models().then(|| {
-            (
-                self.inline_asm_str(raw_callee, LLVMGetInlineAsmConstraintString),
-                self.function_name.clone(),
-            )
-        });
-        let site = site.as_ref().map(|(constraints, function)| InlineAsmSite {
-            asm,
-            constraints,
-            dialect: match unsafe { LLVMGetInlineAsmDialect(raw_callee) } {
-                inkwell::llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT => {
-                    InlineAsmDialect::Att
-                }
-                inkwell::llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectIntel => {
-                    InlineAsmDialect::Intel
-                }
-            },
-            side_effects: unsafe { LLVMGetInlineAsmHasSideEffects(raw_callee) != 0 },
-            align_stack: unsafe { LLVMGetInlineAsmNeedsAlignedStack(raw_callee) != 0 },
-            function,
-        });
+        // Skip the lookup and site construction when no rules are configured, which is the
+        // common case and keeps unmodelled assembly on the direct fail-closed path. The metadata
+        // itself is decoded once by the caller and shared with manifest generation.
+        let function_name = self.function_name.clone();
+        let site = self
+            .contracts
+            .has_inline_asm_models()
+            .then(|| InlineAsmSite {
+                asm: &metadata.asm,
+                constraints: &metadata.constraints,
+                dialect: metadata.dialect,
+                side_effects: metadata.side_effects,
+                align_stack: metadata.align_stack,
+                function: &function_name,
+            });
         if let Some(site) = &site
             && let Some(mapping) = self.contracts.inline_asm_model(site)
         {
@@ -1638,7 +1620,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                     mapping.model
                 );
             }
-            if unsafe { LLVMGetInlineAsmCanUnwind(raw_callee) != 0 } {
+            if metadata.can_unwind {
                 return Err(Diagnostic::unsupported_feature(
                     UnsupportedFeature::InlineAsm,
                     format!(
@@ -3754,21 +3736,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .with_symbol(name.to_owned())
     }
 
-    fn inline_asm_string(&self, asm: LLVMValueRef) -> String {
-        self.inline_asm_str(asm, LLVMGetInlineAsmAsmString)
-    }
-
-    /// Decode one of LLVM's pointer/length inline-assembly string accessors.
-    fn inline_asm_str(&self, asm: LLVMValueRef, getter: InlineAsmStringGetter) -> String {
-        let mut len = 0;
-        let ptr = unsafe { getter(asm, &mut len) };
-        if ptr.is_null() || len == 0 {
-            return String::new();
-        }
-        String::from_utf8_lossy(unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) })
-            .into_owned()
-    }
-
     fn validate_inline_asm_model_signature(
         &mut self,
         instruction: InstructionValue<'ctx>,
@@ -3822,13 +3789,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         // representation extra local type information. Any two lowered pointer
         // types therefore correspond to the same LLVM `ptr` signature type.
         model == asm || (model.is_pointer() && asm.is_pointer())
-    }
-
-    fn inline_asm_is_empty(&self, asm: &str) -> bool {
-        asm.lines().all(|line| {
-            let trimmed = line.trim();
-            trimmed.is_empty() || trimmed.starts_with('#')
-        })
     }
 
     fn instruction_location(&self, instruction: InstructionValue<'ctx>) -> Location {

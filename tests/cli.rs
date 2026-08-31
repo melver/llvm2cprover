@@ -539,3 +539,236 @@ declare void @llvm.va_start.p0(ptr)
     fs::remove_file(input).expect("failed to remove test input");
     fs::remove_file(goto).expect("failed to remove goto output");
 }
+
+#[test]
+fn emits_deterministic_inline_asm_manifest_with_exact_strings_and_signatures() {
+    let input = input_file(
+        r#"
+define i32 @z_caller(i32 %value) {
+entry:
+  %result = call i32 asm sideeffect "z \22quoted\22\09$0\0Aline", "=r,r"(i32 %value)
+  ret i32 %result
+}
+
+define i32 @a_caller(i32 %value) {
+entry:
+  %result = call i32 asm sideeffect "z \22quoted\22\09$0\0Aline", "=r,r"(i32 %value)
+  ret i32 %result
+}
+
+define { i32, i32 } @pair(i32 %value) {
+entry:
+  %result = call { i32, i32 } asm inteldialect "a'''b\0Aline", "=r,=r,r"(i32 %value)
+  ret { i32, i32 } %result
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--emit-asm-manifest")
+        .arg(&input)
+        .output()
+        .expect("failed to emit inline asm manifest");
+    fs::remove_file(input).expect("failed to remove test input");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("manifest was not UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not UTF-8");
+    let manifest: toml::Value = toml::from_str(&stdout).expect("manifest was not valid TOML");
+    let entries = manifest["inline_asm"]
+        .as_array()
+        .expect("missing inline_asm entries");
+
+    assert_eq!(
+        entries.len(),
+        2,
+        "identical templates should be deduplicated"
+    );
+    assert_eq!(entries[0]["asm"].as_str(), Some("a'''b\nline"));
+    assert_eq!(entries[0]["dialect"].as_str(), Some("intel"));
+    assert_eq!(entries[1]["asm"].as_str(), Some("z \"quoted\"\t$0\nline"));
+    assert!(stdout.contains("# Enclosing functions: \"a_caller\", \"z_caller\""));
+    assert!(stdout.contains("# Required model signature: { i32, i32 } @model(i32)"));
+    assert!(stdout.contains("# Required model signature: i32 @model(i32)"));
+    assert!(stderr.contains("2 distinct inline-assembly template(s) from 3 unmatched site(s)"));
+}
+
+#[test]
+fn asm_manifest_omits_sites_matched_by_loaded_manifests() {
+    let input = input_file(
+        r#"
+define i32 @first(i32 %value) {
+entry:
+  %result = call i32 asm sideeffect "opaque", "=r,r"(i32 %value)
+  ret i32 %result
+}
+
+define i32 @second(i32 %value) {
+entry:
+  %result = call i32 asm sideeffect "opaque", "=r,r"(i32 %value)
+  ret i32 %result
+}
+"#,
+    );
+    let manifest = input.with_extension("toml");
+    fs::write(
+        &manifest,
+        r#"
+[[inline_asm]]
+asm = "opaque"
+constraints = "=r,r"
+dialect = "att"
+side_effects = true
+align_stack = false
+function = "first"
+model = "model_first"
+"#,
+    )
+    .expect("failed to write existing manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--emit-asm-manifest")
+        .arg("--contracts")
+        .arg(&manifest)
+        .arg(&input)
+        .output()
+        .expect("failed to emit inline asm manifest");
+    let existing = fs::read_to_string(&manifest).expect("failed to reread existing manifest");
+    fs::remove_file(input).expect("failed to remove test input");
+    fs::remove_file(manifest).expect("failed to remove existing manifest");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("manifest was not UTF-8");
+    assert!(stdout.contains("# Enclosing functions: \"second\""));
+    assert!(stdout.contains("function = \"second\""));
+    assert!(!stdout.contains("# Enclosing functions: \"first\""));
+    llvm2cprover::contracts::parse_contracts(&format!("{existing}\n{stdout}"))
+        .expect("existing and generated manifests should compose");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("from 1 unmatched site(s)"));
+}
+
+#[test]
+fn asm_manifest_qualifies_cross_function_signatures_but_flags_same_function_conflicts() {
+    let input = input_file(
+        r#"
+define i32 @scalar32(i32 %value) {
+entry:
+  %result = call i32 asm sideeffect "polymorphic", "=r,r"(i32 %value)
+  ret i32 %result
+}
+
+define i64 @scalar64(i64 %value) {
+entry:
+  %result = call i64 asm sideeffect "polymorphic", "=r,r"(i64 %value)
+  ret i64 %result
+}
+
+define void @mixed() {
+entry:
+  %first = call i32 asm sideeffect "polymorphic", "=r,r"(i32 1)
+  %second = call i64 asm sideeffect "polymorphic", "=r,r"(i64 1)
+  ret void
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--emit-asm-manifest")
+        .arg(&input)
+        .output()
+        .expect("failed to emit inline asm manifest");
+    fs::remove_file(input).expect("failed to remove test input");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("manifest was not UTF-8");
+    let generated: toml::Value = toml::from_str(&stdout).expect("manifest was not valid TOML");
+    let entries = generated["inline_asm"]
+        .as_array()
+        .expect("missing inline_asm entries");
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["function"].as_str(), Some("mixed"));
+    assert_eq!(entries[1]["function"].as_str(), Some("scalar32"));
+    assert_eq!(entries[2]["function"].as_str(), Some("scalar64"));
+    assert!(stdout.contains(
+        "an enclosing function uses this template with incompatible signatures; function qualification cannot distinguish those sites"
+    ));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("1 distinct inline-assembly template(s) from 4 unmatched site(s)")
+    );
+}
+
+#[test]
+fn asm_manifest_reports_unmodellable_assembly_and_skips_noop_barriers() {
+    let input = input_file(
+        r#"
+module asm "nop"
+
+define void @main() {
+entry:
+  call void asm sideeffect "\0A# barrier\0A\09", "~{memory}"()
+  call void asm sideeffect unwind "cannot model", ""()
+  ret void
+}
+
+define void @asm_goto() {
+entry:
+  callbr void asm sideeffect "", "!i"()
+      to label %fallthrough [label %indirect]
+fallthrough:
+  ret void
+indirect:
+  ret void
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--emit-asm-manifest")
+        .arg(&input)
+        .output()
+        .expect("failed to emit inline asm manifest");
+    fs::remove_file(input).expect("failed to remove test input");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("manifest was not UTF-8");
+    let generated: toml::Value = toml::from_str(&stdout).expect("manifest was not valid TOML");
+    assert_eq!(generated["inline_asm"][0]["asm"].as_str(), Some(""));
+    assert!(stdout.contains("# Enclosing functions: \"asm_goto\""));
+    let stderr = String::from_utf8(output.stderr).expect("stderr was not UTF-8");
+    assert!(stderr.contains("1 distinct inline-assembly template(s) from 1 unmatched site(s)"));
+    assert!(stderr.contains("omitted 1 unwind-capable inline-assembly site(s)"));
+    assert!(stderr.contains("omitted module-level inline assembly"));
+}
+
+#[test]
+fn asm_manifest_rejects_non_utf8_exact_match_keys() {
+    let input = input_file(
+        r#"
+define void @main() {
+entry:
+  call void asm sideeffect "invalid\FF", ""()
+  ret void
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--emit-asm-manifest")
+        .arg(&input)
+        .output()
+        .expect("failed to run inline asm manifest generation");
+    fs::remove_file(input).expect("failed to remove test input");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("inline-assembly template is not valid UTF-8")
+    );
+}

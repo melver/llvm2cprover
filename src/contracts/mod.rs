@@ -30,7 +30,7 @@ pub struct ContractMap {
 }
 
 /// Exact-match rule that redirects one inline-assembly call to compiled LLVM code.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InlineAsmModel {
     /// LLVM's raw inline-assembly template.
@@ -44,6 +44,7 @@ pub struct InlineAsmModel {
     /// Whether LLVM requires stack alignment before executing the assembly.
     pub align_stack: bool,
     /// Optional enclosing function name used to narrow the rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<String>,
     /// Defined LLVM function called in place of the assembly.
     pub model: String,
@@ -106,7 +107,7 @@ impl InlineAsmModel {
     }
 
     /// Whether the assembly itself is identical, ignoring any `function` qualifier.
-    fn same_assembly(
+    pub(crate) fn same_assembly(
         &self,
         asm: &str,
         constraints: &str,
@@ -256,12 +257,9 @@ impl ContractMap {
                 .extend(contract.assigns.iter().flatten().cloned());
         }
         for model in manifest.inline_asm {
-            if model.asm.trim().is_empty() {
-                bail!(
-                    "{}: inline asm model must define a nonempty `asm`",
-                    path.display()
-                );
-            }
+            // Empty ordinary calls lower as no-op barriers, but an empty `callbr` can still
+            // select an indirect successor and therefore needs an exact model for its effects.
+            // Keep the empty string available as a valid exact-match key for that case.
             if model.model.trim().is_empty() {
                 bail!(
                     "{}: inline asm model must define a nonempty `model`",
@@ -488,6 +486,35 @@ mod tests {
                     function: "target",
                 })
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn allows_empty_inline_asm_key_for_asm_goto() {
+        let contracts = super::parse_contracts(
+            r#"
+            [[inline_asm]]
+            asm = ""
+            constraints = "!i"
+            dialect = "att"
+            side_effects = true
+            align_stack = false
+            model = "model_goto"
+            "#,
+        )
+        .expect("empty asm-goto templates should be representable");
+
+        assert!(
+            contracts
+                .inline_asm_model(&super::InlineAsmSite {
+                    asm: "",
+                    constraints: "!i",
+                    dialect: super::InlineAsmDialect::Att,
+                    side_effects: true,
+                    align_stack: false,
+                    function: "main",
+                })
+                .is_some()
         );
     }
 

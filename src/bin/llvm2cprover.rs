@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, ValueEnum};
 use llvm2cprover::{
     Config, InputFormat, JsonDiagnostic, MachineModel, TranslationInput, UnsoundFeature,
-    UnsoundOptions, translate,
+    UnsoundOptions, emit_asm_manifest, translate,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -72,6 +72,21 @@ struct Cli {
     #[arg(long = "contracts")]
     contracts: Vec<PathBuf>,
 
+    /// Emit unmatched inline-assembly model stubs to standard output without lowering.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "output",
+            "replace_with_contract",
+            "enforce_contract",
+            "rename_prefix",
+            "machine_model",
+            "unsound",
+            "report"
+        ]
+    )]
+    emit_asm_manifest: bool,
+
     /// Replace direct calls to this function with its manifest contract.
     #[arg(long = "replace-with-contract")]
     replace_with_contract: Vec<String>,
@@ -113,6 +128,34 @@ struct Cli {
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let diagnostics = cli.diagnostics;
+    if cli.emit_asm_manifest {
+        return match emit_asm_manifest(
+            input_from_cli(cli.input),
+            cli.input_format.into(),
+            &cli.contracts,
+        ) {
+            Ok(manifest) => {
+                print!("{}", manifest.toml);
+                eprintln!(
+                    "Emitted {} distinct inline-assembly template(s) from {} unmatched site(s).",
+                    manifest.distinct_templates, manifest.sites
+                );
+                if manifest.unwind_sites != 0 {
+                    eprintln!(
+                        "Warning: omitted {} unwind-capable inline-assembly site(s); compiled models cannot replace them.",
+                        manifest.unwind_sites
+                    );
+                }
+                if manifest.has_module_asm {
+                    eprintln!(
+                        "Warning: omitted module-level inline assembly; call-site model mappings cannot replace it."
+                    );
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => report_error(&error, diagnostics),
+        };
+    }
     let bare_unsound = cli.unsound.contains(&CliUnsoundFeature::All);
     let unsound = if bare_unsound {
         UnsoundOptions::all()
@@ -143,22 +186,24 @@ fn main() -> std::process::ExitCode {
             }
             std::process::ExitCode::SUCCESS
         }
-        Err(error) => {
-            match diagnostics {
-                DiagnosticFormat::Text => eprintln!("Error: {error:?}"),
-                DiagnosticFormat::Json => {
-                    let diagnostic = JsonDiagnostic::from_error(&error);
-                    // This schema contains only serializable owned strings and integers.
-                    eprintln!(
-                        "{}",
-                        serde_json::to_string(&diagnostic)
-                            .expect("JSON diagnostic serialization cannot fail")
-                    );
-                }
-            }
-            std::process::ExitCode::FAILURE
+        Err(error) => report_error(&error, diagnostics),
+    }
+}
+
+fn report_error(error: &anyhow::Error, diagnostics: DiagnosticFormat) -> std::process::ExitCode {
+    match diagnostics {
+        DiagnosticFormat::Text => eprintln!("Error: {error:?}"),
+        DiagnosticFormat::Json => {
+            let diagnostic = JsonDiagnostic::from_error(error);
+            // This schema contains only serializable owned strings and integers.
+            eprintln!(
+                "{}",
+                serde_json::to_string(&diagnostic)
+                    .expect("JSON diagnostic serialization cannot fail")
+            );
         }
     }
+    std::process::ExitCode::FAILURE
 }
 
 fn input_from_cli(input: Option<PathBuf>) -> TranslationInput {

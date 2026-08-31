@@ -6,6 +6,7 @@
 //! The library surface stays intentionally small:
 //!
 //! - [`translate`] is the one-shot entry point used by the CLI
+//! - [`emit_asm_manifest`] inventories unmatched inline assembly without lowering
 //! - [`Config`] carries stable translation options
 //! - [`translator`] owns LLVM parsing, lowering, diagnostics, and emission
 //! - [`contracts`] owns external contract and inline-assembly model manifests
@@ -23,7 +24,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-pub use translator::{Diagnostic, JsonDiagnostic, TranslationInput, Translator};
+pub use translator::{
+    AsmManifest, Diagnostic, JsonDiagnostic, TranslationInput, Translator, emit_asm_manifest,
+};
 
 /// Input encoding selection for LLVM ingestion.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

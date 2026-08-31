@@ -327,6 +327,23 @@ non-variadic, and its parameter and return types must exactly match the
 assembly call. LLVM represents multiple assembly outputs as an aggregate
 return, so the model must return the identical aggregate type.
 
+Generate deterministic stubs for every unmatched inline-assembly template in a
+module before writing models by hand:
+
+```sh
+llvm2cprover --emit-asm-manifest input.bc > inline-asm.toml
+```
+
+Repeat `--contracts` to omit sites already covered by existing manifests. The
+generated TOML is written to standard output, while template and site counts go
+to standard error so redirection remains safe. Each entry records the enclosing
+functions and required LLVM model signature in comments. Unwind-capable and
+module-level assembly are reported but omitted because call-site model mappings
+cannot replace them. Templates used with different signatures in different
+functions receive function-qualified entries. If one function uses the same
+exact template with incompatible signatures, the generator reports that in a
+comment because the current exact-match format cannot distinguish those sites.
+
 For `callbr`/asm-goto, the model executes once for the assembly effects, then
 verification considers the fallthrough and every indirect successor with normal
 LLVM PHI-edge semantics. Empty and comment-only compiler barriers in ordinary

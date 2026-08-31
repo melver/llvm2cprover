@@ -29,8 +29,8 @@ use inkwell::context::Context;
 use inkwell::llvm_sys::LLVMAtomicOrdering;
 use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockParent, LLVMGetCalledValue, LLVMGetFirstUse, LLVMGetInstructionParent,
-    LLVMGetModuleInlineAsm, LLVMGetNextUse, LLVMGetNumOperands, LLVMGetOperand, LLVMGetOrdering,
-    LLVMGetUser, LLVMIsACallInst, LLVMIsAInvokeInst,
+    LLVMGetNextUse, LLVMGetNumOperands, LLVMGetOperand, LLVMGetOrdering, LLVMGetUser,
+    LLVMIsACallInst, LLVMIsAInvokeInst,
 };
 use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::memory_buffer::MemoryBuffer;
@@ -45,6 +45,7 @@ use crate::contracts;
 use crate::util;
 use crate::{Config, InputFormat};
 
+mod asm_manifest;
 pub mod globals;
 pub mod instructions;
 mod rename;
@@ -56,6 +57,7 @@ pub(crate) const EH_ACTIVE_SYMBOL: &str = "__llvm2cprover_eh_active";
 pub(crate) const EH_PTR_SYMBOL: &str = "__llvm2cprover_eh_ptr";
 pub(crate) const EH_SELECTOR_SYMBOL: &str = "__llvm2cprover_eh_selector";
 
+pub use self::asm_manifest::AsmManifest;
 use self::symbols::SymbolBuilder;
 
 /// Where LLVM input should be loaded from.
@@ -224,6 +226,19 @@ impl Translator {
         }
         Ok(())
     }
+}
+
+/// Parse an LLVM module and generate inline-assembly model stubs without lowering it.
+pub fn emit_asm_manifest(
+    input: TranslationInput,
+    input_format: InputFormat,
+    contract_paths: &[PathBuf],
+) -> Result<AsmManifest> {
+    let bytes = read_input(&input)?;
+    let context = Context::create();
+    let module = parse_module(&context, &input, input_format, &bytes)?;
+    let contracts = contracts::load_contracts(contract_paths)?;
+    asm_manifest::generate(&module, &contracts)
 }
 
 /// Check that every assigns helper's body is observationally read-only.
@@ -548,8 +563,7 @@ fn reject_module_inline_asm(module: &Module<'_>) -> Result<()> {
 }
 
 fn module_has_inline_asm(module: &Module<'_>) -> bool {
-    let mut len = 0;
-    unsafe { !LLVMGetModuleInlineAsm(module.as_mut_ptr(), &mut len).is_null() && len != 0 }
+    asm_manifest::has_module_inline_asm(module)
 }
 
 impl TranslationInput {
