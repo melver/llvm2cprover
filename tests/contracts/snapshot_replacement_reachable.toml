@@ -1,0 +1,4 @@
+[functions.increment]
+snapshot = "snapshot_increment"
+ensures = "ensures_increment"
+assigns = ["assigns_increment"]

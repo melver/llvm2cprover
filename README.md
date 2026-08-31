@@ -105,6 +105,7 @@ Example manifest:
 [functions.abs]
 requires = "__contract_requires_abs"
 ensures = "__contract_ensures_abs"
+snapshot = "__contract_snapshot_abs"
 model = "__contract_model_abs"
 assigns = ["__contract_assigns_abs"]
 ```
@@ -127,10 +128,19 @@ a variadic symbol, so a selected variadic replacement enforces its frame through
 body; an unselected variadic contract with `assigns` fails closed. Address-taken/indirect uses and
 `invoke` uses of selected functions fail closed until their replacement semantics are supported.
 
+Stateful postconditions can use `snapshot` to capture pointer-reachable pre-state. The snapshot
+helper is called after `requires` and before either the real target/model call or replacement
+`assigns` helpers. It receives the target parameters and returns one non-void LLVM value. The
+`ensures` helper receives the target parameters first, that captured value next, and the target
+result last when the target is non-void. A snapshot without `ensures` is rejected.
+
 Supported directives:
 
 - `requires`: inserts a pre-call `__CPROVER_assume(...)`
 - `ensures`: inserts a post-call `__CPROVER_assert(...)`
+- `snapshot`: calls a helper after `requires` but before the target and preserves its non-void
+  result for `ensures`; the `ensures` argument order is target parameters, snapshot, then target
+  result when non-void
 - `model`: redirects direct calls to a helper function
 - `assigns`: attaches CBMC assigns metadata to defined and external functions, generates stub bodies
   only for unselected external declarations with a nonempty frame, and supplies the writable frame

@@ -1,0 +1,3 @@
+[functions.redirect]
+snapshot = "snapshot_redirect"
+ensures = "ensures_redirect"

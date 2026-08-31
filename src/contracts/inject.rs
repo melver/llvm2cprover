@@ -3,9 +3,11 @@
 
 //! Native contract attachment and explicit replacement synthesis.
 //!
-//! Helper-driven `requires`, `ensures`, and `model` behavior is handled during
-//! instruction lowering because it changes call-site behavior. Explicit replacements are
-//! synthesized here before instruction lowering; symbol-level `assigns` metadata is attached after.
+//! At ordinary call sites, helper-driven `requires`, `snapshot`, `ensures`, and `model` behavior
+//! is handled during instruction lowering. A snapshot captures pre-state after `requires` and
+//! before the target or model runs. Explicit replacements are synthesized here before instruction
+//! lowering with the same ordering, placing snapshot capture before `assigns`; symbol-level
+//! `assigns` metadata is attached after lowering.
 //!
 //! For external functions, `assigns` is represented twice on purpose:
 //!
@@ -35,10 +37,11 @@ enum HelperReturn {
 
 /// Attach symbol-level contracts after lowering.
 ///
-/// `requires`, `ensures`, and `model` are handled during instruction lowering.
-/// The remaining native contract hook is `assigns`, which is represented both as
-/// CBMC contract metadata and, for externs, as a synthesized stub body so plain
-/// `cbmc` sees the intended write effects without extra contract-mode flags.
+/// Ordinary-call `requires`, pre-call `snapshot`, `ensures`, and `model` behavior is handled
+/// during instruction lowering, while explicit replacements are synthesized earlier. The
+/// remaining native contract hook is `assigns`, which is represented both as CBMC contract
+/// metadata and, for externs, as a synthesized stub body so plain `cbmc` sees the intended write
+/// effects without extra contract-mode flags.
 pub fn inject_contracts(symbols: &mut SymbolTable, contracts: &ContractMap) -> Result<()> {
     validate_contracts(symbols, contracts)?;
     inject_contracts_with_replacements(symbols, contracts, &BTreeSet::new())
@@ -134,7 +137,6 @@ fn validate_contracts(symbols: &SymbolTable, contracts: &ContractMap) -> Result<
             .return_type()
             .cloned()
             .unwrap_or_else(Type::empty);
-
         if let Some(helper) = contract.requires.as_deref() {
             validate_helper(
                 symbols,
@@ -145,9 +147,51 @@ fn validate_contracts(symbols: &SymbolTable, contracts: &ContractMap) -> Result<
                 HelperReturn::Value,
             )?;
         }
+        let snapshot_type = if let Some(helper) = contract.snapshot.as_deref() {
+            let snapshot_symbol = validate_helper(
+                symbols,
+                name,
+                helper,
+                param_count,
+                "snapshot",
+                HelperReturn::Value,
+            )?;
+            // A snapshot must observe the caller's pre-state, which an opaque declaration
+            // cannot do. This is stricter than `is_undefined_extern`, which only asks whether
+            // a symbol still needs a synthesized stub.
+            if !has_helper_body(snapshot_symbol) {
+                bail!("snapshot helper `{helper}` for `{name}` must be defined");
+            }
+            let target_parameters = target
+                .typ
+                .parameters()
+                .expect("validated function type")
+                .iter()
+                .map(|parameter| parameter.typ().clone())
+                .collect::<Vec<_>>();
+            validate_helper_parameters(
+                symbols,
+                name,
+                helper,
+                snapshot_symbol,
+                &target_parameters,
+                "snapshot",
+            )?;
+            Some(
+                snapshot_symbol
+                    .typ
+                    .return_type()
+                    .cloned()
+                    .expect("validated snapshot return type"),
+            )
+        } else {
+            None
+        };
         if let Some(helper) = contract.ensures.as_deref() {
-            let ensures_arity = param_count + usize::from(return_type != Type::empty());
-            validate_helper(
+            let ensures_arity = param_count
+                + usize::from(snapshot_type.is_some())
+                + usize::from(return_type != Type::empty());
+            let ensures_symbol = validate_helper(
                 symbols,
                 name,
                 helper,
@@ -155,6 +199,26 @@ fn validate_contracts(symbols: &SymbolTable, contracts: &ContractMap) -> Result<
                 "ensures",
                 HelperReturn::Value,
             )?;
+            if let Some(snapshot_type) = snapshot_type.as_ref() {
+                let snapshot_parameter = ensures_symbol
+                    .typ
+                    .parameters()
+                    .expect("validated ensures function type")
+                    .get(param_count)
+                    .expect("validated ensures arity")
+                    .typ();
+                if !types_are_call_compatible(
+                    snapshot_type,
+                    snapshot_parameter,
+                    symbols.machine_model(),
+                ) {
+                    bail!(
+                        "ensures helper `{helper}` for `{name}` has snapshot parameter type {:?}, expected {:?}",
+                        snapshot_parameter,
+                        snapshot_type
+                    );
+                }
+            }
         }
         if let Some(helper) = contract.model.as_deref() {
             validate_helper(
@@ -178,6 +242,66 @@ fn validate_contracts(symbols: &SymbolTable, contracts: &ContractMap) -> Result<
         }
     }
     Ok(())
+}
+
+/// Build the `ensures` argument list: target parameters, the snapshot, then the target result.
+///
+/// The instrumentation and synthesized-replacement paths share this ordering.
+pub(crate) fn ensures_arguments(
+    mut parameters: Vec<Expr>,
+    snapshot: Option<Expr>,
+    result: Option<Expr>,
+) -> Vec<Expr> {
+    parameters.extend(snapshot);
+    parameters.extend(result);
+    parameters
+}
+
+/// Whether a helper symbol carries a body that can be reasoned about.
+///
+/// Distinct from [`is_undefined_extern`], which asks whether a target still needs a stub.
+fn has_helper_body(symbol: &Symbol) -> bool {
+    !symbol.is_extern && !symbol.location.is_builtin()
+}
+
+/// Check a helper's parameter types against what call sites will pass.
+///
+/// Only `snapshot` uses this today; `requires`, `ensures`, and `model` rely on the
+/// target-equivalent casts applied when their calls are emitted.
+fn validate_helper_parameters(
+    symbols: &SymbolTable,
+    target_name: &str,
+    helper_name: &str,
+    helper_symbol: &Symbol,
+    expected: &[Type],
+    kind: &str,
+) -> Result<()> {
+    let parameters = helper_symbol
+        .typ
+        .parameters()
+        .expect("helper existence and arity were validated");
+    for (index, (parameter, expected)) in parameters.iter().zip(expected).enumerate() {
+        if !types_are_call_compatible(expected, parameter.typ(), symbols.machine_model()) {
+            bail!(
+                "{kind} helper `{helper_name}` for `{target_name}` argument {index} has type {:?}, expected {:?}",
+                parameter.typ(),
+                expected
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Match the target-equivalent casts used when helper calls are emitted, without treating two
+/// unrelated aggregate types as equivalent merely because neither has a scalar machine width.
+fn types_are_call_compatible(
+    source: &Type,
+    target: &Type,
+    machine_model: &cprover_bindings::MachineModel,
+) -> bool {
+    source == target
+        || (source.is_equal_on_machine(target, machine_model)
+            && Expr::nondet(source.clone()).can_cast_to(target))
 }
 
 fn attach_assigns_contract(
@@ -221,14 +345,15 @@ fn validate_target_is_function(name: &str, target_type: &Type) -> Result<()> {
     Ok(())
 }
 
-fn validate_helper(
-    symbols: &SymbolTable,
+/// Validate one helper's arity and return type, yielding the resolved symbol for further checks.
+fn validate_helper<'a>(
+    symbols: &'a SymbolTable,
     target_name: &str,
     helper_name: &str,
     expected_arity: usize,
     kind: &str,
     expected_return: HelperReturn,
-) -> Result<()> {
+) -> Result<&'a Symbol> {
     let helper_symbol = symbols
         .lookup(helper_name)
         .ok_or_else(|| anyhow::anyhow!("{kind} helper `{helper_name}` is missing"))?;
@@ -267,7 +392,7 @@ fn validate_helper(
             }
         }
     }
-    Ok(())
+    Ok(helper_symbol)
 }
 
 fn synthesize_assigns_stub(
@@ -355,6 +480,13 @@ fn synthesize_replacement(
             loc,
         ));
     }
+    let snapshot = if let Some(helper) = contract.snapshot.as_deref() {
+        let snapshot = emit_value_helper(symbols, &replacement, helper, &args, "snapshot", loc)?;
+        body.extend(snapshot.0);
+        Some(snapshot.1)
+    } else {
+        None
+    };
     body.extend(assigns_helper_calls(symbols, contract, &args, loc)?);
 
     let result = (return_type != Type::empty())
@@ -363,10 +495,7 @@ fn synthesize_replacement(
         body.push(Stmt::assign(result.clone(), Expr::nondet(return_type), loc));
     }
     if let Some(helper) = contract.ensures.as_deref() {
-        let mut helper_args = args;
-        if let Some(result) = &result {
-            helper_args.push(result.clone());
-        }
+        let helper_args = ensures_arguments(args, snapshot, result.clone());
         let condition =
             emit_value_helper(symbols, &replacement, helper, &helper_args, "ensures", loc)?;
         body.extend(condition.0);

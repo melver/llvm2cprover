@@ -130,6 +130,11 @@ pub struct FunctionContract {
     pub requires: Option<String>,
     /// Helper function called after the target call and asserted to hold.
     pub ensures: Option<String>,
+    /// Helper function called before the target to capture state for `ensures`.
+    ///
+    /// The snapshot helper receives the target parameters and returns one non-void value.
+    /// `ensures` receives that value after the target parameters and before the target result.
+    pub snapshot: Option<String>,
     /// Helper function used instead of the original callee.
     pub model: Option<String>,
     /// Void helper functions that describe writable locations.
@@ -237,9 +242,14 @@ impl ContractMap {
                 );
             }
             self.helpers.extend(
-                [contract.requires, contract.ensures, contract.model]
-                    .into_iter()
-                    .flatten(),
+                [
+                    contract.requires,
+                    contract.ensures,
+                    contract.snapshot,
+                    contract.model,
+                ]
+                .into_iter()
+                .flatten(),
             );
             self.helpers
                 .extend(contract.assigns.iter().flatten().cloned());
@@ -285,11 +295,18 @@ impl ContractMap {
 fn validate_function_contract(path: &Path, name: &str, contract: &FunctionContract) -> Result<()> {
     if contract.requires.is_none()
         && contract.ensures.is_none()
+        && contract.snapshot.is_none()
         && contract.model.is_none()
         && contract.assigns.is_none()
     {
         bail!(
-            "{}: contract for `{name}` must define at least one of `requires`, `ensures`, `model`, or `assigns`",
+            "{}: contract for `{name}` must define at least one of `requires`, `ensures`, `snapshot`, `model`, or `assigns`",
+            path.display()
+        );
+    }
+    if contract.snapshot.is_some() && contract.ensures.is_none() {
+        bail!(
+            "{}: contract for `{name}` defines `snapshot` without `ensures`",
             path.display()
         );
     }
@@ -305,6 +322,7 @@ mod tests {
             [functions.abs]
             requires = "__contract_requires_abs"
             ensures = "__contract_ensures_abs"
+            snapshot = "__contract_snapshot_abs"
             model = "__contract_model_abs"
             assigns = ["__contract_assigns_abs"]
             "#,
@@ -314,10 +332,29 @@ mod tests {
         let abs = contracts.function("abs").expect("missing abs contract");
         assert_eq!(abs.requires.as_deref(), Some("__contract_requires_abs"));
         assert_eq!(abs.ensures.as_deref(), Some("__contract_ensures_abs"));
+        assert_eq!(abs.snapshot.as_deref(), Some("__contract_snapshot_abs"));
         assert_eq!(abs.model.as_deref(), Some("__contract_model_abs"));
         assert_eq!(abs.assigns, Some(vec!["__contract_assigns_abs".to_owned()]));
         assert!(contracts.is_helper("__contract_requires_abs"));
+        assert!(contracts.is_helper("__contract_snapshot_abs"));
         assert!(contracts.is_helper("__contract_assigns_abs"));
+    }
+
+    #[test]
+    fn rejects_snapshot_without_ensures() {
+        let error = super::parse_contracts(
+            r#"
+            [functions.f]
+            snapshot = "snapshot_f"
+            "#,
+        )
+        .expect_err("an unused snapshot must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("defines `snapshot` without `ensures`")
+        );
     }
 
     #[test]

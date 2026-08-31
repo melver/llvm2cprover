@@ -250,7 +250,7 @@ model = "model"
     );
     let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
         .expect("invalid report");
-    assert_eq!(report_json["schema_version"], 2);
+    assert_eq!(report_json["schema_version"], 3);
     assert_eq!(report_json["machine_model"], "lp64");
     assert_eq!(report_json["target_triple"], "x86_64-unknown-linux-gnu");
     assert_eq!(
@@ -286,9 +286,15 @@ define i32 @target(i32 %x) {
 entry:
   ret i32 %x
 }
-define i1 @ensures_target(i32 %x, i32 %result) {
+define i32 @snapshot_target(i32 %x) {
 entry:
-  %same = icmp eq i32 %x, %result
+  ret i32 %x
+}
+define i1 @ensures_target(i32 %x, i32 %snapshot, i32 %result) {
+entry:
+  %snapshot.same = icmp eq i32 %x, %snapshot
+  %result.same = icmp eq i32 %x, %result
+  %same = and i1 %snapshot.same, %result.same
   ret i1 %same
 }
 define i32 @main() {
@@ -305,6 +311,7 @@ entry:
         &manifest,
         r#"
 [functions.target]
+snapshot = "snapshot_target"
 ensures = "ensures_target"
 assigns = []
 "#,
@@ -334,6 +341,7 @@ assigns = []
         .expect("invalid report");
     assert_eq!(report_json["contracts"][0]["function"], "target");
     assert_eq!(report_json["contracts"][0]["reliance"], "replacement");
+    assert_eq!(report_json["contracts"][0]["snapshot"], "snapshot_target");
     assert_eq!(
         report_json["contracts"][0]["assigns"],
         serde_json::json!([])
@@ -397,7 +405,7 @@ model = "model"
 
     let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
         .expect("invalid report");
-    assert_eq!(report_json["schema_version"], 2);
+    assert_eq!(report_json["schema_version"], 3);
     assert_eq!(report_json["inline_asm_models"][0]["asm"], "opaque");
     assert_eq!(report_json["inline_asm_models"][0]["constraints"], "=r,r");
     assert_eq!(report_json["inline_asm_models"][0]["dialect"], "att");

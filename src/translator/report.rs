@@ -139,6 +139,8 @@ struct ContractAssumption {
     #[serde(skip_serializing_if = "Option::is_none")]
     ensures: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     assigns: Option<Vec<String>>,
@@ -164,7 +166,7 @@ pub(crate) fn write_report(
         (&a.function, &a.construct, a.feature).cmp(&(&b.function, &b.construct, b.feature))
     });
     let report = TranslationReport {
-        schema_version: 2,
+        schema_version: 3,
         machine_model: machine_model.as_str(),
         target_triple: module.get_triple().as_str().to_string_lossy().into_owned(),
         data_layout: module
@@ -229,6 +231,7 @@ fn undefined_functions(
         for helper in [
             contract.requires.as_deref(),
             contract.ensures.as_deref(),
+            contract.snapshot.as_deref(),
             contract.model.as_deref(),
         ]
         .into_iter()
@@ -267,6 +270,7 @@ fn contract_assumption(
         },
         requires: contract.requires.clone(),
         ensures: contract.ensures.clone(),
+        snapshot: contract.snapshot.clone(),
         model: contract.model.clone(),
         assigns: contract.assigns.clone(),
         // Contract discharge is not implemented. Make trust explicit instead of

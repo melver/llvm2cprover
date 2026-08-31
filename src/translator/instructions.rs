@@ -1264,6 +1264,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             {
                 self.lower_requires_helper(contract, &callee_name, &args, body, loc)?;
             }
+            let snapshot = if let Some(contract) = &contract
+                && replacement.is_none()
+            {
+                self.lower_snapshot_helper(contract, &callee_name, &args, body, loc)?
+            } else {
+                None
+            };
 
             let effective_callee = replacement.unwrap_or_else(|| {
                 contract
@@ -1281,7 +1288,15 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             if let Some(contract) = &contract
                 && replacement.is_none()
             {
-                self.lower_ensures_helper(contract, &callee_name, &args, instruction, body, loc)?;
+                self.lower_ensures_helper(
+                    contract,
+                    &callee_name,
+                    &args,
+                    snapshot,
+                    instruction,
+                    body,
+                    loc,
+                )?;
             }
             return Ok(());
         }
@@ -1373,6 +1388,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             if let Some(contract) = &contract {
                 self.lower_requires_helper(contract, &callee_name, &args, body, loc)?;
             }
+            let snapshot = if let Some(contract) = &contract {
+                self.lower_snapshot_helper(contract, &callee_name, &args, body, loc)?
+            } else {
+                None
+            };
 
             let effective_callee = contract
                 .as_ref()
@@ -1392,6 +1412,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                     contract,
                     &callee_name,
                     &args,
+                    snapshot,
                     instruction,
                     &mut normal_stmts,
                     loc,
@@ -1821,6 +1842,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         contract: &FunctionContract,
         callee_name: &str,
         args: &[Expr],
+        snapshot: Option<Expr>,
         instruction: InstructionValue<'ctx>,
         body: &mut Vec<Stmt>,
         loc: Location,
@@ -1828,10 +1850,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let Some(helper) = contract.ensures.as_deref() else {
             return Ok(());
         };
-        let mut helper_args = args.to_vec();
-        if !instruction.get_type().is_void_type() {
-            helper_args.push(self.declare_instruction_result(instruction)?);
-        }
+        let result = (!instruction.get_type().is_void_type())
+            .then(|| self.declare_instruction_result(instruction))
+            .transpose()?;
+        let helper_args =
+            crate::contracts::inject::ensures_arguments(args.to_vec(), snapshot, result);
         let cond =
             self.call_contract_helper(helper, helper_args, body, "ensures", loc, callee_name)?;
         body.push(Stmt::assert(
@@ -1841,6 +1864,24 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             loc,
         ));
         Ok(())
+    }
+
+    /// Capture helper-defined pre-state after `requires` and immediately before the target call.
+    /// The returned value is kept in a caller local and later passed to `ensures` after the target
+    /// parameters and before the target result.
+    fn lower_snapshot_helper(
+        &mut self,
+        contract: &FunctionContract,
+        callee_name: &str,
+        args: &[Expr],
+        body: &mut Vec<Stmt>,
+        loc: Location,
+    ) -> Result<Option<Expr>> {
+        let Some(helper) = contract.snapshot.as_deref() else {
+            return Ok(None);
+        };
+        self.call_contract_helper(helper, args.to_vec(), body, "snapshot", loc, callee_name)
+            .map(Some)
     }
 
     fn call_contract_helper(

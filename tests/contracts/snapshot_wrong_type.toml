@@ -1,0 +1,3 @@
+[functions.target]
+snapshot = "snapshot_target"
+ensures = "ensures_target"
