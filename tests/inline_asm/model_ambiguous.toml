@@ -1,0 +1,16 @@
+[[inline_asm]]
+asm = "opaque"
+constraints = "=r,r"
+dialect = "att"
+side_effects = true
+align_stack = false
+model = "generic_model"
+
+[[inline_asm]]
+asm = "opaque"
+constraints = "=r,r"
+dialect = "att"
+side_effects = true
+align_stack = false
+function = "main"
+model = "specific_model"

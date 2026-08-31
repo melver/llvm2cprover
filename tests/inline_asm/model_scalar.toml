@@ -1,0 +1,8 @@
+[[inline_asm]]
+asm = "opaque $0"
+constraints = "=r,r"
+dialect = "att"
+side_effects = true
+align_stack = false
+function = "main"
+model = "model_increment"

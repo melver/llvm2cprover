@@ -8,7 +8,7 @@
 //! - [`translate`] is the one-shot entry point used by the CLI
 //! - [`Config`] carries stable translation options
 //! - [`translator`] owns LLVM parsing, lowering, diagnostics, and emission
-//! - [`contracts`] owns external contract manifests and contract injection
+//! - [`contracts`] owns external contract and inline-assembly model manifests
 //!
 //! More detailed lowering rules live next to the implementation so the code,
 //! rather than a separate architecture document, remains the durable source of
@@ -113,7 +113,7 @@ impl UnsoundOptions {
 pub struct Config {
     /// Output `.goto` path. Defaults to `<input>.goto` or `a.goto` for stdin.
     pub output: Option<PathBuf>,
-    /// TOML contract manifests loaded alongside the translated module.
+    /// TOML contract and inline-assembly model manifests loaded alongside the module.
     pub contracts: Vec<PathBuf>,
     /// Functions whose direct calls are replaced by their manifest contracts.
     ///
@@ -123,8 +123,8 @@ pub struct Config {
     /// Prefix applied to translated LLVM function and global definitions.
     ///
     /// External declarations, LLVM intrinsics, and verifier/runtime symbols remain unprefixed.
-    /// Contract manifests cannot currently be combined with renaming because their symbol bindings
-    /// use original LLVM names.
+    /// Manifests cannot currently be combined with renaming because their symbol bindings use
+    /// original LLVM names.
     pub rename_prefix: Option<String>,
     /// Machine model used for emitted GOTO types and builtins. `Auto` infers from the module.
     pub machine_model: MachineModel,
@@ -132,8 +132,8 @@ pub struct Config {
     pub input_format: InputFormat,
     /// Explicitly enabled, documented unsound fallbacks for coverage probing.
     ///
-    /// Constructs whose effects cannot be bounded, such as target inline assembly, still fail
-    /// closed.
+    /// Constructs whose effects cannot be bounded, such as unmatched target inline assembly,
+    /// still fail closed.
     pub unsound: UnsoundOptions,
     /// Optional path for a deterministic JSON assumption and stub inventory.
     pub report: Option<PathBuf>,

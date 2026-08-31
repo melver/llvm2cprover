@@ -1,0 +1,7 @@
+[[inline_asm]]
+asm = "opaque pointer"
+constraints = "=r,r"
+dialect = "att"
+side_effects = true
+align_stack = false
+model = "model_identity"

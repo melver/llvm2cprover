@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use cprover_bindings::MachineModel as GotoMachineModel;
 use cprover_bindings::goto_program::{
     Expr, Location, Parameter, Symbol, SymbolTable, SymbolValues, Type,
@@ -121,6 +121,13 @@ impl SymbolBuilder {
         for function in module.get_functions() {
             let name = function.get_name().to_string_lossy().into_owned();
             if symbols.lookup(name.as_str()).is_some() {
+                if contracts.is_helper(&name) {
+                    // Keeping the builtin would silently discard the compiled helper body that
+                    // the manifest binds, so every helper class fails closed here.
+                    bail!(
+                        "manifest helper function `{name}` collides with a predeclared runtime symbol"
+                    );
+                }
                 // CBMC and `cprover_bindings` seed builtin declarations up front. Keep those
                 // canonical symbols instead of trying to re-declare the same name from LLVM IR.
                 continue;
@@ -766,6 +773,47 @@ mod tests {
 
         assert!(symbols.lookup("__CPROVER_assume").is_some());
         assert!(symbols.lookup("main").is_some());
+    }
+
+    #[test]
+    fn rejects_inline_asm_model_colliding_with_predeclared_symbol() {
+        let context = Context::create();
+        let module = parse_module(
+            &context,
+            br#"
+            define i32 @abort(i32 %value) {
+            entry:
+              ret i32 %value
+            }
+        "#,
+        );
+        let contracts = crate::contracts::parse_contracts(
+            r#"
+            [[inline_asm]]
+            asm = "opaque"
+            constraints = "=r,r"
+            dialect = "att"
+            side_effects = true
+            align_stack = false
+            model = "abort"
+        "#,
+        )
+        .expect("failed to parse inline asm model");
+        let error = SymbolBuilder::default()
+            .build(
+                &module,
+                crate::util::resolve_machine_model(&module, crate::MachineModel::Auto)
+                    .expect("failed to resolve machine model"),
+                &contracts,
+                &crate::UnsoundOptions::default(),
+            )
+            .expect_err("runtime symbol collision must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("collides with a predeclared runtime symbol")
+        );
     }
 
     #[test]

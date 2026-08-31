@@ -17,7 +17,7 @@ use inkwell::module::Module;
 use inkwell::values::{AsValueRef, FunctionValue};
 use serde::Serialize;
 
-use crate::contracts::{ContractMap, FunctionContract};
+use crate::contracts::{ContractMap, FunctionContract, InlineAsmDialect, InlineAsmSite};
 use crate::{MachineModel, UnsoundFeature};
 
 use super::JsonLocation;
@@ -33,6 +33,7 @@ pub(crate) struct ReportCollector {
     approximations: Vec<Approximation>,
     relied_contracts: BTreeMap<String, bool>,
     resolved_functions: BTreeSet<String>,
+    inline_asm_models: BTreeSet<InlineAsmAssumption>,
 }
 
 impl ReportCollector {
@@ -78,6 +79,22 @@ impl ReportCollector {
             self.resolved_functions.insert(function.to_owned());
         }
     }
+
+    /// Record one compiled model used in place of target inline assembly.
+    pub(crate) fn inline_asm_model(&mut self, site: &InlineAsmSite<'_>, model: &str) {
+        if self.enabled {
+            self.inline_asm_models.insert(InlineAsmAssumption {
+                asm: site.asm.to_owned(),
+                constraints: site.constraints.to_owned(),
+                dialect: site.dialect,
+                side_effects: site.side_effects,
+                align_stack: site.align_stack,
+                function: site.function.to_owned(),
+                model: model.to_owned(),
+                discharged: false,
+            });
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +106,18 @@ struct Approximation {
     location: Option<JsonLocation>,
 }
 
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct InlineAsmAssumption {
+    asm: String,
+    constraints: String,
+    dialect: InlineAsmDialect,
+    side_effects: bool,
+    align_stack: bool,
+    function: String,
+    model: String,
+    discharged: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct TranslationReport {
     schema_version: u32,
@@ -97,6 +126,7 @@ struct TranslationReport {
     data_layout: String,
     undefined_functions: Vec<String>,
     approximations: Vec<Approximation>,
+    inline_asm_models: Vec<InlineAsmAssumption>,
     contracts: Vec<ContractAssumption>,
 }
 
@@ -127,13 +157,14 @@ pub(crate) fn write_report(
         mut approximations,
         relied_contracts,
         resolved_functions,
+        inline_asm_models,
         ..
     } = collected;
     approximations.sort_by(|a, b| {
         (&a.function, &a.construct, a.feature).cmp(&(&b.function, &b.construct, b.feature))
     });
     let report = TranslationReport {
-        schema_version: 1,
+        schema_version: 2,
         machine_model: machine_model.as_str(),
         target_triple: module.get_triple().as_str().to_string_lossy().into_owned(),
         data_layout: module
@@ -149,6 +180,7 @@ pub(crate) fn write_report(
             symbols,
         ),
         approximations,
+        inline_asm_models: inline_asm_models.into_iter().collect(),
         contracts: contracts
             .iter()
             .filter_map(|(name, contract)| {

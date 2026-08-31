@@ -250,7 +250,7 @@ model = "model"
     );
     let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
         .expect("invalid report");
-    assert_eq!(report_json["schema_version"], 1);
+    assert_eq!(report_json["schema_version"], 2);
     assert_eq!(report_json["machine_model"], "lp64");
     assert_eq!(report_json["target_triple"], "x86_64-unknown-linux-gnu");
     assert_eq!(
@@ -339,6 +339,73 @@ assigns = []
         serde_json::json!([])
     );
     assert_eq!(report_json["contracts"][0]["discharged"], false);
+
+    for path in [&input, &manifest, &goto, &report] {
+        fs::remove_file(path).expect("failed to remove test artifact");
+    }
+}
+
+#[test]
+fn report_inventories_applied_inline_asm_models() {
+    let input = input_file(
+        r#"
+define i32 @model(i32 %value) {
+entry:
+  ret i32 %value
+}
+
+define i32 @f(i32 %value) {
+entry:
+  %result = call i32 asm sideeffect "opaque", "=r,r"(i32 %value)
+  ret i32 %result
+}
+"#,
+    );
+    let manifest = input.with_extension("toml");
+    let goto = input.with_extension("goto");
+    let report = input.with_extension("report.json");
+    fs::write(
+        &manifest,
+        r#"
+[[inline_asm]]
+asm = "opaque"
+constraints = "=r,r"
+dialect = "att"
+side_effects = true
+align_stack = false
+model = "model"
+"#,
+    )
+    .expect("failed to write inline asm manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--contracts")
+        .arg(&manifest)
+        .arg("--report")
+        .arg(&report)
+        .arg("--output")
+        .arg(&goto)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
+        .expect("invalid report");
+    assert_eq!(report_json["schema_version"], 2);
+    assert_eq!(report_json["inline_asm_models"][0]["asm"], "opaque");
+    assert_eq!(report_json["inline_asm_models"][0]["constraints"], "=r,r");
+    assert_eq!(report_json["inline_asm_models"][0]["dialect"], "att");
+    assert_eq!(report_json["inline_asm_models"][0]["side_effects"], true);
+    assert_eq!(report_json["inline_asm_models"][0]["align_stack"], false);
+    assert_eq!(report_json["inline_asm_models"][0]["function"], "f");
+    assert_eq!(report_json["inline_asm_models"][0]["model"], "model");
+    assert_eq!(report_json["inline_asm_models"][0]["discharged"], false);
 
     for path in [&input, &manifest, &goto, &report] {
         fs::remove_file(path).expect("failed to remove test artifact");

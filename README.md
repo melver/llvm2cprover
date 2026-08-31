@@ -66,8 +66,9 @@ selector is `--unsound=varargs`, which ignores `va_start`, `va_end`, and
 `va_copy`. When `--report` is requested, every ignored intrinsic is recorded.
 Bare `--unsound` remains accepted as shorthand for all available approximations,
 but prints a warning after successful translation; scripts should use explicit
-selectors. Stateful inline assembly has no bounded approximation and remains
-fail-closed in every mode.
+selectors. Unmatched stateful inline assembly has no bounded approximation and
+remains fail-closed in every mode; an exact manifest mapping may instead route
+it to compiled model code.
 
 `--report <file.json>` writes a deterministic assumption and stub inventory
 after successful translation. It contains:
@@ -75,6 +76,8 @@ after successful translation. It contains:
 - referenced-but-undefined input functions (unused declarations are omitted)
 - every enabled approximation actually taken, including its enclosing function
   and best-effort source location
+- every compiled inline-assembly model actually used; these trusted mappings
+  report `discharged: false`
 - every contract applied at a direct call site, whether it was instrumentation or an explicit
   replacement, and whether the contract has been checked against the preserved implementation;
   replacements currently report `discharged: false`
@@ -91,9 +94,10 @@ Machine model:
 
 ## Contracts
 
-`--contracts <file.toml>` attaches one or more contract manifests. The manifest
-maps target functions to helper symbols, while the helper implementations
-themselves are ordinary compiled LLVM functions in the linked input.
+`--contracts <file.toml>` attaches one or more model manifests. Function
+contracts map targets to helper symbols, and inline-assembly entries map exact
+LLVM assembly metadata to model symbols. All helper and model implementations
+are ordinary compiled LLVM functions in the linked input.
 
 Example manifest:
 
@@ -132,6 +136,28 @@ Supported directives:
   only for unselected external declarations with a nonempty frame, and supplies the writable frame
   for explicit contract replacement; defined function bodies remain intact
 
+The same manifest can map target inline assembly to defined model functions in
+the input module:
+
+```toml
+[[inline_asm]]
+asm = "opaque $0"
+constraints = "=r,r"
+dialect = "att"
+side_effects = true
+align_stack = false
+function = "read_counter" # optional enclosing-function qualifier
+model = "__model_read_counter"
+```
+
+All assembly properties in the entry are matched exactly. The model must be a
+defined, non-variadic function whose parameter and return types exactly match
+the assembly call. LLVM represents multiple assembly outputs as an aggregate
+return, so the corresponding model returns the identical aggregate type.
+Overlapping matches and unwind-capable assembly fail closed. Empty and
+comment-only compiler barriers retain their no-op lowering and do not need a
+model.
+
 ## Design
 
 Overview of the current design:
@@ -153,6 +179,9 @@ Unsupported LLVM features produce deterministic translation errors at the point
 where lowering would become unsound, rather than silently approximating away
 behavior. Explicit `--unsound=<feature>` selectors gate the small set of
 documented approximations and `--report` inventories each approximation used.
+Inline-assembly models are ordinary compiled functions selected by exact raw
+LLVM assembly metadata, so their behavior can be reviewed and tested without
+embedding target-specific semantics in the translator.
 
 ## Related Work
 

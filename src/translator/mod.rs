@@ -152,6 +152,7 @@ impl Translator {
         let module = parse_module(&context, &input, self.config.input_format, &bytes)?;
         reject_module_inline_asm(&module)?;
         let contracts = contracts::load_contracts(&self.config.contracts)?;
+        validate_inline_asm_model_definitions(&module, &contracts)?;
         validate_contract_replacement_uses(&module, &self.config.replace_with_contract)?;
         let resolved_machine_model =
             util::resolve_machine_model_kind(&module, self.config.machine_model)?;
@@ -197,6 +198,24 @@ impl Translator {
         }
         Ok(())
     }
+}
+
+fn validate_inline_asm_model_definitions(
+    module: &Module<'_>,
+    contracts: &contracts::ContractMap,
+) -> Result<()> {
+    for mapping in contracts.inline_asm_models() {
+        let model = module
+            .get_function(&mapping.model)
+            .ok_or_else(|| anyhow!("inline asm model function `{}` is missing", mapping.model))?;
+        if model.count_basic_blocks() == 0 {
+            bail!(
+                "inline asm model function `{}` must be defined in the input module",
+                mapping.model
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_contract_replacement_uses(

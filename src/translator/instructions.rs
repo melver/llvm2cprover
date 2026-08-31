@@ -10,6 +10,7 @@
 //! - basic blocks become labeled GOTO blocks
 //! - ordinary contracts are injected at call sites, while explicitly selected calls redirect
 //!   to internal replacement functions synthesized from the compiled helpers
+//! - exactly matched inline assembly redirects to defined compiled model functions
 //!
 //! Unsupported instructions fail where they are encountered, which keeps
 //! diagnostics specific and avoids a second feature-classification pass.
@@ -31,10 +32,11 @@ use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
-    LLVMGetInlineAsmAsmString, LLVMGetInlineAsmCanUnwind, LLVMGetMaskValue, LLVMGetNormalDest,
-    LLVMGetNumArgOperands, LLVMGetNumClauses, LLVMGetNumMaskElements, LLVMGetNumSuccessors,
-    LLVMGetSuccessor, LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAInlineAsm, LLVMIsCleanup,
-    LLVMIsUndef,
+    LLVMGetInlineAsmAsmString, LLVMGetInlineAsmCanUnwind, LLVMGetInlineAsmConstraintString,
+    LLVMGetInlineAsmDialect, LLVMGetInlineAsmHasSideEffects, LLVMGetInlineAsmNeedsAlignedStack,
+    LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands, LLVMGetNumClauses,
+    LLVMGetNumMaskElements, LLVMGetNumSuccessors, LLVMGetSuccessor, LLVMGetSwitchCaseValue,
+    LLVMGetUnwindDest, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
 };
 use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
@@ -49,9 +51,13 @@ use super::report::ReportCollector;
 use super::types::TypeLowerer;
 use super::{Diagnostic, EH_ACTIVE_SYMBOL, EH_PTR_SYMBOL, EH_SELECTOR_SYMBOL, UnsupportedFeature};
 use crate::contracts::inject::ReplacementMap;
-use crate::contracts::{ContractMap, FunctionContract};
+use crate::contracts::{ContractMap, FunctionContract, InlineAsmDialect, InlineAsmSite};
 use crate::util;
 use crate::{UnsoundFeature, UnsoundOptions};
+
+/// One of LLVM's `LLVMGetInlineAsm*String` pointer/length accessors.
+type InlineAsmStringGetter =
+    unsafe extern "C" fn(LLVMValueRef, *mut usize) -> *const std::os::raw::c_char;
 
 /// Lowers supported LLVM function bodies into GOTO statements.
 ///
@@ -1496,6 +1502,70 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 self.assign_result(instruction, body, value)?;
                 return Ok(true);
             }
+        }
+
+        // Skip the exact-match machinery entirely when no rules are configured, which is the
+        // common case and keeps unmodelled assembly on the direct fail-closed path.
+        let site = self.contracts.has_inline_asm_models().then(|| {
+            (
+                self.inline_asm_str(raw_callee, LLVMGetInlineAsmConstraintString),
+                self.function_name.clone(),
+            )
+        });
+        let site = site.as_ref().map(|(constraints, function)| InlineAsmSite {
+            asm: &asm,
+            constraints,
+            dialect: match unsafe { LLVMGetInlineAsmDialect(raw_callee) } {
+                inkwell::llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT => {
+                    InlineAsmDialect::Att
+                }
+                inkwell::llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectIntel => {
+                    InlineAsmDialect::Intel
+                }
+            },
+            side_effects: unsafe { LLVMGetInlineAsmHasSideEffects(raw_callee) != 0 },
+            align_stack: unsafe { LLVMGetInlineAsmNeedsAlignedStack(raw_callee) != 0 },
+            function,
+        });
+        if let Some(site) = &site
+            && let Some(mapping) = self.contracts.inline_asm_model(site)
+        {
+            if mapping.model == self.function_name {
+                anyhow::bail!(
+                    "inline asm model `{}` recursively matches assembly in its own body",
+                    mapping.model
+                );
+            }
+            if unsafe { LLVMGetInlineAsmCanUnwind(raw_callee) != 0 } {
+                return Err(Diagnostic::unsupported_feature(
+                    UnsupportedFeature::InlineAsm,
+                    format!(
+                        "inline asm model `{}` cannot replace unwind-capable assembly in {}",
+                        mapping.model, self.function_name
+                    ),
+                )
+                .with_symbol(self.function_name.clone())
+                .with_location(loc)
+                .into());
+            }
+            let arguments = (0..unsafe { LLVMGetNumArgOperands(instruction.as_value_ref()) })
+                .map(|index| self.lower_operand(instruction, index))
+                .collect::<Result<Vec<_>>>()?;
+            let function = self.function_expr(&mapping.model, loc)?;
+            self.validate_inline_asm_model_signature(
+                instruction,
+                &mapping.model,
+                &function,
+                &arguments,
+            )?;
+            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
+                &function,
+                arguments,
+                self.symbols.machine_model(),
+            );
+            self.emit_call_result(instruction, function, arguments, body, loc)?;
+            self.report.inline_asm_model(site, &mapping.model);
+            return Ok(true);
         }
 
         // Real target assembly may read or mutate memory through constraints and clobbers that
@@ -3536,13 +3606,73 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     }
 
     fn inline_asm_string(&self, asm: LLVMValueRef) -> String {
+        self.inline_asm_str(asm, LLVMGetInlineAsmAsmString)
+    }
+
+    /// Decode one of LLVM's pointer/length inline-assembly string accessors.
+    fn inline_asm_str(&self, asm: LLVMValueRef, getter: InlineAsmStringGetter) -> String {
         let mut len = 0;
-        let ptr = unsafe { LLVMGetInlineAsmAsmString(asm, &mut len) };
+        let ptr = unsafe { getter(asm, &mut len) };
         if ptr.is_null() || len == 0 {
             return String::new();
         }
         String::from_utf8_lossy(unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) })
             .into_owned()
+    }
+
+    fn validate_inline_asm_model_signature(
+        &mut self,
+        instruction: InstructionValue<'ctx>,
+        model: &str,
+        function: &Expr,
+        arguments: &[Expr],
+    ) -> Result<()> {
+        let typ = function.typ();
+        let parameters = typ
+            .parameters()
+            .ok_or_else(|| anyhow::anyhow!("inline asm model `{model}` is not a function"))?;
+        if typ.is_variadic_code() || parameters.len() != arguments.len() {
+            anyhow::bail!(
+                "inline asm model `{model}` has an incompatible signature: expected {} fixed arguments, found {}{}",
+                arguments.len(),
+                parameters.len(),
+                if typ.is_variadic_code() {
+                    " plus variadic arguments"
+                } else {
+                    ""
+                }
+            );
+        }
+        for (index, (parameter, argument)) in parameters.iter().zip(arguments).enumerate() {
+            if !Self::inline_asm_types_compatible(parameter.typ(), argument.typ()) {
+                anyhow::bail!(
+                    "inline asm model `{model}` argument {index} has type {:?}, expected {:?}",
+                    parameter.typ(),
+                    argument.typ()
+                );
+            }
+        }
+        let expected_return = if instruction.get_type().is_void_type() {
+            Type::empty()
+        } else {
+            self.declare_instruction_result(instruction)?.typ().clone()
+        };
+        let actual_return = typ.return_type().cloned().unwrap_or_else(Type::empty);
+        if !Self::inline_asm_types_compatible(&actual_return, &expected_return) {
+            anyhow::bail!(
+                "inline asm model `{model}` returns {:?}, expected {:?}",
+                actual_return,
+                expected_return
+            );
+        }
+        Ok(())
+    }
+
+    fn inline_asm_types_compatible(model: &Type, asm: &Type) -> bool {
+        // LLVM 22 uses opaque pointers, while pointee recovery gives the GOTO
+        // representation extra local type information. Any two lowered pointer
+        // types therefore correspond to the same LLVM `ptr` signature type.
+        model == asm || (model.is_pointer() && asm.is_pointer())
     }
 
     fn inline_asm_is_empty(&self, asm: &str) -> bool {
