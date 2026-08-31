@@ -4,14 +4,13 @@
 // entry = "main"
 // ---
 
-extern int __CPROVER_nondet_int(void);
 extern void __CPROVER_assert(_Bool, const char*);
 
 extern void scribble(int* x, int* y);
 
-void contract_assigns_scribble(int* x, int* y) {
-  *x = __CPROVER_nondet_int();
+int* contract_assigns_scribble(int* x, int* y) {
   (void)y;
+  return x + 0;
 }
 
 int main(void) {

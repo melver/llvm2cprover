@@ -7,9 +7,9 @@
 //! is handled during instruction lowering. A snapshot captures pre-state after `requires` and
 //! before the target or model runs. Explicit replacements are synthesized here before instruction
 //! lowering with the same ordering, placing snapshot capture before `assigns`; symbol-level
-//! `assigns` metadata is attached after lowering. Observationally read-only pointer-returning
-//! assigns helpers compute CBMC lvalues before entering the preserved implementation; their purity
-//! is validated against the LLVM input before lowering.
+//! `assigns` metadata is attached after lowering. Observationally read-only assigns helpers return
+//! CBMC lvalues before entering the preserved implementation; their purity is validated against
+//! the LLVM input before lowering.
 //!
 //! For external functions, `assigns` is represented twice on purpose:
 //!
@@ -173,6 +173,14 @@ fn attach_enforcement_assigns_contract(
     Ok(())
 }
 
+/// Whether an assigns helper's return type names a concrete writable object.
+fn is_assigns_frame_pointer(typ: &Type) -> bool {
+    typ.is_pointer()
+        && !typ
+            .base_type()
+            .is_some_and(|pointee| pointee == &Type::empty())
+}
+
 /// Require the explicit `assigns` clause both replacement and enforcement depend on.
 fn require_explicit_assigns(contract: &FunctionContract, name: &str, mode: &str) -> Result<()> {
     if contract.assigns.is_none() {
@@ -273,26 +281,12 @@ pub(crate) fn prepare_enforcements(
             let helper_symbol = symbols
                 .lookup(helper.as_str())
                 .expect("validated assigns helper");
-            if !has_helper_body(helper_symbol) {
-                bail!(
-                    "contract enforcement for `{name}` requires defined assigns helper `{helper}`"
-                );
-            }
             let typ = helper_symbol
                 .typ
                 .return_type()
                 .expect("validated assigns helper")
                 .clone();
-            if !typ.is_pointer() {
-                bail!(
-                    "contract enforcement for `{name}` requires pointer-returning assigns helpers; legacy void helper `{helper}` is replacement-only"
-                );
-            }
-            if typ.base_type().is_some_and(|typ| typ == &Type::empty()) {
-                bail!(
-                    "contract enforcement for `{name}` requires a concrete pointee type from assigns helper `{helper}`"
-                );
-            }
+            debug_assert!(is_assigns_frame_pointer(&typ));
             let slot = enforcement_assigns_slot(name, index);
             reject_symbol_collision(symbols, &slot, "contract enforcement assigns slot")?;
             let mut symbol = Symbol::static_variable(&slot, &slot, typ.clone(), Location::none());
@@ -544,11 +538,7 @@ fn attach_assigns_contract(
                 symbols.machine_model(),
             ),
         );
-        let assigned = if call.typ().is_pointer() {
-            call.dereference()
-        } else {
-            call
-        };
+        let assigned = call.dereference();
         clauses.push(Lambda::as_contract_for(
             &target.typ,
             None::<InternedString>,
@@ -608,9 +598,17 @@ fn validate_helper<'a>(
             }
         }
         HelperReturn::Assigns => {
-            if actual_return != Type::empty() && !actual_return.is_pointer() {
+            if !has_helper_body(helper_symbol) {
                 bail!(
-                    "assigns helper `{helper_name}` for `{target_name}` must return void or a pointer"
+                    "assigns helper `{helper_name}` for `{target_name}` must be a compiled definition"
+                );
+            }
+            if !actual_return.is_pointer() {
+                bail!("assigns helper `{helper_name}` for `{target_name}` must return a pointer");
+            }
+            if !is_assigns_frame_pointer(&actual_return) {
+                bail!(
+                    "assigns helper `{helper_name}` for `{target_name}` must return a pointer with a concrete pointee type"
                 );
             }
         }
@@ -826,8 +824,7 @@ fn synthesize_enforcement_harness(
 
 /// Apply the frame described by each assigns helper.
 ///
-/// Legacy void helpers perform their imperative havoc directly. Pointer-returning helpers compute
-/// one writable lvalue, which is then assigned a nondeterministic value.
+/// Call each assigns helper to compute one writable lvalue, then assign it a nondeterministic value.
 fn assigns_helper_calls(
     symbols: &mut SymbolTable,
     function: &str,
@@ -852,11 +849,7 @@ fn assigns_helper_calls(
             .return_type()
             .cloned()
             .expect("validated helper function");
-        if return_type == Type::empty() {
-            statements.push(Stmt::function_call(None, helper_expr, arguments, loc));
-            continue;
-        }
-        // A pointer-returning helper names an lvalue; havoc it so the frame is modeled.
+        // The helper names an lvalue; havoc it so the frame is modeled.
         let result = insert_local(
             symbols,
             function,

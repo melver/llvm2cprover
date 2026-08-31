@@ -126,8 +126,6 @@ pub struct Config {
     /// implementation. The selected function must be
     /// defined, non-variadic, non-recursive, and have an explicit `assigns` clause. The generated
     /// harness checks pre/postconditions; CBMC's dynamic-frame pass checks the attached frame.
-    /// Nonempty enforced frames use pointer-returning assigns helpers; legacy void helpers remain
-    /// available for replacement but cannot be discharged.
     pub enforce_contract: BTreeSet<String>,
     /// Prefix applied to translated LLVM function and global definitions.
     ///

@@ -2,7 +2,7 @@
 ; Copyright 2026 The llvm2cprover Authors
 ; ---
 ; expected = "TRANSLATION FAILED"
-; description = "pointer-returning assigns helpers must be compiled definitions"
+; description = "assigns helpers must be compiled definitions"
 ; ---
 
 define i32 @target() {

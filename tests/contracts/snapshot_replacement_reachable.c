@@ -8,7 +8,6 @@
 // translator_flags = ["--replace-with-contract", "increment"]
 // ---
 
-extern int __CPROVER_nondet_int(void);
 extern void __CPROVER_assert(_Bool, const char*);
 
 int increment(int* counter) {
@@ -20,9 +19,7 @@ int snapshot_increment(int* counter) {
   return *counter;
 }
 
-void assigns_increment(int* counter) {
-  *counter = __CPROVER_nondet_int();
-}
+int* assigns_increment(int* counter) { return counter + 0; }
 
 _Bool ensures_increment(int* counter, int before, int result) {
   return *counter == before + 1 && result == *counter;

@@ -2,7 +2,7 @@
 ; Copyright 2026 The llvm2cprover Authors
 ; ---
 ; expected = "TRANSLATION FAILED"
-; description = "pointer-returning assigns helpers reject local stack frames"
+; description = "assigns helpers reject local stack frames"
 ; ---
 
 define i32 @target() {

@@ -2,7 +2,7 @@
 // Copyright 2026 The llvm2cprover Authors
 // ---
 // expected = "TRANSLATION FAILED"
-// description = "rejects a pointer-returning assigns helper that mutates nonlocal state"
+// description = "rejects an assigns helper that mutates nonlocal state"
 // translator_flags = ["--enforce-contract", "increment"]
 // ---
 

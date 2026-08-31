@@ -1,5 +1,5 @@
 // ---
-// description = "assigns helpers must return void or a pointer"
+// description = "assigns helpers must return a pointer"
 // expected = "TRANSLATION FAILED"
 // entry = "main"
 // ---

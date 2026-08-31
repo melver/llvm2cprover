@@ -8,14 +8,11 @@
 // translator_flags = ["--replace-with-contract", "target"]
 // ---
 
-extern int __CPROVER_nondet_int(void);
 extern void __CPROVER_assert(_Bool, const char*);
 
 extern int target(int* writable);
 
-void contract_assigns_target(int* writable) {
-  *writable = __CPROVER_nondet_int();
-}
+int* contract_assigns_target(int* writable) { return writable + 0; }
 
 _Bool contract_ensures_target(int* writable, int result) {
   (void)writable;

@@ -121,14 +121,16 @@ Contract workflow:
 To replace selected direct calls with their contracts, repeat
 `--replace-with-contract <function>` as needed. Replacement is deliberately opt-in per run; the
 original function body remains in the GOTO program for separate contract checking. A replacement
-asserts `requires`, executes the `assigns` helpers to havoc exactly the declared frame, creates a
+asserts `requires`, evaluates the `assigns` helpers and havocs each returned object, creates a
 nondeterministic return value, and assumes `ensures`. The manifest must explicitly include an
-`assigns` key: use `assigns = []` to declare that the replacement is pure. Replacement and `model`
-are mutually exclusive. For variadic targets, helpers summarize the fixed parameters and the
-replacement ignores extra arguments. The current bindings cannot attach native assigns metadata to
-a variadic symbol, so a selected variadic replacement enforces its frame through the replacement
-body; an unselected variadic contract with `assigns` fails closed. Address-taken/indirect uses and
-`invoke` uses of selected functions fail closed until their replacement semantics are supported.
+`assigns` key: each named helper returns a pointer to one writable object, and the replacement
+havocs the pointed-to object. Use `assigns = []` to declare that the replacement is pure.
+Replacement and `model` are mutually exclusive. For variadic targets, helpers summarize the fixed
+parameters and the replacement ignores extra arguments. The current bindings cannot attach native
+assigns metadata to a variadic symbol, so a selected variadic replacement enforces its frame through
+the replacement body; an unselected variadic contract with `assigns` fails closed.
+Address-taken/indirect uses and `invoke` uses of selected functions fail closed until their
+replacement semantics are supported.
 
 To check a contract against its preserved implementation, select exactly one target with
 `--enforce-contract <function>`. Each translation accepts one enforcement obligation because the
@@ -175,15 +177,15 @@ Supported directives:
 - `model`: redirects direct calls to a helper function
 - `assigns`: attaches CBMC assigns metadata to defined and external functions, generates stub bodies
   only for unselected external declarations with a nonempty frame, and supplies the writable frame
-  for explicit contract replacement; defined function bodies remain intact. Legacy void helpers
-  perform imperative havoc and remain valid for replacement. For a nonempty frame selected by
-  `--enforce-contract`, each helper instead returns a pointer to one writable object; the harness
-  evaluates the helpers before the real call, replacement havocs the pointed-to objects, and DFCC
-  checks writes against their dereferenced lvalues. Pointer-returning helpers are lvalue expressions,
-  not imperative frame code: they must be compiled, observationally read-only definitions that
-  return a nonlocal object. Translation rejects nonlocal stores, volatile or atomic accesses
+  for explicit contract replacement; defined function bodies remain intact. Each helper must be a
+  compiled, observationally read-only definition returning a pointer to one concrete, nonlocal
+  writable object. The helper is an lvalue expression: replacements and synthesized external stubs
+  havoc the pointed-to object, while DFCC checks preserved implementations against the dereferenced
+  lvalue. Translation rejects nonlocal stores, volatile or atomic accesses
   (including fences), memory-writing intrinsics, potentially side-effecting calls, and pointers to
-  the helper's own stack frame. Use `assigns = []` for a pure function
+  the helper's own stack frame. With LLVM opaque pointers, the helper's IR must retain enough type
+  information to recover the pointee. For example, C `return p + 0` retains the element type where
+  a direct `return p` may not. Use `assigns = []` for a pure function
 
 The same manifest can map target inline assembly to defined model functions in
 the input module:

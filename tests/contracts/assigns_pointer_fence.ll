@@ -2,7 +2,7 @@
 ; Copyright 2026 The llvm2cprover Authors
 ; ---
 ; expected = "TRANSLATION FAILED"
-; description = "pointer-returning assigns helpers reject atomic fences"
+; description = "assigns helpers reject atomic fences"
 ; ---
 
 @value = global i32 0

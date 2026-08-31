@@ -158,7 +158,7 @@ impl Translator {
         reject_module_inline_asm(&module)?;
         let contracts = contracts::load_contracts(&self.config.contracts)?;
         validate_inline_asm_model_definitions(&module, &contracts)?;
-        validate_pointer_assigns_helpers_are_read_only(&module, &contracts)?;
+        validate_assigns_helpers(&module, &contracts)?;
         if self.config.enforce_contract.len() > 1 {
             bail!("exactly one --enforce-contract target may be selected per translation");
         }
@@ -226,29 +226,28 @@ impl Translator {
     }
 }
 
-fn validate_pointer_assigns_helpers_are_read_only(
-    module: &Module<'_>,
-    contracts: &contracts::ContractMap,
-) -> Result<()> {
+/// Check that every assigns helper's body is observationally read-only.
+///
+/// The helper's *form* — compiled, pointer-returning, concrete pointee — is validated once
+/// against the lowered symbol table in [`contracts::inject::validate_helper`]. Helpers that do
+/// not have that form are skipped here so the single canonical error comes from there.
+fn validate_assigns_helpers(module: &Module<'_>, contracts: &contracts::ContractMap) -> Result<()> {
     for (target, contract) in contracts.iter() {
         for helper in contract.assigns.iter().flatten() {
             let Some(function) = module.get_function(helper) else {
                 continue;
             };
-            if !function
+            let returns_pointer = function
                 .get_type()
                 .get_return_type()
-                .is_some_and(|typ| typ.is_pointer_type())
-            {
+                .is_some_and(|typ| typ.is_pointer_type());
+            if !returns_pointer || function.count_basic_blocks() == 0 {
                 continue;
-            }
-            if function.count_basic_blocks() == 0 {
-                bail!("pointer-returning assigns helper `{helper}` for `{target}` must be defined");
             }
             for block in function.get_basic_blocks() {
                 let mut instruction = block.get_first_instruction();
                 while let Some(current) = instruction {
-                    validate_pointer_assigns_instruction(target, helper, current)?;
+                    validate_assigns_instruction(target, helper, current)?;
                     instruction = current.get_next_instruction();
                 }
             }
@@ -257,7 +256,7 @@ fn validate_pointer_assigns_helpers_are_read_only(
     Ok(())
 }
 
-fn validate_pointer_assigns_instruction(
+fn validate_assigns_instruction(
     target: &str,
     helper: &str,
     instruction: InstructionValue<'_>,
@@ -265,25 +264,19 @@ fn validate_pointer_assigns_instruction(
     match instruction.get_opcode() {
         InstructionOpcode::Store => {
             if instruction.get_volatile().unwrap_or(false) {
-                bail!(
-                    "pointer-returning assigns helper `{helper}` for `{target}` contains a volatile store"
-                );
+                bail!("assigns helper `{helper}` for `{target}` contains a volatile store");
             }
             if unsafe { LLVMGetOrdering(instruction.as_value_ref()) }
                 != LLVMAtomicOrdering::LLVMAtomicOrderingNotAtomic
             {
-                bail!(
-                    "pointer-returning assigns helper `{helper}` for `{target}` contains an atomic store"
-                );
+                bail!("assigns helper `{helper}` for `{target}` contains an atomic store");
             }
             let destination = match instruction.get_operand(1) {
                 Some(Operand::Value(value)) => value,
                 _ => bail!("store in assigns helper `{helper}` has no pointer destination"),
             };
             if !is_local_alloca_derived(destination) {
-                bail!(
-                    "pointer-returning assigns helper `{helper}` for `{target}` writes nonlocal state"
-                );
+                bail!("assigns helper `{helper}` for `{target}` writes nonlocal state");
             }
         }
         InstructionOpcode::Load => {
@@ -292,19 +285,15 @@ fn validate_pointer_assigns_instruction(
                     != LLVMAtomicOrdering::LLVMAtomicOrderingNotAtomic
             {
                 bail!(
-                    "pointer-returning assigns helper `{helper}` for `{target}` contains a volatile or atomic load"
+                    "assigns helper `{helper}` for `{target}` contains a volatile or atomic load"
                 );
             }
         }
         InstructionOpcode::AtomicRMW | InstructionOpcode::AtomicCmpXchg => {
-            bail!(
-                "pointer-returning assigns helper `{helper}` for `{target}` contains an atomic write"
-            );
+            bail!("assigns helper `{helper}` for `{target}` contains an atomic write");
         }
         InstructionOpcode::Fence => {
-            bail!(
-                "pointer-returning assigns helper `{helper}` for `{target}` contains an atomic fence"
-            );
+            bail!("assigns helper `{helper}` for `{target}` contains an atomic fence");
         }
         InstructionOpcode::Call | InstructionOpcode::Invoke | InstructionOpcode::CallBr => {
             let called = unsafe { LLVMGetCalledValue(instruction.as_value_ref()) };
@@ -315,7 +304,7 @@ fn validate_pointer_assigns_instruction(
             });
             if !harmless {
                 bail!(
-                    "pointer-returning assigns helper `{helper}` for `{target}` calls a potentially side-effecting function"
+                    "assigns helper `{helper}` for `{target}` calls a potentially side-effecting function"
                 );
             }
         }
@@ -325,7 +314,7 @@ fn validate_pointer_assigns_instruction(
                 && is_local_alloca_derived(value)
             {
                 bail!(
-                    "pointer-returning assigns helper `{helper}` for `{target}` returns a pointer to its own local allocation"
+                    "assigns helper `{helper}` for `{target}` returns a pointer to its own local allocation"
                 );
             }
         }

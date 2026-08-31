@@ -137,9 +137,10 @@ pub struct FunctionContract {
     pub snapshot: Option<String>,
     /// Helper function used instead of the original callee.
     pub model: Option<String>,
-    /// Void helper functions that describe writable locations.
+    /// Compiled, observationally read-only helpers describing writable locations.
     ///
-    /// `None` distinguishes an omitted frame from an explicitly empty (pure) frame.
+    /// Each helper returns a pointer to one concrete, nonlocal writable object. `None`
+    /// distinguishes an omitted frame from an explicitly empty (pure) frame.
     pub assigns: Option<Vec<String>>,
 }
 

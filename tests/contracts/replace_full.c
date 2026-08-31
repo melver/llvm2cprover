@@ -8,7 +8,6 @@
 // translator_flags = ["--replace-with-contract", "target"]
 // ---
 
-extern int __CPROVER_nondet_int(void);
 extern void __CPROVER_assert(_Bool, const char*);
 
 int target_body_ran;
@@ -25,10 +24,10 @@ _Bool contract_requires_target(int x, int* writable, int* untouched) {
   return x >= 0;
 }
 
-void contract_assigns_target(int x, int* writable, int* untouched) {
+int* contract_assigns_target(int x, int* writable, int* untouched) {
   (void)x;
   (void)untouched;
-  *writable = __CPROVER_nondet_int();
+  return writable + 0;
 }
 
 _Bool contract_ensures_target(int x, int* writable, int* untouched, int result) {

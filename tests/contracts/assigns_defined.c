@@ -7,14 +7,11 @@
 // entry = "main"
 // ---
 
-extern int __CPROVER_nondet_int(void);
 extern void __CPROVER_assert(_Bool, const char*);
 
 void target(int* value) { *value = 42; }
 
-void contract_assigns_target(int* value) {
-  *value = __CPROVER_nondet_int();
-}
+int* contract_assigns_target(int* value) { return value + 0; }
 
 int main(void) {
   int value = 0;
