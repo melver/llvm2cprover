@@ -10,7 +10,9 @@
 //! - basic blocks become labeled GOTO blocks
 //! - ordinary contracts are injected at call sites, while explicitly selected calls redirect
 //!   to internal replacement functions synthesized from the compiled helpers
-//! - exactly matched inline assembly redirects to defined compiled model functions
+//! - exactly matched inline assembly redirects to defined compiled model functions;
+//!   modeled `callbr` executes the model once and nondeterministically follows one
+//!   of its declared successor edges
 //!
 //! Unsupported instructions fail where they are encountered, which keeps
 //! diagnostics specific and avoids a second feature-classification pass.
@@ -35,8 +37,8 @@ use inkwell::llvm_sys::core::{
     LLVMGetInlineAsmAsmString, LLVMGetInlineAsmCanUnwind, LLVMGetInlineAsmConstraintString,
     LLVMGetInlineAsmDialect, LLVMGetInlineAsmHasSideEffects, LLVMGetInlineAsmNeedsAlignedStack,
     LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands, LLVMGetNumClauses,
-    LLVMGetNumMaskElements, LLVMGetNumSuccessors, LLVMGetSuccessor, LLVMGetSwitchCaseValue,
-    LLVMGetUnwindDest, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
+    LLVMGetNumMaskElements, LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetSuccessor,
+    LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
 };
 use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
@@ -369,6 +371,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             InstructionOpcode::Select => self.lower_select(instruction, body),
             InstructionOpcode::Return => self.lower_return(instruction, body),
             InstructionOpcode::Call => self.lower_call(instruction, body),
+            InstructionOpcode::CallBr => self.lower_callbr(instruction, body),
             InstructionOpcode::Invoke => self.lower_invoke(instruction, body),
             InstructionOpcode::LandingPad => self.lower_landingpad(instruction, body),
             InstructionOpcode::Resume => self.lower_resume(instruction, body),
@@ -1415,6 +1418,71 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(())
     }
 
+    fn lower_callbr(
+        &mut self,
+        instruction: InstructionValue<'ctx>,
+        body: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let loc = self.instruction_location(instruction);
+        let predecessor = self.current_block.ok_or_else(|| {
+            self.unsupported_control_flow("callbr lowered without current block", loc)
+        })?;
+        let raw_instruction = instruction.as_value_ref();
+        let raw_callee = unsafe { LLVMGetCalledValue(raw_instruction) };
+        if unsafe { LLVMIsAInlineAsm(raw_callee) }.is_null() {
+            return Err(self
+                .unsupported_control_flow("unsupported non-assembly callbr", loc)
+                .into());
+        }
+
+        // A callbr's successors are its fallthrough followed by its indirect destinations, so
+        // the generic terminator API enumerates exactly the edges this lowering must cover.
+        let successor_count = unsafe { LLVMGetNumSuccessors(raw_instruction) };
+        if successor_count < 2 {
+            return Err(self
+                .unsupported_control_flow(
+                    "callbr without an indirect destination is unsupported",
+                    loc,
+                )
+                .into());
+        }
+        if unsafe { LLVMGetNumOperandBundles(raw_instruction) } != 0 {
+            return Err(self
+                .unsupported_control_flow("callbr operand bundles are unsupported", loc)
+                .into());
+        }
+        // Arguments, one label per successor, and the callee plus fallthrough operands. Anything
+        // else means an operand shape this lowering does not understand.
+        let expected_operands = unsafe { LLVMGetNumArgOperands(raw_instruction) }
+            .checked_add(successor_count)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| self.unsupported_control_flow("callbr operand count overflow", loc))?;
+        if instruction.get_num_operands() != expected_operands {
+            return Err(self
+                .unsupported_control_flow("unexpected callbr operand count", loc)
+                .into());
+        }
+
+        let successors = (0..successor_count)
+            .map(|index| {
+                unsafe { BasicBlock::new(LLVMGetSuccessor(raw_instruction, index)) }
+                    .ok_or_else(|| self.unsupported_control_flow("malformed callbr successor", loc))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Unlike an ordinary call, even empty asm in a callbr may select an indirect edge.
+        // Require an exact compiled model for its state effects before conservatively allowing
+        // every destination declared by the LLVM instruction.
+        let asm = self.inline_asm_string(raw_callee);
+        self.lower_inline_asm_model(instruction, raw_callee, &asm, body, loc)?;
+        let branches = successors
+            .into_iter()
+            .map(|successor| self.branch_to(predecessor, successor))
+            .collect::<Result<Vec<_>>>()?;
+        body.push(self.nondeterministic_branches(branches, loc)?);
+        Ok(())
+    }
+
     fn lower_landingpad(
         &mut self,
         instruction: InstructionValue<'ctx>,
@@ -1488,7 +1556,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(false);
         }
 
-        let loc = self.instruction_location(instruction);
         let asm = self.inline_asm_string(raw_callee);
         if self.inline_asm_is_empty(&asm) && unsafe { LLVMGetInlineAsmCanUnwind(raw_callee) == 0 } {
             // Empty inline asm, including comment-only compiler barriers, is not a stateful
@@ -1504,6 +1571,20 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             }
         }
 
+        let loc = self.instruction_location(instruction);
+        self.lower_inline_asm_model(instruction, raw_callee, &asm, body, loc)?;
+        Ok(true)
+    }
+
+    /// Redirect one inline-assembly site to its compiled model, or fail closed.
+    fn lower_inline_asm_model(
+        &mut self,
+        instruction: InstructionValue<'ctx>,
+        raw_callee: LLVMValueRef,
+        asm: &str,
+        body: &mut Vec<Stmt>,
+        loc: Location,
+    ) -> Result<()> {
         // Skip the exact-match machinery entirely when no rules are configured, which is the
         // common case and keeps unmodelled assembly on the direct fail-closed path.
         let site = self.contracts.has_inline_asm_models().then(|| {
@@ -1513,7 +1594,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             )
         });
         let site = site.as_ref().map(|(constraints, function)| InlineAsmSite {
-            asm: &asm,
+            asm,
             constraints,
             dialect: match unsafe { LLVMGetInlineAsmDialect(raw_callee) } {
                 inkwell::llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT => {
@@ -1565,7 +1646,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             );
             self.emit_call_result(instruction, function, arguments, body, loc)?;
             self.report.inline_asm_model(site, &mapping.model);
-            return Ok(true);
+            return Ok(());
         }
 
         // Real target assembly may read or mutate memory through constraints and clobbers that
@@ -1573,11 +1654,28 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         // when the caller permits selected approximations with `--unsound`; always fail closed.
         Err(Diagnostic::unsupported_feature(
             UnsupportedFeature::InlineAsm,
-            format!("unsupported inline asm call in {}", self.function_name),
+            format!(
+                "unsupported inline asm {} in {}",
+                match instruction.get_opcode() {
+                    InstructionOpcode::CallBr => "callbr",
+                    _ => "call",
+                },
+                self.function_name
+            ),
         )
         .with_symbol(self.function_name.clone())
         .with_location(loc)
         .into())
+    }
+
+    fn nondeterministic_branches(&self, mut branches: Vec<Stmt>, loc: Location) -> Result<Stmt> {
+        let mut branch = branches
+            .pop()
+            .ok_or_else(|| self.unsupported_control_flow("callbr has no successors", loc))?;
+        while let Some(candidate) = branches.pop() {
+            branch = Stmt::if_then_else(Expr::nondet(Type::bool()), candidate, Some(branch), loc);
+        }
+        Ok(branch)
     }
 
     fn emit_call_result(
@@ -3598,6 +3696,16 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             self.instruction_location(instruction),
         ));
         Ok(())
+    }
+
+    /// Build a fail-closed control-flow diagnostic for the function being lowered.
+    fn unsupported_control_flow(&self, message: &str, loc: Location) -> Diagnostic {
+        Diagnostic::unsupported_feature(
+            UnsupportedFeature::ControlFlow,
+            format!("{message} in {}", self.function_name),
+        )
+        .with_symbol(self.function_name.clone())
+        .with_location(loc)
     }
 
     fn unsupported_intrinsic(&self, name: &str, message: impl Into<String>) -> Diagnostic {

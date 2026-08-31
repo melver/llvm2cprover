@@ -154,9 +154,13 @@ All assembly properties in the entry are matched exactly. The model must be a
 defined, non-variadic function whose parameter and return types exactly match
 the assembly call. LLVM represents multiple assembly outputs as an aggregate
 return, so the corresponding model returns the identical aggregate type.
-Overlapping matches and unwind-capable assembly fail closed. Empty and
-comment-only compiler barriers retain their no-op lowering and do not need a
-model.
+For `callbr`/asm-goto, the model is executed once for the assembly's effects,
+then verification considers every declared fallthrough and indirect successor;
+normal LLVM PHI-edge semantics are preserved on each path. Overlapping matches,
+unwind-capable assembly, and non-assembly `callbr` fail closed. Empty and
+comment-only compiler barriers in ordinary calls retain their no-op lowering
+and do not need a model; a `callbr` always needs one because it may transfer
+control to an indirect destination.
 
 ## Design
 
