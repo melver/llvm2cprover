@@ -250,7 +250,7 @@ model = "model"
     );
     let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
         .expect("invalid report");
-    assert_eq!(report_json["schema_version"], 3);
+    assert_eq!(report_json["schema_version"], 4);
     assert_eq!(report_json["machine_model"], "lp64");
     assert_eq!(report_json["target_triple"], "x86_64-unknown-linux-gnu");
     assert_eq!(
@@ -286,6 +286,7 @@ define i32 @target(i32 %x) {
 entry:
   ret i32 %x
 }
+
 define i32 @snapshot_target(i32 %x) {
 entry:
   ret i32 %x
@@ -354,6 +355,58 @@ assigns = []
 }
 
 #[test]
+fn report_marks_selected_enforcement_obligation() {
+    let input = input_file(
+        r#"
+define i32 @target(i32 %x) {
+entry:
+  ret i32 %x
+}
+"#,
+    );
+    let manifest = input.with_extension("toml");
+    let goto = input.with_extension("goto");
+    let report = input.with_extension("report.json");
+    fs::write(
+        &manifest,
+        r#"
+[functions.target]
+assigns = []
+"#,
+    )
+    .expect("failed to write contract manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--contracts")
+        .arg(&manifest)
+        .arg("--enforce-contract")
+        .arg("target")
+        .arg("--output")
+        .arg(&goto)
+        .arg("--report")
+        .arg(&report)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
+        .expect("invalid report");
+    assert_eq!(report_json["contracts"][0]["function"], "target");
+    assert_eq!(report_json["contracts"][0]["reliance"], "enforcement");
+    assert_eq!(report_json["contracts"][0]["discharged"], true);
+
+    for path in [&input, &manifest, &goto, &report] {
+        fs::remove_file(path).expect("failed to remove test artifact");
+    }
+}
+
+#[test]
 fn report_inventories_applied_inline_asm_models() {
     let input = input_file(
         r#"
@@ -405,7 +458,7 @@ model = "model"
 
     let report_json: Value = serde_json::from_slice(&fs::read(&report).expect("missing report"))
         .expect("invalid report");
-    assert_eq!(report_json["schema_version"], 3);
+    assert_eq!(report_json["schema_version"], 4);
     assert_eq!(report_json["inline_asm_models"][0]["asm"], "opaque");
     assert_eq!(report_json["inline_asm_models"][0]["constraints"], "=r,r");
     assert_eq!(report_json["inline_asm_models"][0]["dialect"], "att");

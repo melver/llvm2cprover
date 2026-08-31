@@ -79,8 +79,10 @@ after successful translation. It contains:
 - every compiled inline-assembly model actually used; these trusted mappings
   report `discharged: false`
 - every contract applied at a direct call site, whether it was instrumentation or an explicit
-  replacement, and whether the contract has been checked against the preserved implementation;
-  replacements currently report `discharged: false`
+  replacement, plus the single selected enforcement obligation. `discharged: true` means the
+  emitted artifact contains that obligation; it does not mean the proof succeeded. Only a
+  successful CBMC run proves it. Replacement entries remain `discharged: false`; discharge uses a
+  separate enforcement translation
 - the resolved machine model and the input module's raw target triple and data layout
 
 The report has a numeric `schema_version` field for consumers. A report path
@@ -128,6 +130,35 @@ a variadic symbol, so a selected variadic replacement enforces its frame through
 body; an unselected variadic contract with `assigns` fails closed. Address-taken/indirect uses and
 `invoke` uses of selected functions fail closed until their replacement semantics are supported.
 
+To check a contract against its preserved implementation, select exactly one target with
+`--enforce-contract <function>`. Each translation accepts one enforcement obligation because the
+generated CBMC workflow proves one harness/specification pair at a time. The translation contains
+a harness named `__llvm2cprover_contract_enforcement_<symbol>` and a frame specification named
+`__llvm2cprover_contract_spec_<symbol>`, where `<symbol>` is the sanitized target name used by the
+translator. Prepare and verify it with CBMC's dynamic-frame pass:
+
+```sh
+llvm2cprover input.bc --contracts contracts.toml \
+  --enforce-contract target -o target.goto
+goto-cc target.goto --function __llvm2cprover_contract_enforcement_target \
+  -o target.linked.goto
+goto-instrument --dfcc __llvm2cprover_contract_enforcement_target \
+  --no-malloc-may-fail \
+  --enforce-contract target/__llvm2cprover_contract_spec_target \
+  target.linked.goto target.enforced.goto
+cbmc target.enforced.goto
+```
+
+The harness assumes `requires`, captures `snapshot`, computes the frame, calls the real target body,
+and asserts `ensures`. `goto-cc --function` is required: besides linking, it creates CBMC's entry
+point and initialization function. `goto-instrument --dfcc` enforces writes against the attached
+frame; running the uninstrumented harness alone checks only the postcondition and is not a frame
+proof. Direct or mutual recursion, variadic or external targets, indirect uses, and `invoke` calls
+fail closed. Enforcement cannot be combined with replacement or a trusted `model`, and every
+selected contract helper must be a compiled definition. Input uses or definitions of `free` are
+currently rejected in enforcement artifacts because CBMC's DFCC runtime must supply its own model.
+Void targets currently require `assigns = []`; CBMC's DFCC rejects their nonempty generated frame.
+
 Stateful postconditions can use `snapshot` to capture pointer-reachable pre-state. The snapshot
 helper is called after `requires` and before either the real target/model call or replacement
 `assigns` helpers. It receives the target parameters and returns one non-void LLVM value. The
@@ -144,7 +175,15 @@ Supported directives:
 - `model`: redirects direct calls to a helper function
 - `assigns`: attaches CBMC assigns metadata to defined and external functions, generates stub bodies
   only for unselected external declarations with a nonempty frame, and supplies the writable frame
-  for explicit contract replacement; defined function bodies remain intact
+  for explicit contract replacement; defined function bodies remain intact. Legacy void helpers
+  perform imperative havoc and remain valid for replacement. For a nonempty frame selected by
+  `--enforce-contract`, each helper instead returns a pointer to one writable object; the harness
+  evaluates the helpers before the real call, replacement havocs the pointed-to objects, and DFCC
+  checks writes against their dereferenced lvalues. Pointer-returning helpers are lvalue expressions,
+  not imperative frame code: they must be compiled, observationally read-only definitions that
+  return a nonlocal object. Translation rejects nonlocal stores, volatile or atomic accesses
+  (including fences), memory-writing intrinsics, potentially side-effecting calls, and pointers to
+  the helper's own stack frame. Use `assigns = []` for a pure function
 
 The same manifest can map target inline assembly to defined model functions in
 the input module:

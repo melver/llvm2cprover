@@ -76,6 +76,10 @@ struct Cli {
     #[arg(long = "replace-with-contract")]
     replace_with_contract: Vec<String>,
 
+    /// Emit one harness that checks this function's contract against its real body.
+    #[arg(long = "enforce-contract")]
+    enforce_contract: Vec<String>,
+
     /// Prefix translated LLVM function and global definitions.
     #[arg(long)]
     rename_prefix: Option<String>,
@@ -122,6 +126,7 @@ fn main() -> std::process::ExitCode {
         output: cli.output,
         contracts: cli.contracts,
         replace_with_contract: cli.replace_with_contract.into_iter().collect(),
+        enforce_contract: cli.enforce_contract.into_iter().collect(),
         rename_prefix: cli.rename_prefix,
         machine_model: cli.machine_model.into(),
         input_format: cli.input_format.into(),

@@ -120,6 +120,15 @@ pub struct Config {
     /// Replacement is explicit per translation. Each selected function must have a contract
     /// with an explicitly present `assigns` clause, including `assigns = []` for a pure function.
     pub replace_with_contract: BTreeSet<String>,
+    /// The function for which a contract-checking harness is emitted.
+    ///
+    /// At most one function may be selected. Enforcement preserves and calls the real
+    /// implementation. The selected function must be
+    /// defined, non-variadic, non-recursive, and have an explicit `assigns` clause. The generated
+    /// harness checks pre/postconditions; CBMC's dynamic-frame pass checks the attached frame.
+    /// Nonempty enforced frames use pointer-returning assigns helpers; legacy void helpers remain
+    /// available for replacement but cannot be discharged.
+    pub enforce_contract: BTreeSet<String>,
     /// Prefix applied to translated LLVM function and global definitions.
     ///
     /// External declarations, LLVM intrinsics, and verifier/runtime symbols remain unprefixed.

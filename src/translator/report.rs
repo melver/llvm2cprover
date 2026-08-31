@@ -152,6 +152,7 @@ pub(crate) fn write_report(
     module: &Module<'_>,
     machine_model: MachineModel,
     contracts: &ContractMap,
+    enforced_contracts: &BTreeSet<String>,
     symbols: &SymbolTable,
     collected: ReportCollector,
 ) -> Result<()> {
@@ -166,7 +167,7 @@ pub(crate) fn write_report(
         (&a.function, &a.construct, a.feature).cmp(&(&b.function, &b.construct, b.feature))
     });
     let report = TranslationReport {
-        schema_version: 3,
+        schema_version: 4,
         machine_model: machine_model.as_str(),
         target_triple: module.get_triple().as_str().to_string_lossy().into_owned(),
         data_layout: module
@@ -186,8 +187,15 @@ pub(crate) fn write_report(
         contracts: contracts
             .iter()
             .filter_map(|(name, contract)| {
-                let replacement = *relied_contracts.get(name)?;
-                Some(contract_assumption((name, contract), replacement))
+                let replacement = relied_contracts.get(name).copied();
+                if replacement.is_none() && !enforced_contracts.contains(name) {
+                    return None;
+                }
+                Some(contract_assumption(
+                    (name, contract),
+                    replacement,
+                    enforced_contracts.contains(name),
+                ))
             })
             .collect(),
     };
@@ -259,22 +267,23 @@ fn is_referenced(function: FunctionValue<'_>) -> bool {
 
 fn contract_assumption(
     (name, contract): (&str, &FunctionContract),
-    replacement: bool,
+    replacement: Option<bool>,
+    discharged: bool,
 ) -> ContractAssumption {
     ContractAssumption {
         function: name.to_owned(),
-        reliance: if replacement {
-            "replacement"
-        } else {
-            "instrumentation"
+        reliance: match replacement {
+            Some(true) => "replacement",
+            Some(false) => "instrumentation",
+            None => "enforcement",
         },
         requires: contract.requires.clone(),
         ensures: contract.ensures.clone(),
         snapshot: contract.snapshot.clone(),
         model: contract.model.clone(),
         assigns: contract.assigns.clone(),
-        // Contract discharge is not implemented. Make trust explicit instead of
-        // implying that call-site instrumentation proves the helper contract.
-        discharged: false,
+        // This records that the artifact contains the selected enforcement obligation. A proof
+        // result still comes from running CBMC after its dynamic-frame transformation.
+        discharged,
     }
 }

@@ -7,7 +7,9 @@
 //! is handled during instruction lowering. A snapshot captures pre-state after `requires` and
 //! before the target or model runs. Explicit replacements are synthesized here before instruction
 //! lowering with the same ordering, placing snapshot capture before `assigns`; symbol-level
-//! `assigns` metadata is attached after lowering.
+//! `assigns` metadata is attached after lowering. Observationally read-only pointer-returning
+//! assigns helpers compute CBMC lvalues before entering the preserved implementation; their purity
+//! is validated against the LLVM input before lowering.
 //!
 //! For external functions, `assigns` is represented twice on purpose:
 //!
@@ -30,9 +32,9 @@ use super::{ContractMap, FunctionContract};
 pub(crate) type ReplacementMap = BTreeMap<String, String>;
 
 enum HelperReturn {
-    Void,
     Value,
     Exact(Type),
+    Assigns,
 }
 
 /// Attach symbol-level contracts after lowering.
@@ -44,7 +46,7 @@ enum HelperReturn {
 /// effects without extra contract-mode flags.
 pub fn inject_contracts(symbols: &mut SymbolTable, contracts: &ContractMap) -> Result<()> {
     validate_contracts(symbols, contracts)?;
-    inject_contracts_with_replacements(symbols, contracts, &BTreeSet::new())
+    inject_contracts_with_replacements(symbols, contracts, &BTreeSet::new(), &BTreeSet::new())
 }
 
 /// Attach `assigns` metadata, skipping targets bypassed by an explicit replacement.
@@ -55,6 +57,7 @@ pub(crate) fn inject_contracts_with_replacements(
     symbols: &mut SymbolTable,
     contracts: &ContractMap,
     replacements: &BTreeSet<String>,
+    enforcements: &BTreeSet<String>,
 ) -> Result<()> {
     for (name, contract) in contracts.iter() {
         let Some(assigns) = contract.assigns.as_ref() else {
@@ -74,9 +77,131 @@ pub(crate) fn inject_contracts_with_replacements(
             bail!("assigns metadata for variadic function `{name}` is unsupported");
         }
         attach_assigns_contract(symbols, name, contract)?;
+        if enforcements.contains(name) {
+            attach_enforcement_contract(symbols, name, contract)?;
+        }
         if !replaced && !assigns.is_empty() && needs_extern_stub {
             synthesize_assigns_stub(symbols, name, contract)?;
         }
+    }
+    Ok(())
+}
+
+/// Stable property symbol consumed by `goto-instrument --enforce-contract`.
+pub fn enforcement_contract_symbol(name: &str) -> String {
+    format!(
+        "__llvm2cprover_contract_spec_{}",
+        crate::util::sanitize_name(name)
+    )
+}
+
+fn enforcement_contract_identifier(name: &str) -> String {
+    format!("contract::{}", enforcement_contract_symbol(name))
+}
+
+fn enforcement_assigns_slot(name: &str, index: usize) -> String {
+    format!(
+        "__llvm2cprover_contract_assigns_{}_{}",
+        crate::util::sanitize_name(name),
+        index
+    )
+}
+
+/// Stable harness entry point for checking one preserved implementation.
+pub fn enforcement_harness_symbol(name: &str) -> String {
+    format!(
+        "__llvm2cprover_contract_enforcement_{}",
+        crate::util::sanitize_name(name)
+    )
+}
+
+fn attach_enforcement_contract(
+    symbols: &mut SymbolTable,
+    name: &str,
+    contract: &FunctionContract,
+) -> Result<()> {
+    let target = symbols
+        .lookup(name)
+        .ok_or_else(|| anyhow::anyhow!("contract target `{name}` is missing"))?
+        .clone();
+    let contract_name = enforcement_contract_identifier(name);
+    reject_symbol_collision(symbols, &contract_name, "contract enforcement symbol")?;
+    let contract_type = Type::code(
+        indexed_parameters(&target.typ, &contract_name),
+        target
+            .typ
+            .return_type()
+            .cloned()
+            .expect("validated function type"),
+    );
+    ensure_function_parameters(symbols, &contract_name, &contract_type, &target.location);
+    let symbol = Symbol::function(
+        contract_name.clone(),
+        contract_type,
+        None,
+        contract_name.clone(),
+        target.location,
+    )
+    .with_is_property(true);
+    let contract_type = symbol.typ.clone();
+    symbols.insert(symbol);
+    attach_enforcement_assigns_contract(symbols, &contract_name, &contract_type, name, contract)
+}
+
+fn attach_enforcement_assigns_contract(
+    symbols: &mut SymbolTable,
+    contract_name: &str,
+    contract_type: &Type,
+    target_name: &str,
+    contract: &FunctionContract,
+) -> Result<()> {
+    let clauses = contract
+        .assigns
+        .iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, _)| {
+            let assigned = symbols
+                .lookup(enforcement_assigns_slot(target_name, index))
+                .expect("prepared enforcement assigns slot")
+                .to_expr()
+                .dereference();
+            Lambda::as_contract_for(contract_type, None::<InternedString>, assigned)
+        })
+        .collect();
+    symbols.attach_contract(contract_name, GotoFunctionContract::new(clauses));
+    Ok(())
+}
+
+/// Require the explicit `assigns` clause both replacement and enforcement depend on.
+fn require_explicit_assigns(contract: &FunctionContract, name: &str, mode: &str) -> Result<()> {
+    if contract.assigns.is_none() {
+        bail!(
+            "contract {mode} for `{name}` requires an explicit `assigns` clause; use `assigns = []` for no writes"
+        );
+    }
+    Ok(())
+}
+
+/// Build `argN` parameters mirroring a target's signature, scoped to one synthesized symbol.
+fn indexed_parameters(target_type: &Type, prefix: &str) -> Vec<Parameter> {
+    target_type
+        .parameters()
+        .expect("validated function type")
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| {
+            let base = format!("arg{index}");
+            let identifier = format!("{prefix}::{base}");
+            Parameter::new(Some(base), Some(identifier), parameter.typ().clone())
+        })
+        .collect()
+}
+
+/// Reject a synthesized symbol name that the input module already uses.
+fn reject_symbol_collision(symbols: &SymbolTable, name: &str, kind: &str) -> Result<()> {
+    if symbols.lookup(name).is_some() {
+        bail!("{kind} `{name}` collides with an input symbol");
     }
     Ok(())
 }
@@ -95,17 +220,12 @@ pub(crate) fn prepare_replacements(
     contracts: &ContractMap,
     replacements: &BTreeSet<String>,
 ) -> Result<ReplacementMap> {
-    validate_contracts(symbols, contracts)?;
     let mut synthesized = ReplacementMap::new();
     for name in replacements {
         let contract = contracts.function(name).ok_or_else(|| {
             anyhow::anyhow!("--replace-with-contract target `{name}` has no contract")
         })?;
-        if contract.assigns.is_none() {
-            bail!(
-                "contract replacement for `{name}` requires an explicit `assigns` clause; use `assigns = []` for no writes"
-            );
-        }
+        require_explicit_assigns(contract, name, "replacement")?;
         if contract.model.is_some() {
             bail!("contract replacement for `{name}` cannot also define `model`");
         }
@@ -117,6 +237,98 @@ pub(crate) fn prepare_replacements(
     Ok(synthesized)
 }
 
+/// Validate enforcement selections and synthesize harnesses around preserved real bodies.
+pub(crate) fn prepare_enforcements(
+    symbols: &mut SymbolTable,
+    contracts: &ContractMap,
+    enforcements: &BTreeSet<String>,
+    replacements: &BTreeSet<String>,
+) -> Result<()> {
+    for name in enforcements {
+        if replacements.contains(name) {
+            bail!("contract enforcement for `{name}` cannot be combined with replacement");
+        }
+        let contract = contracts
+            .function(name)
+            .ok_or_else(|| anyhow::anyhow!("--enforce-contract target `{name}` has no contract"))?;
+        require_explicit_assigns(contract, name, "enforcement")?;
+        if contract.model.is_some() {
+            bail!("contract enforcement for `{name}` cannot discharge a trusted `model`");
+        }
+        for (kind, helper) in [
+            ("requires", contract.requires.as_deref()),
+            ("ensures", contract.ensures.as_deref()),
+            ("snapshot", contract.snapshot.as_deref()),
+        ] {
+            if let Some(helper) = helper {
+                let symbol = symbols.lookup(helper).expect("validated contract helper");
+                if !has_helper_body(symbol) {
+                    bail!(
+                        "contract enforcement for `{name}` requires defined {kind} helper `{helper}`"
+                    );
+                }
+            }
+        }
+        for (index, helper) in contract.assigns.iter().flatten().enumerate() {
+            let helper_symbol = symbols
+                .lookup(helper.as_str())
+                .expect("validated assigns helper");
+            if !has_helper_body(helper_symbol) {
+                bail!(
+                    "contract enforcement for `{name}` requires defined assigns helper `{helper}`"
+                );
+            }
+            let typ = helper_symbol
+                .typ
+                .return_type()
+                .expect("validated assigns helper")
+                .clone();
+            if !typ.is_pointer() {
+                bail!(
+                    "contract enforcement for `{name}` requires pointer-returning assigns helpers; legacy void helper `{helper}` is replacement-only"
+                );
+            }
+            if typ.base_type().is_some_and(|typ| typ == &Type::empty()) {
+                bail!(
+                    "contract enforcement for `{name}` requires a concrete pointee type from assigns helper `{helper}`"
+                );
+            }
+            let slot = enforcement_assigns_slot(name, index);
+            reject_symbol_collision(symbols, &slot, "contract enforcement assigns slot")?;
+            let mut symbol = Symbol::static_variable(&slot, &slot, typ.clone(), Location::none());
+            symbol.update(cprover_bindings::goto_program::SymbolValues::Expr(
+                typ.null(),
+            ));
+            symbols.insert(symbol);
+        }
+        let target = symbols
+            .lookup(name)
+            .ok_or_else(|| anyhow::anyhow!("contract enforcement target `{name}` is missing"))?;
+        if target.is_extern {
+            bail!("contract enforcement target `{name}` must be defined");
+        }
+        if target.typ.is_variadic_code() {
+            bail!("contract enforcement for variadic function `{name}` is unsupported");
+        }
+        if !contract
+            .assigns
+            .as_ref()
+            .expect("explicit assigns")
+            .is_empty()
+            && target
+                .typ
+                .return_type()
+                .is_some_and(|typ| typ == &Type::empty())
+        {
+            bail!(
+                "contract enforcement for void function `{name}` with a nonempty assigns frame is unsupported"
+            );
+        }
+        synthesize_enforcement_harness(symbols, name, contract)?;
+    }
+    Ok(())
+}
+
 /// Stable private symbol used for one explicit contract replacement.
 pub(crate) fn replacement_symbol(name: &str) -> String {
     format!(
@@ -125,7 +337,11 @@ pub(crate) fn replacement_symbol(name: &str) -> String {
     )
 }
 
-fn validate_contracts(symbols: &SymbolTable, contracts: &ContractMap) -> Result<()> {
+/// Check every manifest helper against the lowered symbol table.
+///
+/// Run once, before [`prepare_replacements`] and [`prepare_enforcements`], so a bad manifest
+/// fails before any synthesis happens.
+pub(crate) fn validate_contracts(symbols: &SymbolTable, contracts: &ContractMap) -> Result<()> {
     for (name, contract) in contracts.iter() {
         let target = symbols
             .lookup(name)
@@ -237,7 +453,7 @@ fn validate_contracts(symbols: &SymbolTable, contracts: &ContractMap) -> Result<
                 helper,
                 param_count,
                 "assigns",
-                HelperReturn::Void,
+                HelperReturn::Assigns,
             )?;
         }
     }
@@ -328,10 +544,15 @@ fn attach_assigns_contract(
                 symbols.machine_model(),
             ),
         );
+        let assigned = if call.typ().is_pointer() {
+            call.dereference()
+        } else {
+            call
+        };
         clauses.push(Lambda::as_contract_for(
             &target.typ,
             None::<InternedString>,
-            call,
+            assigned,
         ));
     }
     symbols.attach_contract(name, GotoFunctionContract::new(clauses));
@@ -369,11 +590,6 @@ fn validate_helper<'a>(
         .cloned()
         .unwrap_or_else(Type::empty);
     match expected_return {
-        HelperReturn::Void => {
-            if actual_return != Type::empty() {
-                bail!("{kind} helper `{helper_name}` for `{target_name}` must return void");
-            }
-        }
         HelperReturn::Value => {
             if actual_return == Type::empty() {
                 bail!("{kind} helper `{helper_name}` for `{target_name}` must return a value");
@@ -388,6 +604,13 @@ fn validate_helper<'a>(
                     "{kind} helper `{helper_name}` for `{target_name}` returns {:?}, expected {:?}",
                     actual_return,
                     expected_return
+                );
+            }
+        }
+        HelperReturn::Assigns => {
+            if actual_return != Type::empty() && !actual_return.is_pointer() {
+                bail!(
+                    "assigns helper `{helper_name}` for `{target_name}` must return void or a pointer"
                 );
             }
         }
@@ -411,7 +634,7 @@ fn synthesize_assigns_stub(
     let loc = target.location;
     ensure_function_parameters(symbols, name, &target.typ, &loc);
     let params = parameter_exprs(&target.typ, loc);
-    let mut body = assigns_helper_calls(symbols, contract, &params, loc)?;
+    let mut body = assigns_helper_calls(symbols, name, contract, &params, loc)?;
     let return_type = target
         .typ
         .return_type()
@@ -440,22 +663,9 @@ fn synthesize_replacement(
         .ok_or_else(|| anyhow::anyhow!("contract target `{name}` is missing"))?
         .clone();
     let replacement = replacement_symbol(name);
-    if symbols.lookup(replacement.as_str()).is_some() {
-        bail!("contract replacement symbol `{replacement}` collides with an input symbol");
-    }
+    reject_symbol_collision(symbols, &replacement, "contract replacement symbol")?;
     let loc = target.location;
-    let params = target
-        .typ
-        .parameters()
-        .expect("validated function type")
-        .iter()
-        .enumerate()
-        .map(|(index, parameter)| {
-            let base = format!("arg{index}");
-            let identifier = format!("{replacement}::{base}");
-            Parameter::new(Some(base), Some(identifier), parameter.typ().clone())
-        })
-        .collect::<Vec<_>>();
+    let params = indexed_parameters(&target.typ, &replacement);
     let return_type = target
         .typ
         .return_type()
@@ -487,7 +697,13 @@ fn synthesize_replacement(
     } else {
         None
     };
-    body.extend(assigns_helper_calls(symbols, contract, &args, loc)?);
+    body.extend(assigns_helper_calls(
+        symbols,
+        &replacement,
+        contract,
+        &args,
+        loc,
+    )?);
 
     let result = (return_type != Type::empty())
         .then(|| insert_local(symbols, &replacement, "result", return_type.clone(), loc));
@@ -515,31 +731,153 @@ fn synthesize_replacement(
     Ok(replacement)
 }
 
-/// Emit one void call per `assigns` helper, with arguments cast to each helper's parameters.
+fn synthesize_enforcement_harness(
+    symbols: &mut SymbolTable,
+    name: &str,
+    contract: &FunctionContract,
+) -> Result<String> {
+    let target = symbols
+        .lookup(name)
+        .ok_or_else(|| anyhow::anyhow!("contract target `{name}` is missing"))?
+        .clone();
+    let harness = enforcement_harness_symbol(name);
+    reject_symbol_collision(symbols, &harness, "contract enforcement harness")?;
+    let loc = target.location;
+    let harness_type = Type::code(indexed_parameters(&target.typ, &harness), Type::empty());
+    ensure_function_parameters(symbols, &harness, &harness_type, &loc);
+    let args = parameter_exprs(&harness_type, loc);
+    let mut body = Vec::new();
+
+    if let Some(helper) = contract.requires.as_deref() {
+        let condition = emit_value_helper(symbols, &harness, helper, &args, "requires", loc)?;
+        body.extend(condition.0);
+        body.push(Stmt::assume(condition.1.cast_to(Type::bool()), loc));
+    }
+    let snapshot = if let Some(helper) = contract.snapshot.as_deref() {
+        let snapshot = emit_value_helper(symbols, &harness, helper, &args, "snapshot", loc)?;
+        body.extend(snapshot.0);
+        Some(snapshot.1)
+    } else {
+        None
+    };
+    for (index, helper) in contract.assigns.iter().flatten().enumerate() {
+        let helper_symbol = symbols
+            .lookup(helper.as_str())
+            .expect("validated assigns helper")
+            .clone();
+        let helper_expr = helper_symbol.to_expr().with_location(loc);
+        let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
+            &helper_expr,
+            args.clone(),
+            symbols.machine_model(),
+        );
+        let slot = symbols
+            .lookup(enforcement_assigns_slot(name, index))
+            .expect("prepared enforcement assigns slot")
+            .to_expr()
+            .with_location(loc);
+        body.push(Stmt::function_call(Some(slot), helper_expr, arguments, loc));
+    }
+
+    let return_type = target
+        .typ
+        .return_type()
+        .cloned()
+        .expect("validated function type");
+    let result = (return_type != Type::empty())
+        .then(|| insert_local(symbols, &harness, "result", return_type, loc));
+    let target_expr = target.to_expr().with_location(loc);
+    body.push(Stmt::function_call(
+        result.clone(),
+        target_expr.clone(),
+        Expr::cast_arguments_to_target_equivalent_function_parameter_types(
+            &target_expr,
+            args.clone(),
+            symbols.machine_model(),
+        ),
+        loc,
+    ));
+
+    if let Some(helper) = contract.ensures.as_deref() {
+        let helper_args = ensures_arguments(args, snapshot, result);
+        let condition = emit_value_helper(symbols, &harness, helper, &helper_args, "ensures", loc)?;
+        body.extend(condition.0);
+        body.push(Stmt::assert(
+            condition.1.cast_to(Type::bool()),
+            "contract",
+            &format!("ensures for {name}"),
+            loc,
+        ));
+    }
+    body.push(Stmt::ret(None, loc));
+
+    symbols.insert(
+        Symbol::function(
+            harness.clone(),
+            harness_type,
+            Some(Stmt::block(body, loc)),
+            harness.clone(),
+            loc,
+        )
+        .with_is_file_local(true),
+    );
+    Ok(harness)
+}
+
+/// Apply the frame described by each assigns helper.
+///
+/// Legacy void helpers perform their imperative havoc directly. Pointer-returning helpers compute
+/// one writable lvalue, which is then assigned a nondeterministic value.
 fn assigns_helper_calls(
-    symbols: &SymbolTable,
+    symbols: &mut SymbolTable,
+    function: &str,
     contract: &FunctionContract,
     args: &[Expr],
     loc: Location,
 ) -> Result<Vec<Stmt>> {
-    contract
-        .assigns
-        .iter()
-        .flatten()
-        .map(|helper| {
-            let helper_expr = symbols
-                .lookup(helper.as_str())
-                .ok_or_else(|| anyhow::anyhow!("assigns helper `{helper}` is missing"))?
-                .to_expr()
-                .with_location(loc);
-            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-                &helper_expr,
-                args.to_vec(),
-                symbols.machine_model(),
-            );
-            Ok(Stmt::function_call(None, helper_expr, arguments, loc))
-        })
-        .collect()
+    let mut statements = Vec::new();
+    for (index, helper) in contract.assigns.iter().flatten().enumerate() {
+        let helper_symbol = symbols
+            .lookup(helper.as_str())
+            .ok_or_else(|| anyhow::anyhow!("assigns helper `{helper}` is missing"))?
+            .clone();
+        let helper_expr = helper_symbol.to_expr().with_location(loc);
+        let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
+            &helper_expr,
+            args.to_vec(),
+            symbols.machine_model(),
+        );
+        let return_type = helper_symbol
+            .typ
+            .return_type()
+            .cloned()
+            .expect("validated helper function");
+        if return_type == Type::empty() {
+            statements.push(Stmt::function_call(None, helper_expr, arguments, loc));
+            continue;
+        }
+        // A pointer-returning helper names an lvalue; havoc it so the frame is modeled.
+        let result = insert_local(
+            symbols,
+            function,
+            &format!("assigns{index}"),
+            return_type,
+            loc,
+        );
+        let lvalue = result.clone().dereference();
+        statements.push(Stmt::function_call(
+            Some(result),
+            helper_expr,
+            arguments,
+            loc,
+        ));
+        statements.push(Stmt::assign(
+            lvalue.clone(),
+            Expr::nondet(lvalue.typ().clone()),
+            loc,
+        ));
+    }
+    Ok(statements)
 }
 
 fn emit_value_helper(

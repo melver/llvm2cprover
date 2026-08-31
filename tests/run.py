@@ -262,6 +262,55 @@ def run_cbmc(test: TestCase, args: argparse.Namespace, goto_path: Path) -> subpr
     return run_command(command, cwd=ROOT)
 
 
+def selected_enforcement(test: TestCase) -> str | None:
+    selections = [
+        test.translator_flags[index + 1]
+        for index, flag in enumerate(test.translator_flags[:-1])
+        if flag == "--enforce-contract"
+    ]
+    if not selections:
+        return None
+    if len(selections) != 1:
+        raise ValueError(f"{test.path}: E2E discharge tests select exactly one contract")
+    return selections[0]
+
+
+def instrument_contract(
+    test: TestCase,
+    args: argparse.Namespace,
+    goto_path: Path,
+    target: str,
+) -> tuple[str, subprocess.CompletedProcess[str], Path]:
+    # Mirrors the symbol names documented in README.md, which llvm2cprover builds with
+    # util::sanitize_name. Test targets are plain identifiers, so alnum-or-underscore is
+    # enough here; a rename on the Rust side surfaces as a missing-property failure.
+    safe_target = "".join(character if character.isalnum() else "_" for character in target)
+    harness = f"__llvm2cprover_contract_enforcement_{safe_target}"
+    specification = f"__llvm2cprover_contract_spec_{safe_target}"
+    linked_path = goto_path.with_suffix(".linked.goto")
+    instrumented_path = goto_path.with_suffix(".instrumented.goto")
+    linked = run_command(
+        [args.goto_cc, str(goto_path), "--function", harness, "-o", str(linked_path)],
+        cwd=ROOT,
+    )
+    if linked.returncode != 0:
+        return ("goto-cc", linked, linked_path)
+    instrumented = run_command(
+        [
+            args.goto_instrument,
+            "--dfcc",
+            harness,
+            "--no-malloc-may-fail",
+            "--enforce-contract",
+            f"{target}/{specification}",
+            str(linked_path),
+            str(instrumented_path),
+        ],
+        cwd=ROOT,
+    )
+    return ("goto-instrument", instrumented, instrumented_path)
+
+
 def expect_translation_failure(result: subprocess.CompletedProcess[str]) -> RunResult:
     if result.returncode != 0:
         return RunResult(True)
@@ -328,7 +377,15 @@ def run_test(test: TestCase, args: argparse.Namespace) -> RunResult:
         return expect_translation_failure(translate)
     if translate.returncode != 0:
         return RunResult(False, command_details(tool, translate))
-    cbmc = run_cbmc(test, args, goto_path)
+    verification_path = goto_path
+    enforcement = selected_enforcement(test)
+    if enforcement is not None:
+        tool, instrumented, verification_path = instrument_contract(
+            test, args, goto_path, enforcement
+        )
+        if instrumented.returncode != 0:
+            return RunResult(False, command_details(tool, instrumented))
+    cbmc = run_cbmc(test, args, verification_path)
     if cbmc.returncode not in {0, 10}:
         return RunResult(False, command_details("cbmc", cbmc))
     output = "\n".join(part for part in (cbmc.stdout, cbmc.stderr) if part)
@@ -347,6 +404,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clang", default="clang")
     parser.add_argument("--rustc", default="rustc")
     parser.add_argument("--cbmc", default="cbmc")
+    parser.add_argument("--goto-cc", default="goto-cc")
+    parser.add_argument("--goto-instrument", default="goto-instrument")
     return parser.parse_args()
 
 

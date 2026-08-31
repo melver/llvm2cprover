@@ -57,11 +57,13 @@ impl SymbolBuilder {
         unsound: &UnsoundOptions,
     ) -> Result<SymbolTable> {
         let replacements = BTreeSet::new();
+        let enforcements = BTreeSet::new();
         self.build_reporting(
             module,
             machine_model,
             contracts,
             &replacements,
+            &enforcements,
             unsound,
             &mut ReportCollector::default(),
         )
@@ -74,6 +76,7 @@ impl SymbolBuilder {
         machine_model: GotoMachineModel,
         contracts: &ContractMap,
         replacements: &BTreeSet<String>,
+        enforcements: &BTreeSet<String>,
         unsound: &UnsoundOptions,
         report: &mut ReportCollector,
     ) -> Result<SymbolTable> {
@@ -149,9 +152,17 @@ impl SymbolBuilder {
 
         self.insert_pending_aggregate_symbols(&mut symbols);
 
-        let replacements =
+        crate::contracts::inject::validate_contracts(&symbols, contracts)?;
+        let replacement_map =
             crate::contracts::inject::prepare_replacements(&mut symbols, contracts, replacements)?;
-        let mut instructions = InstructionLowerer::new(contracts, &replacements, unsound, report);
+        crate::contracts::inject::prepare_enforcements(
+            &mut symbols,
+            contracts,
+            enforcements,
+            replacements,
+        )?;
+        let mut instructions =
+            InstructionLowerer::new(contracts, &replacement_map, unsound, report);
         for function in module.get_functions() {
             if function.count_basic_blocks() != 0 {
                 instructions.lower_function(
@@ -559,7 +570,7 @@ pub(super) fn insert_runtime_symbols(symbols: &mut SymbolTable) {
         // CBMC only needs the opaque tag name to merge our declaration with its pthread model;
         // the built-in library supplies the concrete layout when it links its own definition.
         symbols.insert(Symbol::incomplete_union(
-            "tag-pthread_attr_t",
+            "pthread_attr_t",
             "union pthread_attr_t",
         ));
     }

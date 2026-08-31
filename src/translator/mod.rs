@@ -26,14 +26,19 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use cprover_bindings::goto_program::Location;
 use cprover_bindings::irep::goto_binary_serde::write_goto_binary_file;
 use inkwell::context::Context;
+use inkwell::llvm_sys::LLVMAtomicOrdering;
 use inkwell::llvm_sys::core::{
-    LLVMGetCalledValue, LLVMGetFirstUse, LLVMGetModuleInlineAsm, LLVMGetNextUse,
-    LLVMGetNumOperands, LLVMGetOperand, LLVMGetUser, LLVMIsACallInst, LLVMIsAInvokeInst,
+    LLVMGetBasicBlockParent, LLVMGetCalledValue, LLVMGetFirstUse, LLVMGetInstructionParent,
+    LLVMGetModuleInlineAsm, LLVMGetNextUse, LLVMGetNumOperands, LLVMGetOperand, LLVMGetOrdering,
+    LLVMGetUser, LLVMIsACallInst, LLVMIsAInvokeInst,
 };
 use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::Module;
-use inkwell::values::AsValueRef;
+use inkwell::values::{
+    AsValueRef, BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, InstructionValue,
+    Operand,
+};
 use serde::Serialize;
 
 use crate::contracts;
@@ -153,7 +158,13 @@ impl Translator {
         reject_module_inline_asm(&module)?;
         let contracts = contracts::load_contracts(&self.config.contracts)?;
         validate_inline_asm_model_definitions(&module, &contracts)?;
+        validate_pointer_assigns_helpers_are_read_only(&module, &contracts)?;
+        if self.config.enforce_contract.len() > 1 {
+            bail!("exactly one --enforce-contract target may be selected per translation");
+        }
         validate_contract_replacement_uses(&module, &self.config.replace_with_contract)?;
+        validate_contract_enforcement_uses(&module, &self.config.enforce_contract)?;
+        validate_contract_enforcement_runtime(&module, &self.config.enforce_contract)?;
         let resolved_machine_model =
             util::resolve_machine_model_kind(&module, self.config.machine_model)?;
         let machine_model = util::machine_model_for(&module, resolved_machine_model);
@@ -177,6 +188,7 @@ impl Translator {
             machine_model,
             &contracts,
             &self.config.replace_with_contract,
+            &self.config.enforce_contract,
             &self.config.unsound,
             &mut report,
         )?;
@@ -184,7 +196,20 @@ impl Translator {
             &mut symbols,
             &contracts,
             &self.config.replace_with_contract,
+            &self.config.enforce_contract,
         )?;
+        if !self.config.enforce_contract.is_empty() {
+            // DFCC must introduce `free` together with its contracts runtime. The bindings seed an
+            // unused declaration eagerly, which prevents CBMC's library linker from supplying the
+            // real body, so omit that declaration after rejecting input uses above.
+            const UNUSED_FREE: &str = "__llvm2cprover_unused_builtin_free";
+            if symbols.lookup(UNUSED_FREE).is_some() {
+                bail!(
+                    "DFCC runtime compatibility symbol `{UNUSED_FREE}` collides with an input symbol"
+                );
+            }
+            symbols.lookup_mut("free").expect("builtin free").name = UNUSED_FREE.into();
+        }
         write_goto_binary_file(output.as_path(), &symbols);
         if let Some(path) = self.config.report.as_deref() {
             report::write_report(
@@ -192,12 +217,203 @@ impl Translator {
                 &module,
                 resolved_machine_model,
                 &contracts,
+                &self.config.enforce_contract,
                 &symbols,
                 report,
             )?;
         }
         Ok(())
     }
+}
+
+fn validate_pointer_assigns_helpers_are_read_only(
+    module: &Module<'_>,
+    contracts: &contracts::ContractMap,
+) -> Result<()> {
+    for (target, contract) in contracts.iter() {
+        for helper in contract.assigns.iter().flatten() {
+            let Some(function) = module.get_function(helper) else {
+                continue;
+            };
+            if !function
+                .get_type()
+                .get_return_type()
+                .is_some_and(|typ| typ.is_pointer_type())
+            {
+                continue;
+            }
+            if function.count_basic_blocks() == 0 {
+                bail!("pointer-returning assigns helper `{helper}` for `{target}` must be defined");
+            }
+            for block in function.get_basic_blocks() {
+                let mut instruction = block.get_first_instruction();
+                while let Some(current) = instruction {
+                    validate_pointer_assigns_instruction(target, helper, current)?;
+                    instruction = current.get_next_instruction();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_pointer_assigns_instruction(
+    target: &str,
+    helper: &str,
+    instruction: InstructionValue<'_>,
+) -> Result<()> {
+    match instruction.get_opcode() {
+        InstructionOpcode::Store => {
+            if instruction.get_volatile().unwrap_or(false) {
+                bail!(
+                    "pointer-returning assigns helper `{helper}` for `{target}` contains a volatile store"
+                );
+            }
+            if unsafe { LLVMGetOrdering(instruction.as_value_ref()) }
+                != LLVMAtomicOrdering::LLVMAtomicOrderingNotAtomic
+            {
+                bail!(
+                    "pointer-returning assigns helper `{helper}` for `{target}` contains an atomic store"
+                );
+            }
+            let destination = match instruction.get_operand(1) {
+                Some(Operand::Value(value)) => value,
+                _ => bail!("store in assigns helper `{helper}` has no pointer destination"),
+            };
+            if !is_local_alloca_derived(destination) {
+                bail!(
+                    "pointer-returning assigns helper `{helper}` for `{target}` writes nonlocal state"
+                );
+            }
+        }
+        InstructionOpcode::Load => {
+            if instruction.get_volatile().unwrap_or(false)
+                || unsafe { LLVMGetOrdering(instruction.as_value_ref()) }
+                    != LLVMAtomicOrdering::LLVMAtomicOrderingNotAtomic
+            {
+                bail!(
+                    "pointer-returning assigns helper `{helper}` for `{target}` contains a volatile or atomic load"
+                );
+            }
+        }
+        InstructionOpcode::AtomicRMW | InstructionOpcode::AtomicCmpXchg => {
+            bail!(
+                "pointer-returning assigns helper `{helper}` for `{target}` contains an atomic write"
+            );
+        }
+        InstructionOpcode::Fence => {
+            bail!(
+                "pointer-returning assigns helper `{helper}` for `{target}` contains an atomic fence"
+            );
+        }
+        InstructionOpcode::Call | InstructionOpcode::Invoke | InstructionOpcode::CallBr => {
+            let called = unsafe { LLVMGetCalledValue(instruction.as_value_ref()) };
+            let called_name = unsafe { FunctionValue::new(called) }
+                .map(|function| function.get_name().to_string_lossy().into_owned());
+            let harmless = called_name.as_deref().is_some_and(|name| {
+                name.starts_with("llvm.dbg.") || name.starts_with("llvm.lifetime.")
+            });
+            if !harmless {
+                bail!(
+                    "pointer-returning assigns helper `{helper}` for `{target}` calls a potentially side-effecting function"
+                );
+            }
+        }
+        InstructionOpcode::Return => {
+            if let Some(Operand::Value(value)) = instruction.get_operand(0)
+                && value.get_type().is_pointer_type()
+                && is_local_alloca_derived(value)
+            {
+                bail!(
+                    "pointer-returning assigns helper `{helper}` for `{target}` returns a pointer to its own local allocation"
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_local_alloca_derived(value: BasicValueEnum<'_>) -> bool {
+    let Some(instruction) = value.as_instruction_value() else {
+        return false;
+    };
+    match instruction.get_opcode() {
+        InstructionOpcode::Alloca => true,
+        InstructionOpcode::BitCast
+        | InstructionOpcode::AddrSpaceCast
+        | InstructionOpcode::GetElementPtr => match instruction.get_operand(0) {
+            Some(Operand::Value(base)) => is_local_alloca_derived(base),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn validate_contract_enforcement_runtime(
+    module: &Module<'_>,
+    enforcements: &BTreeSet<String>,
+) -> Result<()> {
+    if enforcements.is_empty() {
+        return Ok(());
+    }
+    if let Some(free) = module.get_function("free")
+        && (free.count_basic_blocks() != 0
+            || unsafe { !LLVMGetFirstUse(free.as_value_ref()).is_null() })
+    {
+        bail!(
+            "contract enforcement currently cannot be combined with input uses or definitions of `free`"
+        );
+    }
+    Ok(())
+}
+
+fn validate_contract_enforcement_uses(
+    module: &Module<'_>,
+    enforcements: &BTreeSet<String>,
+) -> Result<()> {
+    for name in enforcements {
+        let Some(function) = module.get_function(name) else {
+            continue;
+        };
+        // Direct self-recursion is the degenerate call cycle, so the cycle walk below reports it.
+        for_each_direct_call_use(
+            function.as_value_ref(),
+            || format!("contract enforcement for `{name}` does not support invoke uses"),
+            || {
+                format!(
+                    "contract enforcement for `{name}` requires direct calls only; its address is used indirectly"
+                )
+            },
+            |_| Ok(()),
+        )?;
+        validate_contract_enforcement_call_cycle(function.as_value_ref(), name)?;
+    }
+    Ok(())
+}
+
+fn validate_contract_enforcement_call_cycle(target: LLVMValueRef, name: &str) -> Result<()> {
+    let mut visited = BTreeSet::from([target as usize]);
+    let mut pending = vec![target];
+    while let Some(callee) = pending.pop() {
+        let mut usage = unsafe { LLVMGetFirstUse(callee) };
+        while !usage.is_null() {
+            let user = unsafe { LLVMGetUser(usage) };
+            if is_direct_call_to(user, callee) {
+                let caller = unsafe { LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) };
+                if caller == target {
+                    bail!(
+                        "contract enforcement for `{name}` does not support recursive call cycles"
+                    );
+                }
+                if visited.insert(caller as usize) {
+                    pending.push(caller);
+                }
+            }
+            usage = unsafe { LLVMGetNextUse(usage) };
+        }
+    }
+    Ok(())
 }
 
 fn validate_inline_asm_model_definitions(
@@ -226,25 +442,53 @@ fn validate_contract_replacement_uses(
         let Some(function) = module.get_function(name) else {
             continue;
         };
-        let mut usage = unsafe { LLVMGetFirstUse(function.as_value_ref()) };
-        while !usage.is_null() {
-            let user = unsafe { LLVMGetUser(usage) };
-            let is_call = unsafe { !LLVMIsACallInst(user).is_null() };
-            let is_invoke = unsafe { !LLVMIsAInvokeInst(user).is_null() };
-            if is_invoke {
-                bail!("{}", invoke_replacement_message(name));
-            }
-            let direct_call =
-                is_call && unsafe { LLVMGetCalledValue(user) == function.as_value_ref() };
-            // A direct call must mention the callee exactly once; a second occurrence means the
-            // address is also passed as an argument.
-            if !direct_call || self_operand_count(user, function.as_value_ref()) != 1 {
-                bail!(
+        for_each_direct_call_use(
+            function.as_value_ref(),
+            || invoke_replacement_message(name),
+            || {
+                format!(
                     "contract replacement for `{name}` requires direct calls only; its address is used indirectly"
-                );
-            }
-            usage = unsafe { LLVMGetNextUse(usage) };
+                )
+            },
+            |_| Ok(()),
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `user` is a plain direct call to `callee` that does not also leak its address.
+///
+/// A direct call names the callee exactly once; a second occurrence means the address is also
+/// passed as an argument.
+fn is_direct_call_to(user: LLVMValueRef, callee: LLVMValueRef) -> bool {
+    unsafe {
+        (!LLVMIsACallInst(user).is_null() || !LLVMIsAInvokeInst(user).is_null())
+            && LLVMGetCalledValue(user) == callee
+            && self_operand_count(user, callee) == 1
+    }
+}
+
+/// Visit every use of `function`, rejecting any that is not a direct call.
+///
+/// Shared by the replacement and enforcement pre-passes, which differ only in wording and in
+/// the extra per-use check they apply.
+fn for_each_direct_call_use(
+    function: LLVMValueRef,
+    invoke_message: impl Fn() -> String,
+    indirect_message: impl Fn() -> String,
+    mut visit: impl FnMut(LLVMValueRef) -> Result<()>,
+) -> Result<()> {
+    let mut usage = unsafe { LLVMGetFirstUse(function) };
+    while !usage.is_null() {
+        let user = unsafe { LLVMGetUser(usage) };
+        if unsafe { !LLVMIsAInvokeInst(user).is_null() } {
+            bail!("{}", invoke_message());
         }
+        if !is_direct_call_to(user, function) {
+            bail!("{}", indirect_message());
+        }
+        visit(user)?;
+        usage = unsafe { LLVMGetNextUse(usage) };
     }
     Ok(())
 }
