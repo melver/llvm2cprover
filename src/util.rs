@@ -56,7 +56,17 @@ pub fn machine_model_for(module: &Module<'_>, model: MachineModel) -> GotoMachin
         .to_str()
         .unwrap_or_default()
         .to_owned();
-    let arch = triple_arch(&triple);
+    let mut arch = triple_arch(&triple);
+    if arch.is_empty() {
+        arch = match model {
+            MachineModel::Ilp32 => "i386",
+            MachineModel::Lp64 | MachineModel::Llp64 => "x86_64",
+            MachineModel::Auto => {
+                unreachable!("auto must be resolved before building a symbol table")
+            }
+        }
+        .to_owned();
+    }
     let big_endian = is_big_endian(module);
     machine_model(model, arch, big_endian)
 }
@@ -197,7 +207,7 @@ fn pointer_width(module: &Module<'_>) -> Result<u32> {
     let arch = triple_arch(triple.as_str().to_str().unwrap_or_default());
     if matches!(
         arch.as_str(),
-        "x86_64" | "aarch64" | "riscv64" | "powerpc64" | "powerpc64le" | "s390x"
+        "x86_64" | "arm64" | "riscv64" | "powerpc64" | "powerpc64le" | "s390x"
     ) {
         return Ok(64);
     }
@@ -225,7 +235,11 @@ fn is_big_endian(module: &Module<'_>) -> bool {
 }
 
 fn triple_arch(triple: &str) -> String {
-    triple.split('-').next().unwrap_or("unknown").to_owned()
+    let raw = triple.split('-').next().unwrap_or_default();
+    match raw {
+        "aarch64" => "arm64".to_owned(),
+        arch => arch.to_owned(),
+    }
 }
 
 /// Normalize LLVM-derived names into the restricted identifier shape used in GOTO symbols.
@@ -447,12 +461,48 @@ mod tests {
             infer_machine_model(&module).expect("detect"),
             MachineModel::Lp64
         );
-        assert_eq!(
-            resolve_machine_model(&module, MachineModel::Auto)
-                .expect("resolve")
-                .pointer_width,
-            64
+        let model = resolve_machine_model(&module, MachineModel::Auto).expect("resolve");
+        assert_eq!(model.pointer_width, 64);
+        assert_eq!(model.architecture, "x86_64");
+    }
+
+    #[test]
+    fn defaults_architecture_when_triple_omitted() {
+        let context = Context::create();
+        let module = parse_module(
+            &context,
+            r#"
+                define void @f() {
+                entry:
+                  ret void
+                }
+            "#,
         );
+
+        let model = resolve_machine_model(&module, MachineModel::Auto).expect("resolve");
+        assert_eq!(model.architecture, "x86_64");
+
+        let model_32 = resolve_machine_model(&module, MachineModel::Ilp32).expect("resolve");
+        assert_eq!(model_32.architecture, "i386");
+    }
+
+    #[test]
+    fn maps_aarch64_triple_to_cbmc_arm64() {
+        let context = Context::create();
+        let module = parse_module(
+            &context,
+            r#"
+                target triple = "aarch64-unknown-linux-gnu"
+
+                define void @f() {
+                entry:
+                  ret void
+                }
+            "#,
+        );
+
+        let model = resolve_machine_model(&module, MachineModel::Auto).expect("resolve");
+        assert_eq!(model.architecture, "arm64");
     }
 
     #[test]
