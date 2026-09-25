@@ -557,6 +557,12 @@ pub(super) fn insert_runtime_symbols(symbols: &mut SymbolTable) {
         symbol.update(SymbolValues::Expr(typ.null()));
         symbols.insert(symbol);
     }
+    if let Some(dead_object) = symbols.lookup_mut("__CPROVER_dead_object") {
+        // `cprover_bindings` seeds `__CPROVER_dead_object` as an uninitialized `extern` symbol.
+        // Initialize it to null so CBMC's pointer checks do not treat it as an unconstrained nondet.
+        dead_object.is_extern = false;
+        dead_object.update(SymbolValues::Expr(Type::void_pointer().null()));
+    }
     if symbols.lookup("pthread_t").is_none() {
         let width = symbols.machine_model().pointer_width;
         symbols.insert(Symbol::typedef(
@@ -712,7 +718,25 @@ mod tests {
 
         let symbols = build_symbols(&module);
 
-        assert!(symbols.lookup("__CPROVER_deallocated").is_some());
+        let dealloc = symbols
+            .lookup("__CPROVER_deallocated")
+            .expect("missing deallocated");
+        assert!(!dealloc.is_extern);
+        assert!(matches!(dealloc.value, SymbolValues::Expr(_)));
+    }
+
+    #[test]
+    fn seeds_cprover_dead_object_runtime_symbol() {
+        let context = Context::create();
+        let module = context.create_module("symbols");
+
+        let symbols = build_symbols(&module);
+
+        let dead_object = symbols
+            .lookup("__CPROVER_dead_object")
+            .expect("missing dead object");
+        assert!(!dead_object.is_extern);
+        assert!(matches!(dead_object.value, SymbolValues::Expr(_)));
     }
 
     #[test]
