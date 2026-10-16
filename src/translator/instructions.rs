@@ -343,7 +343,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             InstructionOpcode::Load => self.lower_load(instruction, body),
             InstructionOpcode::Store => self.lower_store(instruction, body),
             InstructionOpcode::GetElementPtr => self.lower_gep(instruction, body),
-            InstructionOpcode::Br => self.lower_branch(instruction, body),
+            InstructionOpcode::UncondBr | InstructionOpcode::CondBr => {
+                self.lower_branch(instruction, body)
+            }
             InstructionOpcode::Switch => self.lower_switch(instruction, body),
             InstructionOpcode::ZExt
             | InstructionOpcode::SExt
@@ -480,19 +482,17 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             }
             3 => {
                 let cond = self.lower_operand(instruction, 0)?.cast_to(Type::bool());
-                // The LLVM C API returns branch successors in reverse order:
-                // operand 1 = false destination, operand 2 = true destination.
-                let false_dest = self.operand_block(
+                let true_dest = self.operand_block(
                     instruction,
                     1,
                     UnsupportedFeature::ControlFlow,
-                    "malformed false branch target",
+                    "malformed true branch target",
                 )?;
-                let true_dest = self.operand_block(
+                let false_dest = self.operand_block(
                     instruction,
                     2,
                     UnsupportedFeature::ControlFlow,
-                    "malformed true branch target",
+                    "malformed false branch target",
                 )?;
                 body.push(Stmt::if_then_else(
                     cond,

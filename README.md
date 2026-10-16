@@ -10,7 +10,7 @@ intentionally unsound fallbacks are available as an opt-in feature.
 
 ### Prerequisites
 
-- **LLVM 22 or later**
+- **LLVM 23 or later**
 - **Rust stable** and Cargo
 - **CBMC**
 - *Development dependencies:*

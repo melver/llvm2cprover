@@ -863,19 +863,14 @@ mod tests {
 
     #[test]
     fn branch_operand_ordering() {
-        // The LLVM C API returns conditional branch operands in a different order
-        // than the textual IR syntax `br i1 %cond, label %true, label %false`:
+        // Prior to LLVM 23 (commit 750088fa8aba), the LLVM C API returned
+        // conditional branch operands in reverse order (operand 1 = IfFalse,
+        // operand 2 = IfTrue). Verify that CondBrInst operands match the
+        // textual IR syntax `br i1 %cond, label %true, label %false`:
         //
         //   operand 0 = condition
-        //   operand 1 = false destination  (IfFalse)
-        //   operand 2 = true destination   (IfTrue)
-        //
-        // This matches the raw Use array layout in CondBrInst [Cond, IfFalse, IfTrue]
-        // but is the REVERSE of getSuccessor(0)=IfTrue / getSuccessor(1)=IfFalse.
-        //
-        // LLVM commit 750088fa8aba (March 2026) fixes this so that operand 1 = IfTrue
-        // and operand 2 = IfFalse.  When we upgrade past that commit this test will
-        // fail, reminding us to swap the operand indices in lower_branch.
+        //   operand 1 = true destination   (IfTrue)
+        //   operand 2 = false destination  (IfFalse)
         let context = Context::create();
         let module = parse_module(
             &context,
@@ -900,7 +895,7 @@ mod tests {
             .get_first_basic_block()
             .and_then(|block| block.get_terminator())
             .expect("missing br instruction");
-        assert_eq!(br.get_opcode(), InstructionOpcode::Br);
+        assert_eq!(br.get_opcode(), InstructionOpcode::CondBr);
         assert_eq!(br.get_num_operands(), 3);
 
         let op0 = br.get_operand(0).expect("missing operand 0");
@@ -917,7 +912,7 @@ mod tests {
             _ => panic!("operand 2 should be a block"),
         };
 
-        assert_eq!(op1_name, "no", "C API operand 1 is the false destination");
-        assert_eq!(op2_name, "yes", "C API operand 2 is the true destination");
+        assert_eq!(op1_name, "yes", "C API operand 1 is the true destination");
+        assert_eq!(op2_name, "no", "C API operand 2 is the false destination");
     }
 }
