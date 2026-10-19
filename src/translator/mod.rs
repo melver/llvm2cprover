@@ -57,6 +57,10 @@ pub(crate) const EH_ACTIVE_SYMBOL: &str = "__llvm2cprover_eh_active";
 pub(crate) const EH_PTR_SYMBOL: &str = "__llvm2cprover_eh_ptr";
 pub(crate) const EH_SELECTOR_SYMBOL: &str = "__llvm2cprover_eh_selector";
 
+pub(crate) fn is_metadata_noop_intrinsic(name: &str) -> bool {
+    name.starts_with("llvm.dbg.") || name.starts_with("llvm.experimental.noalias.scope.decl")
+}
+
 pub use self::asm_manifest::AsmManifest;
 use self::symbols::SymbolBuilder;
 
@@ -315,7 +319,7 @@ fn validate_assigns_instruction(
             let called_name = unsafe { FunctionValue::new(called) }
                 .map(|function| function.get_name().to_string_lossy().into_owned());
             let harmless = called_name.as_deref().is_some_and(|name| {
-                name.starts_with("llvm.dbg.") || name.starts_with("llvm.lifetime.")
+                is_metadata_noop_intrinsic(name) || name.starts_with("llvm.lifetime.")
             });
             if !harmless {
                 bail!(

@@ -123,6 +123,9 @@ impl SymbolBuilder {
 
         for function in module.get_functions() {
             let name = function.get_name().to_string_lossy().into_owned();
+            if name.starts_with("llvm.") {
+                continue;
+            }
             if symbols.lookup(name.as_str()).is_some() {
                 if contracts.is_helper(&name) {
                     // Keeping the builtin would silently discard the compiled helper body that
@@ -405,7 +408,10 @@ impl SymbolBuilder {
             )
             .with_symbol(function_name.clone())
         })?;
-        let Some(callee) = call.get_called_fn_value() else {
+        let Some(callee) = call
+            .get_called_fn_value()
+            .filter(|callee| callee.count_basic_blocks() != 0)
+        else {
             return Ok(false);
         };
 
@@ -1173,6 +1179,29 @@ mod tests {
 
         let debug = stmt_debug(&symbols, "f");
         assert!(!debug.contains("lifetime"));
+        assert!(debug.contains("Return"));
+    }
+
+    #[test]
+    fn lowers_noalias_scope_decl_as_nop() {
+        let symbols = build_symbols_from_ir(
+            br#"
+            declare void @llvm.experimental.noalias.scope.decl(metadata)
+
+            define void @f() {
+            entry:
+              tail call void @llvm.experimental.noalias.scope.decl(metadata !0)
+              ret void
+            }
+
+            !0 = !{!1}
+            !1 = distinct !{!1, !2, !"callee: %p"}
+            !2 = distinct !{!2, !"callee"}
+        "#,
+        );
+
+        let debug = stmt_debug(&symbols, "f");
+        assert!(!debug.contains("noalias"));
         assert!(debug.contains("Return"));
     }
 

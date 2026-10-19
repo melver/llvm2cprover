@@ -1222,10 +1222,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
         if let Some(callee) = unsafe { FunctionValue::new(raw_callee) } {
             let callee_name = callee.get_name().to_string_lossy().into_owned();
-            if callee_name.starts_with("llvm.dbg.") {
-                // LLVM debug intrinsics carry source-level bookkeeping only. Drop them before
-                // lowering operands so optimized debug records with `poison` never enter the
-                // semantic translation path.
+            if super::is_metadata_noop_intrinsic(&callee_name) {
+                // LLVM debug and alias-scope intrinsics carry metadata-only bookkeeping. Drop
+                // them before lowering operands so metadata or `poison` arguments never enter
+                // the semantic translation path.
                 return Ok(());
             }
         }
