@@ -550,18 +550,15 @@ fn pthread_t_type() -> Type {
 }
 
 pub(super) fn insert_runtime_symbols(symbols: &mut SymbolTable) {
-    if symbols.lookup("__CPROVER_deallocated").is_none() {
-        // CBMC's own C front-end seeds this pointer before library instrumentation runs.
-        // LLVM-originated GOTO lacks that path, so we add the same global explicitly.
-        let typ = Type::void_pointer();
-        let mut symbol = Symbol::static_variable(
-            "__CPROVER_deallocated",
-            "__CPROVER_deallocated",
-            typ.clone(),
-            Location::none(),
-        );
-        symbol.update(SymbolValues::Expr(typ.null()));
-        symbols.insert(symbol);
+    for name in ["__CPROVER_deallocated", "__CPROVER_memory_leak"] {
+        if symbols.lookup(name).is_none() {
+            // CBMC's own C front-end seeds these pointers before library instrumentation runs.
+            // LLVM-originated GOTO lacks that path, so we add the same globals explicitly.
+            let typ = Type::void_pointer();
+            let mut symbol = Symbol::static_variable(name, name, typ.clone(), Location::none());
+            symbol.update(SymbolValues::Expr(typ.null()));
+            symbols.insert(symbol);
+        }
     }
     if let Some(dead_object) = symbols.lookup_mut("__CPROVER_dead_object") {
         // `cprover_bindings` seeds `__CPROVER_dead_object` as an uninitialized `extern` symbol.
