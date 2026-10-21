@@ -1014,6 +1014,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                         .unwrap_or_else(|| result.typ().clone()),
                 )
                 .cast_to(result.typ().clone()),
+            // `i1` lowers to 8-bit `c_bool`, so truncate through a 1-bit bitvector first to
+            // extract the least-significant bit instead of the low byte.
+            InstructionOpcode::Trunc if result.typ().is_c_bool() => value
+                .cast_to(Type::unsigned_int(1_u32))
+                .cast_to(result.typ().clone()),
             InstructionOpcode::ZExt
             | InstructionOpcode::Trunc
             | InstructionOpcode::PtrToInt
