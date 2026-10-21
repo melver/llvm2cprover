@@ -586,9 +586,6 @@ fn validate_helper<'a>(
             }
         }
         HelperReturn::Exact(expected_return) => {
-            if actual_return == Type::empty() {
-                bail!("{kind} helper `{helper_name}` for `{target_name}` must return a value");
-            }
             if actual_return != expected_return {
                 bail!(
                     "{kind} helper `{helper_name}` for `{target_name}` returns {:?}, expected {:?}",
