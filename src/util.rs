@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::slice;
 
 use anyhow::{Result, bail};
-use cprover_bindings::goto_program::Location;
+use cprover_bindings::goto_program::{Expr, Location, Type};
 use cprover_bindings::{MachineModel as GotoMachineModel, RoundingMode};
 use inkwell::llvm_sys::core::{
     LLVMGetDebugLocColumn, LLVMGetDebugLocDirectory, LLVMGetDebugLocFilename, LLVMGetDebugLocLine,
@@ -256,6 +256,15 @@ pub fn sanitize_name(name: &str) -> String {
         "tmp".to_owned()
     } else {
         out
+    }
+}
+
+/// Build a nondeterministic expression of `typ`, constraining `c_bool` to `{0, 1}`.
+pub fn nondet_expr(typ: Type) -> Expr {
+    if typ.is_c_bool() {
+        Expr::nondet(Type::bool()).cast_to(typ)
+    } else {
+        Expr::nondet(typ)
     }
 }
 

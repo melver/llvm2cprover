@@ -27,6 +27,7 @@ use cprover_bindings::goto_program::{
 };
 
 use super::{ContractMap, FunctionContract};
+use crate::util;
 
 /// Contract target name to the internal replacement symbol synthesized for it.
 pub(crate) type ReplacementMap = BTreeMap<String, String>;
@@ -636,7 +637,7 @@ fn synthesize_assigns_stub(
         .cloned()
         .unwrap_or_else(Type::empty);
     if return_type != Type::empty() {
-        body.push(Stmt::ret(Some(Expr::nondet(return_type)), loc));
+        body.push(Stmt::ret(Some(util::nondet_expr(return_type)), loc));
     } else {
         body.push(Stmt::ret(None, loc));
     }
@@ -703,7 +704,11 @@ fn synthesize_replacement(
     let result = (return_type != Type::empty())
         .then(|| insert_local(symbols, &replacement, "result", return_type.clone(), loc));
     if let Some(result) = &result {
-        body.push(Stmt::assign(result.clone(), Expr::nondet(return_type), loc));
+        body.push(Stmt::assign(
+            result.clone(),
+            util::nondet_expr(return_type),
+            loc,
+        ));
     }
     if let Some(helper) = contract.ensures.as_deref() {
         let helper_args = ensures_arguments(args, snapshot, result.clone());
@@ -863,7 +868,7 @@ fn assigns_helper_calls(
         ));
         statements.push(Stmt::assign(
             lvalue.clone(),
-            Expr::nondet(lvalue.typ().clone()),
+            util::nondet_expr(lvalue.typ().clone()),
             loc,
         ));
     }

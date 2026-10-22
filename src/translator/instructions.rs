@@ -2008,7 +2008,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             let lhs = self.declare_instruction_result(instruction)?;
             body.push(Stmt::assign(
                 lhs.clone(),
-                Expr::nondet(lhs.typ().clone()),
+                util::nondet_expr(lhs.typ().clone()),
                 loc,
             ));
             return Ok(true);
@@ -3049,7 +3049,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .map(|lane| {
                 let mask = unsafe { LLVMGetMaskValue(instruction.as_value_ref(), lane) };
                 if mask < 0 {
-                    return Ok(Expr::nondet(elem_type.clone()));
+                    return Ok(util::nondet_expr(elem_type.clone()));
                 }
                 let index = mask as u64;
                 if index < vector1_len {
@@ -3326,7 +3326,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(if return_type == Type::empty() {
             Stmt::ret(None, loc)
         } else {
-            Stmt::ret(Some(Expr::nondet(return_type)), loc)
+            Stmt::ret(Some(util::nondet_expr(return_type)), loc)
         })
     }
 
@@ -3340,7 +3340,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         // undef in a function body means "any value" — unlike global undef which
         // follows C static-storage zero-init (handled in GlobalLowerer).
         if unsafe { LLVMIsUndef(value.as_value_ref()) } != 0 {
-            return Ok(Expr::nondet(typ));
+            return Ok(util::nondet_expr(typ));
         }
 
         self.insert_pending_aggregate_symbols();
