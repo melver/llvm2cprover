@@ -2150,6 +2150,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if is_rust_panic_symbol(callee_name) {
+            body.push(Stmt::assert_false("panic", "Rust panic", loc));
+            return Ok(true);
+        }
+
         if callee_name.starts_with("llvm.memcmp") {
             self.lower_builtin_call(
                 BuiltinFn::Memcmp,
@@ -3336,14 +3341,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         let typ = self.types.lower_value(value)?;
+        self.insert_pending_aggregate_symbols();
 
         // undef in a function body means "any value" — unlike global undef which
         // follows C static-storage zero-init (handled in GlobalLowerer).
         if unsafe { LLVMIsUndef(value.as_value_ref()) } != 0 {
             return Ok(util::nondet_expr(typ));
         }
-
-        self.insert_pending_aggregate_symbols();
         self.globals
             .lower_initializer(
                 &self.function_name,
@@ -3914,4 +3918,44 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             }
         }
     }
+}
+
+/// Recognize Rust's `core::panicking::*` and `core::slice::index::slice_index_fail` ABI entry
+/// points across both v0 (`_R...`) and legacy (`_ZN...E`) symbol mangling.
+fn is_rust_panic_symbol(name: &str) -> bool {
+    if let Some(rest) = name
+        .strip_prefix("_ZN4core")
+        .and_then(|s| s.strip_suffix('E'))
+    {
+        return is_rust_core_panic_path(rest);
+    }
+    let Some(rest) = name.strip_prefix("_R") else {
+        return false;
+    };
+    let rest = rest.strip_prefix('I').unwrap_or(rest);
+    let Some(mut rest) = rest.strip_prefix("NvNt") else {
+        return false;
+    };
+    while let Some(next) = rest.strip_prefix("Nt") {
+        rest = next;
+    }
+    let Some(mut rest) = rest.strip_prefix('C') else {
+        return false;
+    };
+    if let Some(after_s) = rest.strip_prefix('s') {
+        let Some((_, after_underscore)) = after_s.split_once('_') else {
+            return false;
+        };
+        rest = after_underscore;
+    }
+    rest.strip_prefix("4core")
+        .is_some_and(is_rust_core_panic_path)
+}
+
+fn is_rust_core_panic_path(rest: &str) -> bool {
+    if let Some(tail) = rest.strip_prefix("9panicking") {
+        return tail.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    }
+    rest.strip_prefix("5slice5index16slice_index_fail")
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with("17h"))
 }

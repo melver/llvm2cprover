@@ -1852,4 +1852,32 @@ mod tests {
             value => panic!("expected statement body, got {value:?}"),
         }
     }
+
+    #[test]
+    fn lowers_rust_panic_calls_to_assert_false() {
+        let symbols = build_symbols_from_ir(
+            br#"
+            declare void @_RNvNtCs1234_4core9panicking18panic_bounds_check(i64, i64, ptr)
+            declare void @_RNvNtNtCs1234_4core9panicking11panic_const23panic_const_div_by_zero(ptr)
+            declare void @_RNvNtNtCs1234_4core5slice5index16slice_index_fail(i64, i64, i64, ptr)
+            declare void @_ZN4core9panicking5panic17h0123456789abcdefE(ptr, i64, ptr)
+            declare void @_ZN4core5slice5index16slice_index_fail17h0123456789abcdefE(i64, i64, i64, ptr)
+
+            define void @f() {
+            entry:
+              call void @_RNvNtCs1234_4core9panicking18panic_bounds_check(i64 0, i64 0, ptr null)
+              call void @_RNvNtNtCs1234_4core9panicking11panic_const23panic_const_div_by_zero(ptr null)
+              call void @_RNvNtNtCs1234_4core5slice5index16slice_index_fail(i64 0, i64 0, i64 0, ptr null)
+              call void @_ZN4core9panicking5panic17h0123456789abcdefE(ptr null, i64 0, ptr null)
+              call void @_ZN4core5slice5index16slice_index_fail17h0123456789abcdefE(i64 0, i64 0, i64 0, ptr null)
+              ret void
+            }
+        "#,
+        );
+
+        let debug = stmt_debug(&symbols, "f");
+        assert_eq!(debug.matches("Assert {").count(), 5);
+        assert!(debug.contains("Rust panic"));
+        assert!(!debug.contains("FunctionCall"));
+    }
 }
