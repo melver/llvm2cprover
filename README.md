@@ -73,7 +73,9 @@ clang -emit-llvm -c -O0 foo.c -o - \
   | llvm2cprover - -o foo.goto
 ```
 
-`--input-format auto|bc|ll` overrides input detection when necessary. Run
+`--input-format auto|bc|ll` overrides input detection when necessary. Repeat
+`--entry <function>` to restrict lowered function bodies, globals, and manifest
+contracts to the cone of influence of the selected entry points. Run
 `llvm2cprover --help` for the complete command-line reference.
 
 ### Machine model

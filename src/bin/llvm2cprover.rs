@@ -77,6 +77,7 @@ struct Cli {
         long,
         conflicts_with_all = [
             "output",
+            "entry",
             "replace_with_contract",
             "enforce_contract",
             "rename_prefix",
@@ -86,6 +87,10 @@ struct Cli {
         ]
     )]
     emit_asm_manifest: bool,
+
+    /// Restrict lowered function bodies and globals to the cone of influence of this entry function.
+    #[arg(long = "entry")]
+    entry: Vec<String>,
 
     /// Replace direct calls to this function with its manifest contract.
     #[arg(long = "replace-with-contract")]
@@ -167,6 +172,7 @@ fn main() -> std::process::ExitCode {
     };
     let config = Config {
         output: cli.output,
+        entry: cli.entry.into_iter().collect(),
         contracts: cli.contracts,
         replace_with_contract: cli.replace_with_contract.into_iter().collect(),
         enforce_contract: cli.enforce_contract.into_iter().collect(),

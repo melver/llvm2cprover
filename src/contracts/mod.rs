@@ -145,6 +145,20 @@ pub struct FunctionContract {
     pub assigns: Option<Vec<String>>,
 }
 
+impl FunctionContract {
+    pub(crate) fn helpers(&self) -> impl Iterator<Item = &str> {
+        [
+            self.requires.as_deref(),
+            self.ensures.as_deref(),
+            self.snapshot.as_deref(),
+            self.model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.assigns.iter().flatten().map(String::as_str))
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
@@ -219,6 +233,46 @@ impl ContractMap {
         !self.inline_asm.is_empty()
     }
 
+    /// Restrict contracts and inline-assembly rules to the reachable cone of influence.
+    ///
+    /// Explicitly selected replacement and enforcement targets are retained so missing or
+    /// unreachable selections still fail closed during contract validation.
+    pub(crate) fn scoped_to(
+        &self,
+        reachable_functions: &BTreeSet<String>,
+        replacements: &BTreeSet<String>,
+        enforcements: &BTreeSet<String>,
+    ) -> Self {
+        let functions = self
+            .functions
+            .iter()
+            .filter(|(name, _)| {
+                reachable_functions.contains(name.as_str())
+                    || replacements.contains(name.as_str())
+                    || enforcements.contains(name.as_str())
+            })
+            .map(|(name, contract)| (name.clone(), contract.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let inline_asm = self
+            .inline_asm
+            .iter()
+            .filter(|mapping| reachable_functions.contains(&mapping.model))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut helpers = BTreeSet::new();
+        for contract in functions.values() {
+            helpers.extend(contract.helpers().map(str::to_owned));
+        }
+        for model in &inline_asm {
+            helpers.insert(model.model.clone());
+        }
+        Self {
+            functions,
+            inline_asm,
+            helpers,
+        }
+    }
+
     fn merge_manifest(&mut self, path: &Path, text: &str) -> Result<()> {
         let manifest = toml::from_str::<Manifest>(text)
             .with_context(|| format!("failed to parse contract file {}", path.display()))?;
@@ -233,28 +287,13 @@ impl ContractMap {
         }
         for (name, contract) in manifest.functions {
             validate_function_contract(path, &name, &contract)?;
-            if self
-                .functions
-                .insert(name.clone(), contract.clone())
-                .is_some()
-            {
+            self.helpers.extend(contract.helpers().map(str::to_owned));
+            if self.functions.insert(name.clone(), contract).is_some() {
                 bail!(
                     "{}: duplicate contract definition for `{name}`",
                     path.display()
                 );
             }
-            self.helpers.extend(
-                [
-                    contract.requires,
-                    contract.ensures,
-                    contract.snapshot,
-                    contract.model,
-                ]
-                .into_iter()
-                .flatten(),
-            );
-            self.helpers
-                .extend(contract.assigns.iter().flatten().cloned());
         }
         for model in manifest.inline_asm {
             // Empty ordinary calls lower as no-op barriers, but an empty `callbr` can still

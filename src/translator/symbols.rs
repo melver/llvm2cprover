@@ -8,21 +8,27 @@
 //! module also runs the pointer-pointee recovery fixed point that reconstructs
 //! typed pointers from opaque LLVM `ptr` values.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
 use cprover_bindings::MachineModel as GotoMachineModel;
 use cprover_bindings::goto_program::{
     Expr, Location, Parameter, Symbol, SymbolTable, SymbolValues, Type,
 };
+use inkwell::llvm_sys::core::{
+    LLVMAliasGetAliasee, LLVMGetCalledValue, LLVMGetNumArgOperands, LLVMGetNumOperands,
+    LLVMGetOperand, LLVMIsAConstant, LLVMIsAGlobalAlias, LLVMIsAGlobalVariable, LLVMIsAInlineAsm,
+};
+use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::module::Module;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{
-    AsValueRef, BasicValueEnum, CallSiteValue, FunctionValue, InstructionOpcode, InstructionValue,
+    AsValueRef, BasicValueEnum, CallSiteValue, FunctionValue, GlobalValue, InstructionOpcode,
+    InstructionValue,
 };
 
 use crate::UnsoundOptions;
-use crate::contracts::ContractMap;
+use crate::contracts::{ContractMap, InlineAsmSite};
 use crate::util;
 
 use super::globals::GlobalLowerer;
@@ -62,6 +68,7 @@ impl SymbolBuilder {
             module,
             machine_model,
             contracts,
+            None,
             &replacements,
             &enforcements,
             unsound,
@@ -70,11 +77,13 @@ impl SymbolBuilder {
     }
 
     /// Discover declarations while recording translation-report inputs.
-    pub(crate) fn build_reporting<'ctx>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_reporting<'ctx>(
         &mut self,
         module: &Module<'ctx>,
         machine_model: GotoMachineModel,
         contracts: &ContractMap,
+        cone: Option<&ConeOfInfluence>,
         replacements: &BTreeSet<String>,
         enforcements: &BTreeSet<String>,
         unsound: &UnsoundOptions,
@@ -92,12 +101,18 @@ impl SymbolBuilder {
         if !data_layout_str.is_empty() {
             self.lowerer.set_target_data(data_layout_str);
         }
-        self.collect_pointer_hints(module)?;
+        self.collect_pointer_hints(module, cone)?;
         let mut symbols = SymbolTable::new(machine_model);
         insert_runtime_symbols(&mut symbols);
 
         for global in module.get_globals() {
             let name = global.get_name().to_string_lossy().into_owned();
+            if cone
+                .as_ref()
+                .is_some_and(|cone| !cone.reachable_globals.contains(&name))
+            {
+                continue;
+            }
             let typ = self
                 .lowerer
                 .lower_any(global.get_value_type())
@@ -124,6 +139,12 @@ impl SymbolBuilder {
         for function in module.get_functions() {
             let name = function.get_name().to_string_lossy().into_owned();
             if name.starts_with("llvm.") {
+                continue;
+            }
+            if cone
+                .as_ref()
+                .is_some_and(|cone| !cone.reachable_functions.contains(&name))
+            {
                 continue;
             }
             if symbols.lookup(name.as_str()).is_some() {
@@ -167,7 +188,13 @@ impl SymbolBuilder {
         let mut instructions =
             InstructionLowerer::new(contracts, &replacement_map, unsound, report);
         for function in module.get_functions() {
-            if function.count_basic_blocks() != 0 {
+            let should_lower = match cone {
+                Some(cone) => cone
+                    .lowered_functions
+                    .contains(function.get_name().to_string_lossy().as_ref()),
+                None => function.count_basic_blocks() != 0,
+            };
+            if should_lower {
                 instructions.lower_function(
                     function,
                     &mut symbols,
@@ -253,14 +280,24 @@ impl SymbolBuilder {
         }
     }
 
-    fn collect_pointer_hints<'ctx>(&mut self, module: &Module<'ctx>) -> Result<()> {
+    fn collect_pointer_hints<'ctx>(
+        &mut self,
+        module: &Module<'ctx>,
+        cone: Option<&ConeOfInfluence>,
+    ) -> Result<()> {
         loop {
             let mut changed = false;
             for function in module.get_functions() {
                 if function.count_basic_blocks() == 0 {
                     continue;
                 }
-                changed |= self.collect_function_pointer_hints(function)?;
+                let name = function.get_name().to_string_lossy();
+                if cone.is_some_and(|cone| !cone.reachable_functions.contains(name.as_ref())) {
+                    continue;
+                }
+                let fail_on_error =
+                    cone.is_none_or(|cone| cone.lowered_functions.contains(name.as_ref()));
+                changed |= self.collect_function_pointer_hints(function, fail_on_error)?;
             }
             // Call edges can refine pointer types across functions, so iterate to a fixed point
             // instead of baking a separate global inference data structure.
@@ -273,11 +310,16 @@ impl SymbolBuilder {
     fn collect_function_pointer_hints<'ctx>(
         &mut self,
         function: FunctionValue<'ctx>,
+        fail_on_error: bool,
     ) -> Result<bool> {
         let mut changed = false;
         for block in function.get_basic_blocks() {
             for instruction in block.get_instructions() {
-                changed |= self.collect_instruction_pointer_hints(function, instruction)?;
+                match self.collect_instruction_pointer_hints(function, instruction) {
+                    Ok(inst_changed) => changed |= inst_changed,
+                    Err(error) if fail_on_error => return Err(error),
+                    Err(_) => {}
+                }
             }
         }
         Ok(changed)
@@ -537,6 +579,241 @@ impl SymbolBuilder {
                 .get_zero_extended_constant()
                 .map(|value| value as usize),
             _ => None,
+        }
+    }
+}
+
+/// Reachable symbol and body sets computed from `--entry` and `--enforce-contract` roots.
+#[derive(Debug)]
+pub(super) struct ConeOfInfluence {
+    /// Functions whose symbol declarations belong in [`SymbolTable`].
+    pub(super) reachable_functions: BTreeSet<String>,
+    /// Defined functions whose LLVM basic blocks are lowered into GOTO bodies.
+    pub(super) lowered_functions: BTreeSet<String>,
+    /// Functions referenced in non-direct-call positions within the cone of influence.
+    pub(super) address_taken_functions: BTreeSet<String>,
+    /// Globals whose declarations and initializers belong in [`SymbolTable`].
+    pub(super) reachable_globals: BTreeSet<String>,
+}
+
+impl ConeOfInfluence {
+    pub(super) fn compute<'ctx>(
+        module: &Module<'ctx>,
+        contracts: &ContractMap,
+        entry: &BTreeSet<String>,
+        replacements: &BTreeSet<String>,
+        enforcements: &BTreeSet<String>,
+    ) -> Result<Self> {
+        let mut functions = BTreeMap::new();
+        for function in module.get_functions() {
+            let name = function.get_name().to_string_lossy().into_owned();
+            functions.insert(name, function);
+        }
+        for name in entry {
+            let is_defined = functions
+                .get(name)
+                .is_some_and(|function| function.count_basic_blocks() != 0);
+            if !is_defined && !enforcements.contains(name) {
+                bail!("entry function `{name}` is not defined");
+            }
+        }
+        let mut globals = BTreeMap::new();
+        for global in module.get_globals() {
+            let name = global.get_name().to_string_lossy().into_owned();
+            globals.insert(name, global);
+        }
+
+        let mut builder = ConeBuilder {
+            functions,
+            globals,
+            contracts,
+            entry,
+            replacements,
+            enforcements,
+            reachable_functions: BTreeSet::new(),
+            lowered_functions: BTreeSet::new(),
+            address_taken_functions: BTreeSet::new(),
+            reachable_globals: BTreeSet::new(),
+            body_worklist: Vec::new(),
+            global_worklist: Vec::new(),
+        };
+        for name in entry.union(enforcements) {
+            builder.mark_function_reachable(name);
+        }
+        while !builder.body_worklist.is_empty() || !builder.global_worklist.is_empty() {
+            while let Some(name) = builder.body_worklist.pop() {
+                if let Some(&function) = builder.functions.get(&name) {
+                    builder.visit_function_body(&name, function);
+                }
+            }
+            while let Some(name) = builder.global_worklist.pop() {
+                if let Some(&global) = builder.globals.get(&name)
+                    && let Some(initializer) = global.get_initializer()
+                {
+                    builder.visit_constant_value(initializer.as_value_ref());
+                }
+            }
+        }
+
+        Ok(Self {
+            reachable_functions: builder.reachable_functions,
+            lowered_functions: builder.lowered_functions,
+            address_taken_functions: builder.address_taken_functions,
+            reachable_globals: builder.reachable_globals,
+        })
+    }
+}
+
+struct ConeBuilder<'a, 'ctx> {
+    functions: BTreeMap<String, FunctionValue<'ctx>>,
+    globals: BTreeMap<String, GlobalValue<'ctx>>,
+    contracts: &'a ContractMap,
+    entry: &'a BTreeSet<String>,
+    replacements: &'a BTreeSet<String>,
+    enforcements: &'a BTreeSet<String>,
+    reachable_functions: BTreeSet<String>,
+    lowered_functions: BTreeSet<String>,
+    address_taken_functions: BTreeSet<String>,
+    reachable_globals: BTreeSet<String>,
+    body_worklist: Vec<String>,
+    global_worklist: Vec<String>,
+}
+
+impl<'ctx> ConeBuilder<'_, 'ctx> {
+    fn should_skip_body(&self, name: &str) -> bool {
+        let is_root = self.entry.contains(name) || self.enforcements.contains(name);
+        let is_replaced_or_modeled = self.replacements.contains(name)
+            || self
+                .contracts
+                .function(name)
+                .is_some_and(|contract| contract.model.is_some());
+        !is_root && !self.address_taken_functions.contains(name) && is_replaced_or_modeled
+    }
+
+    fn mark_function_reachable(&mut self, name: &str) {
+        if name.starts_with("llvm.") {
+            return;
+        }
+        if self.reachable_functions.insert(name.to_owned())
+            && let Some(contract) = self.contracts.function(name)
+        {
+            for helper in contract.helpers() {
+                self.mark_function_reachable(helper);
+            }
+        }
+        if !self.should_skip_body(name)
+            && self
+                .functions
+                .get(name)
+                .is_some_and(|function| function.count_basic_blocks() != 0)
+            && self.lowered_functions.insert(name.to_owned())
+        {
+            self.body_worklist.push(name.to_owned());
+        }
+    }
+
+    fn mark_function_address_taken(&mut self, name: &str) {
+        if name.starts_with("llvm.") {
+            return;
+        }
+        self.address_taken_functions.insert(name.to_owned());
+        self.mark_function_reachable(name);
+    }
+
+    fn mark_global_reachable(&mut self, name: &str) {
+        if self.reachable_globals.insert(name.to_owned()) {
+            self.global_worklist.push(name.to_owned());
+        }
+    }
+
+    fn visit_constant_value(&mut self, mut raw: LLVMValueRef) {
+        if raw.is_null() || unsafe { LLVMIsAConstant(raw) }.is_null() {
+            return;
+        }
+        while unsafe { !LLVMIsAGlobalAlias(raw).is_null() } {
+            raw = unsafe { LLVMAliasGetAliasee(raw) };
+            if raw.is_null() {
+                return;
+            }
+        }
+        if let Some(function) = unsafe { FunctionValue::new(raw) } {
+            let name = function.get_name().to_string_lossy().into_owned();
+            self.mark_function_address_taken(&name);
+            return;
+        }
+        if unsafe { !LLVMIsAGlobalVariable(raw).is_null() } {
+            let global = unsafe { GlobalValue::new(raw) };
+            let name = global.get_name().to_string_lossy().into_owned();
+            self.mark_global_reachable(&name);
+            return;
+        }
+        let operand_count = unsafe { LLVMGetNumOperands(raw) };
+        debug_assert!(operand_count >= 0);
+        for index in 0..operand_count as u32 {
+            self.visit_constant_value(unsafe { LLVMGetOperand(raw, index) });
+        }
+    }
+
+    fn visit_function_body(&mut self, function_name: &str, function: FunctionValue<'ctx>) {
+        for block in function.get_basic_blocks() {
+            for instruction in block.get_instructions() {
+                let opcode = instruction.get_opcode();
+                let raw_inst = instruction.as_value_ref();
+                if matches!(
+                    opcode,
+                    InstructionOpcode::Call | InstructionOpcode::Invoke | InstructionOpcode::CallBr
+                ) {
+                    let raw_callee = unsafe { LLVMGetCalledValue(raw_inst) };
+                    if opcode == InstructionOpcode::Call
+                        && let Some(callee) = unsafe { FunctionValue::new(raw_callee) }
+                    {
+                        let callee_name = callee.get_name().to_string_lossy();
+                        if super::is_metadata_noop_intrinsic(callee_name.as_ref()) {
+                            continue;
+                        }
+                    }
+                    let arg_count = unsafe { LLVMGetNumArgOperands(raw_inst) };
+                    if unsafe { !LLVMIsAInlineAsm(raw_callee).is_null() } {
+                        if self.contracts.has_inline_asm_models()
+                            && let Ok(metadata) = super::asm_manifest::decode_inline_asm(raw_callee)
+                            && !super::asm_manifest::is_elided_barrier(
+                                opcode,
+                                &metadata,
+                                instruction.get_type().is_void_type(),
+                                arg_count,
+                            )
+                        {
+                            let site = InlineAsmSite {
+                                asm: &metadata.asm,
+                                constraints: &metadata.constraints,
+                                dialect: metadata.dialect,
+                                side_effects: metadata.side_effects,
+                                align_stack: metadata.align_stack,
+                                function: function_name,
+                            };
+                            if let Some(mapping) = self.contracts.inline_asm_model(&site) {
+                                self.mark_function_reachable(&mapping.model);
+                            }
+                        }
+                    } else if matches!(opcode, InstructionOpcode::Call | InstructionOpcode::Invoke)
+                        && let Some(callee) = unsafe { FunctionValue::new(raw_callee) }
+                    {
+                        let callee_name = callee.get_name().to_string_lossy().into_owned();
+                        self.mark_function_reachable(&callee_name);
+                    } else {
+                        self.visit_constant_value(raw_callee);
+                    }
+                    for index in 0..arg_count {
+                        self.visit_constant_value(unsafe { LLVMGetOperand(raw_inst, index) });
+                    }
+                } else {
+                    let operand_count = unsafe { LLVMGetNumOperands(raw_inst) };
+                    debug_assert!(operand_count >= 0);
+                    for index in 0..operand_count as u32 {
+                        self.visit_constant_value(unsafe { LLVMGetOperand(raw_inst, index) });
+                    }
+                }
+            }
         }
     }
 }
@@ -1879,5 +2156,198 @@ mod tests {
         assert_eq!(debug.matches("Assert {").count(), 5);
         assert!(debug.contains("Rust panic"));
         assert!(!debug.contains("FunctionCall"));
+    }
+
+    fn build_symbols_with_entry<'ctx>(
+        module: &Module<'ctx>,
+        contracts: &ContractMap,
+        entry: &BTreeSet<String>,
+    ) -> Result<SymbolTable> {
+        let empty = BTreeSet::new();
+        let cone = ConeOfInfluence::compute(module, contracts, entry, &empty, &empty)?;
+        let contracts = contracts.scoped_to(&cone.reachable_functions, &empty, &empty);
+        SymbolBuilder::default().build_reporting(
+            module,
+            crate::util::resolve_machine_model(module, crate::MachineModel::Auto)
+                .expect("failed to resolve machine model"),
+            &contracts,
+            Some(&cone),
+            &empty,
+            &empty,
+            &UnsoundOptions::default(),
+            &mut ReportCollector::default(),
+        )
+    }
+
+    #[test]
+    fn entry_prunes_unreachable_functions_globals_and_unsupported_bodies() {
+        let context = Context::create();
+        let module = parse_module(
+            &context,
+            br#"
+            @used_global = global i32 7
+            @indirect_global = global ptr @used_global
+            @.str.unused = private unnamed_addr constant [4 x i8] c"bad\00"
+            @alloc_unused = private unnamed_addr constant [4 x i8] c"pan\00"
+
+            declare i32 @used_extern(i32)
+            declare i32 @unused_extern(i32)
+
+            define i32 @reachable_leaf() {
+            entry:
+              %ptr = load ptr, ptr @indirect_global
+              %val = load i32, ptr %ptr
+              %res = call i32 @used_extern(i32 %val)
+              ret i32 %res
+            }
+
+            define i32 @main() {
+            entry:
+              %v = call i32 @reachable_leaf()
+              ret i32 %v
+            }
+
+            define void @unreachable_bad() {
+            entry:
+              %p = getelementptr [4 x i8], ptr @.str.unused, i64 0, i64 0
+              %q = getelementptr [4 x i8], ptr @alloc_unused, i64 0, i64 0
+              call void asm sideeffect "ud2", ""()
+              %bad = call i32 @unused_extern(i32 0)
+              ret void
+            }
+        "#,
+        );
+
+        let entry = BTreeSet::from(["main".to_owned()]);
+        let symbols = build_symbols_with_entry(&module, &ContractMap::default(), &entry)
+            .expect("unreachable unsupported body should be skipped");
+
+        assert!(symbols.lookup("main").is_some());
+        assert!(symbols.lookup("reachable_leaf").is_some());
+        assert!(symbols.lookup("used_extern").is_some());
+        assert!(symbols.lookup("used_global").is_some());
+        assert!(symbols.lookup("indirect_global").is_some());
+
+        assert!(symbols.lookup("unreachable_bad").is_none());
+        assert!(symbols.lookup("unused_extern").is_none());
+        assert!(symbols.lookup(".str.unused").is_none());
+        assert!(symbols.lookup("alloc_unused").is_none());
+    }
+
+    #[test]
+    fn entry_bypasses_modeled_and_replaced_callee_bodies_unless_root_or_address_taken() {
+        let context = Context::create();
+        let module = parse_module(
+            &context,
+            br#"
+            @skipped_global = global i32 99
+            @kept_global = global i32 1
+
+            define void @subtree_behind_modeled() {
+            entry:
+              store i32 0, ptr @skipped_global
+              call void asm sideeffect "ud2", ""()
+              ret void
+            }
+
+            define ptr @modeled_callee(ptr %p) {
+            entry:
+              %bad = alloca <vscale x 4 x i32>
+              call void @subtree_behind_modeled()
+              %gep = getelementptr i32, ptr %p, i64 0
+              ret ptr %gep
+            }
+
+            define ptr @model_for_callee(ptr %p) {
+            entry:
+              %gep = getelementptr i32, ptr %p, i64 0
+              ret ptr %gep
+            }
+
+            define i32 @address_taken_modeled(i32 %x) {
+            entry:
+              %g = load i32, ptr @kept_global
+              %sum = add i32 %x, %g
+              ret i32 %sum
+            }
+
+            define i32 @model_for_address_taken(i32 %x) {
+            entry:
+              ret i32 %x
+            }
+
+            define i32 @main(ptr %p) {
+            entry:
+              %r = call ptr @modeled_callee(ptr %p)
+              %fn_ptr = select i1 true, ptr @address_taken_modeled, ptr @address_taken_modeled
+              %Direct = call i32 @address_taken_modeled(i32 5)
+              %Indirect = call i32 %fn_ptr(i32 %Direct)
+              ret i32 %Indirect
+            }
+        "#,
+        );
+
+        let contracts = crate::contracts::parse_contracts(
+            r#"
+            [functions.modeled_callee]
+            model = "model_for_callee"
+
+            [functions.address_taken_modeled]
+            model = "model_for_address_taken"
+
+            [functions.unrelated_contract_target]
+            model = "missing_unrelated_helper"
+        "#,
+        )
+        .expect("contracts should parse");
+
+        let entry = BTreeSet::from(["main".to_owned()]);
+        let symbols = build_symbols_with_entry(&module, &contracts, &entry)
+            .expect("entry translation with model bypass should succeed");
+
+        let modeled = symbols
+            .lookup("modeled_callee")
+            .expect("modeled callee declaration must remain in symbol table");
+        assert!(!modeled.is_extern);
+        assert!(modeled.value.is_none());
+        assert!(
+            symbols
+                .lookup("model_for_callee")
+                .is_some_and(|s| !s.value.is_none())
+        );
+        assert!(symbols.lookup("subtree_behind_modeled").is_none());
+        assert!(symbols.lookup("skipped_global").is_none());
+
+        let addr_taken = symbols
+            .lookup("address_taken_modeled")
+            .expect("address-taken function must be present");
+        assert!(!addr_taken.value.is_none());
+        assert!(symbols.lookup("kept_global").is_some());
+    }
+
+    #[test]
+    fn entry_rejects_undefined_or_missing_entry_function() {
+        let context = Context::create();
+        let module = parse_module(
+            &context,
+            br#"
+            declare void @decl_only()
+            define void @defined_fn() {
+            entry:
+              ret void
+            }
+        "#,
+        );
+
+        for bad_entry in ["missing_fn", "decl_only"] {
+            let entry = BTreeSet::from([bad_entry.to_owned()]);
+            let err = build_symbols_with_entry(&module, &ContractMap::default(), &entry)
+                .expect_err("undefined entry must fail closed");
+            assert!(
+                err.to_string()
+                    .contains(&format!("entry function `{bad_entry}` is not defined")),
+                "{err}"
+            );
+        }
     }
 }

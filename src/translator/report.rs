@@ -236,16 +236,7 @@ fn undefined_functions(
         {
             undefined.remove(target);
         }
-        for helper in [
-            contract.requires.as_deref(),
-            contract.ensures.as_deref(),
-            contract.snapshot.as_deref(),
-            contract.model.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .chain(contract.assigns.iter().flatten().map(String::as_str))
-        {
+        for helper in contract.helpers() {
             if is_unresolved_function(symbols, helper) {
                 undefined.insert(helper.to_owned());
             }

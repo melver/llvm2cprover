@@ -772,3 +772,97 @@ entry:
             .contains("inline-assembly template is not valid UTF-8")
     );
 }
+
+#[test]
+fn entry_scopes_report_and_project_wide_contracts_to_cone_of_influence() {
+    let input = input_file(
+        r#"
+declare i32 @reachable_extern(i32)
+declare i32 @unreachable_extern(i32)
+declare i32 @behind_modeled_extern(i32)
+
+define i32 @modeled_step(i32 %x) {
+entry:
+  %v = call i32 @behind_modeled_extern(i32 %x)
+  call void asm sideeffect "ud2", ""()
+  ret i32 %v
+}
+
+define i32 @model_modeled_step(i32 %x) {
+entry:
+  %v = call i32 @reachable_extern(i32 %x)
+  ret i32 %v
+}
+
+define i32 @harness() {
+entry:
+  %r = call i32 @modeled_step(i32 1)
+  ret i32 %r
+}
+
+define i32 @other_entry() {
+entry:
+  %u = call i32 @unreachable_extern(i32 2)
+  call void asm sideeffect "int3", ""()
+  ret i32 %u
+}
+"#,
+    );
+    let manifest = input.with_extension("toml");
+    let goto = input.with_extension("goto");
+    let report = input.with_extension("report.json");
+    fs::write(
+        &manifest,
+        r#"
+[functions.modeled_step]
+model = "model_modeled_step"
+
+[functions.other_contract_target]
+requires = "missing_other_requires"
+"#,
+    )
+    .expect("failed to write contract manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--entry")
+        .arg("harness")
+        .arg("--contracts")
+        .arg(&manifest)
+        .arg("--report")
+        .arg(&report)
+        .arg("-o")
+        .arg(&goto)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    fs::remove_file(&input).expect("failed to remove test input");
+    fs::remove_file(&manifest).expect("failed to remove contract manifest");
+    let _ = fs::remove_file(&goto);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("missing report"))
+            .expect("report was not valid JSON");
+    fs::remove_file(&report).expect("failed to remove report");
+
+    assert_eq!(
+        report_json["undefined_functions"],
+        serde_json::json!(["reachable_extern"])
+    );
+    assert_eq!(
+        report_json["contracts"],
+        serde_json::json!([
+            {
+                "function": "modeled_step",
+                "reliance": "instrumentation",
+                "model": "model_modeled_step",
+                "discharged": false,
+            }
+        ])
+    );
+}

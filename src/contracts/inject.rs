@@ -65,9 +65,11 @@ pub(crate) fn inject_contracts_with_replacements(
             continue;
         };
         let replaced = replacements.contains(name);
-        let target = symbols.lookup(name);
-        let target_is_variadic = target.is_some_and(|target| target.typ.is_variadic_code());
-        let needs_extern_stub = target.is_some_and(is_undefined_extern);
+        let Some(target) = symbols.lookup(name) else {
+            continue;
+        };
+        let target_is_variadic = target.typ.is_variadic_code();
+        let needs_extern_stub = is_undefined_extern(target);
         if target_is_variadic {
             if replaced {
                 // cprover_bindings cannot attach a native FunctionContract to VariadicCode.

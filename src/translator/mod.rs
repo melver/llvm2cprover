@@ -30,7 +30,7 @@ use inkwell::llvm_sys::LLVMAtomicOrdering;
 use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockParent, LLVMGetCalledValue, LLVMGetFirstUse, LLVMGetInstructionParent,
     LLVMGetNextUse, LLVMGetNumOperands, LLVMGetOperand, LLVMGetOrdering, LLVMGetUser,
-    LLVMIsACallInst, LLVMIsAInvokeInst,
+    LLVMIsACallInst, LLVMIsAInstruction, LLVMIsAInvokeInst,
 };
 use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::memory_buffer::MemoryBuffer;
@@ -163,14 +163,9 @@ impl Translator {
         let module = parse_module(&context, &input, self.config.input_format, &bytes)?;
         reject_module_inline_asm(&module)?;
         let contracts = contracts::load_contracts(&self.config.contracts)?;
-        validate_inline_asm_model_definitions(&module, &contracts)?;
-        validate_assigns_helpers(&module, &contracts)?;
         if self.config.enforce_contract.len() > 1 {
             bail!("exactly one --enforce-contract target may be selected per translation");
         }
-        validate_contract_replacement_uses(&module, &self.config.replace_with_contract)?;
-        validate_contract_enforcement_uses(&module, &self.config.enforce_contract)?;
-        validate_contract_enforcement_runtime(&module, &self.config.enforce_contract)?;
         let resolved_machine_model =
             util::resolve_machine_model_kind(&module, self.config.machine_model)?;
         let machine_model = util::machine_model_for(&module, resolved_machine_model);
@@ -184,6 +179,39 @@ impl Translator {
             }
             rename::rename_module_symbols(&module, &machine_model, prefix)?;
         }
+        let cone = (!self.config.entry.is_empty())
+            .then(|| {
+                symbols::ConeOfInfluence::compute(
+                    &module,
+                    &contracts,
+                    &self.config.entry,
+                    &self.config.replace_with_contract,
+                    &self.config.enforce_contract,
+                )
+            })
+            .transpose()?;
+        let contracts = if let Some(cone) = &cone {
+            contracts.scoped_to(
+                &cone.reachable_functions,
+                &self.config.replace_with_contract,
+                &self.config.enforce_contract,
+            )
+        } else {
+            contracts
+        };
+        validate_inline_asm_model_definitions(&module, &contracts)?;
+        validate_assigns_helpers(&module, &contracts)?;
+        validate_contract_replacement_uses(
+            &module,
+            &self.config.replace_with_contract,
+            cone.as_ref(),
+        )?;
+        validate_contract_enforcement_uses(&module, &self.config.enforce_contract, cone.as_ref())?;
+        validate_contract_enforcement_runtime(
+            &module,
+            &self.config.enforce_contract,
+            cone.as_ref(),
+        )?;
         let output = util::output_path(&input, self.config.output.as_deref());
         if self.config.report.as_deref() == Some(output.as_path()) {
             bail!("--report must not overwrite the GOTO output");
@@ -193,6 +221,7 @@ impl Translator {
             &module,
             machine_model,
             &contracts,
+            cone.as_ref(),
             &self.config.replace_with_contract,
             &self.config.enforce_contract,
             &self.config.unsound,
@@ -361,14 +390,19 @@ fn is_local_alloca_derived(value: BasicValueEnum<'_>) -> bool {
 fn validate_contract_enforcement_runtime(
     module: &Module<'_>,
     enforcements: &BTreeSet<String>,
+    cone: Option<&symbols::ConeOfInfluence>,
 ) -> Result<()> {
     if enforcements.is_empty() {
         return Ok(());
     }
-    if let Some(free) = module.get_function("free")
-        && (free.count_basic_blocks() != 0
-            || unsafe { !LLVMGetFirstUse(free.as_value_ref()).is_null() })
-    {
+    let free_used = match cone {
+        Some(cone) => cone.reachable_functions.contains("free"),
+        None => module.get_function("free").is_some_and(|free| {
+            free.count_basic_blocks() != 0
+                || unsafe { !LLVMGetFirstUse(free.as_value_ref()).is_null() }
+        }),
+    };
+    if free_used {
         bail!(
             "contract enforcement currently cannot be combined with input uses or definitions of `free`"
         );
@@ -379,6 +413,7 @@ fn validate_contract_enforcement_runtime(
 fn validate_contract_enforcement_uses(
     module: &Module<'_>,
     enforcements: &BTreeSet<String>,
+    cone: Option<&symbols::ConeOfInfluence>,
 ) -> Result<()> {
     for name in enforcements {
         let Some(function) = module.get_function(name) else {
@@ -387,6 +422,8 @@ fn validate_contract_enforcement_uses(
         // Direct self-recursion is the degenerate call cycle, so the cycle walk below reports it.
         for_each_direct_call_use(
             function.as_value_ref(),
+            name,
+            cone,
             || format!("contract enforcement for `{name}` does not support invoke uses"),
             || {
                 format!(
@@ -395,12 +432,16 @@ fn validate_contract_enforcement_uses(
             },
             |_| Ok(()),
         )?;
-        validate_contract_enforcement_call_cycle(function.as_value_ref(), name)?;
+        validate_contract_enforcement_call_cycle(function.as_value_ref(), name, cone)?;
     }
     Ok(())
 }
 
-fn validate_contract_enforcement_call_cycle(target: LLVMValueRef, name: &str) -> Result<()> {
+fn validate_contract_enforcement_call_cycle(
+    target: LLVMValueRef,
+    name: &str,
+    cone: Option<&symbols::ConeOfInfluence>,
+) -> Result<()> {
     let mut visited = BTreeSet::from([target as usize]);
     let mut pending = vec![target];
     while let Some(callee) = pending.pop() {
@@ -409,6 +450,16 @@ fn validate_contract_enforcement_call_cycle(target: LLVMValueRef, name: &str) ->
             let user = unsafe { LLVMGetUser(usage) };
             if is_direct_call_to(user, callee) {
                 let caller = unsafe { LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) };
+                if cone.is_some_and(|cone| {
+                    unsafe { FunctionValue::new(caller) }.is_none_or(|function| {
+                        !cone
+                            .lowered_functions
+                            .contains(function.get_name().to_string_lossy().as_ref())
+                    })
+                }) {
+                    usage = unsafe { LLVMGetNextUse(usage) };
+                    continue;
+                }
                 if caller == target {
                     bail!(
                         "contract enforcement for `{name}` does not support recursive call cycles"
@@ -445,6 +496,7 @@ fn validate_inline_asm_model_definitions(
 fn validate_contract_replacement_uses(
     module: &Module<'_>,
     replacements: &BTreeSet<String>,
+    cone: Option<&symbols::ConeOfInfluence>,
 ) -> Result<()> {
     for name in replacements {
         let Some(function) = module.get_function(name) else {
@@ -452,6 +504,8 @@ fn validate_contract_replacement_uses(
         };
         for_each_direct_call_use(
             function.as_value_ref(),
+            name,
+            cone,
             || invoke_replacement_message(name),
             || {
                 format!(
@@ -482,13 +536,28 @@ fn is_direct_call_to(user: LLVMValueRef, callee: LLVMValueRef) -> bool {
 /// the extra per-use check they apply.
 fn for_each_direct_call_use(
     function: LLVMValueRef,
+    name: &str,
+    cone: Option<&symbols::ConeOfInfluence>,
     invoke_message: impl Fn() -> String,
     indirect_message: impl Fn() -> String,
     mut visit: impl FnMut(LLVMValueRef) -> Result<()>,
 ) -> Result<()> {
+    if cone.is_some_and(|cone| cone.address_taken_functions.contains(name)) {
+        bail!("{}", indirect_message());
+    }
     let mut usage = unsafe { LLVMGetFirstUse(function) };
     while !usage.is_null() {
         let user = unsafe { LLVMGetUser(usage) };
+        if let Some(cone) = cone {
+            let Some(caller) = enclosing_function_name(user) else {
+                usage = unsafe { LLVMGetNextUse(usage) };
+                continue;
+            };
+            if !cone.lowered_functions.contains(&caller) {
+                usage = unsafe { LLVMGetNextUse(usage) };
+                continue;
+            }
+        }
         if unsafe { !LLVMIsAInvokeInst(user).is_null() } {
             bail!("{}", invoke_message());
         }
@@ -499,6 +568,18 @@ fn for_each_direct_call_use(
         usage = unsafe { LLVMGetNextUse(usage) };
     }
     Ok(())
+}
+
+fn enclosing_function_name(user: LLVMValueRef) -> Option<String> {
+    if unsafe { LLVMIsAInstruction(user) }.is_null() {
+        return None;
+    }
+    let block = unsafe { LLVMGetInstructionParent(user) };
+    if block.is_null() {
+        return None;
+    }
+    let function = unsafe { FunctionValue::new(LLVMGetBasicBlockParent(block)) }?;
+    Some(function.get_name().to_string_lossy().into_owned())
 }
 
 /// How many operands of `user` refer to `value`.

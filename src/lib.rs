@@ -116,6 +116,10 @@ impl UnsoundOptions {
 pub struct Config {
     /// Output `.goto` path. Defaults to `<input>.goto` or `a.goto` for stdin.
     pub output: Option<PathBuf>,
+    /// Entry-point functions used to restrict lowering to the reachable cone of influence.
+    ///
+    /// When empty (the default), every defined function and global in the module is lowered.
+    pub entry: BTreeSet<String>,
     /// TOML contract and inline-assembly model manifests loaded alongside the module.
     pub contracts: Vec<PathBuf>,
     /// Functions whose direct calls are replaced by their manifest contracts.
