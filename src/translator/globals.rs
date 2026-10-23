@@ -267,7 +267,7 @@ impl GlobalLowerer {
             return Ok(typ.zero());
         }
 
-        if let Some(expr) = self.lower_symbol_address(value, typ, lowerer, location)? {
+        if let Some(expr) = self.lower_symbol_address(value, typ, lowerer, symbols, location)? {
             return Ok(expr);
         }
 
@@ -397,6 +397,7 @@ impl GlobalLowerer {
         value: PointerValue<'ctx>,
         typ: &Type,
         lowerer: &mut TypeLowerer,
+        symbols: &SymbolTable,
         location: &Location,
     ) -> std::result::Result<Option<Expr>, Diagnostic> {
         let mut raw = value.as_value_ref();
@@ -406,32 +407,45 @@ impl GlobalLowerer {
             raw = unsafe { LLVMAliasGetAliasee(raw) };
         }
 
-        if let Some(function) = unsafe { FunctionValue::new(raw) } {
-            let name = function.get_name().to_string_lossy().into_owned();
-            let code = lowerer.lower_function(function.get_type())?;
-            return Ok(Some(
-                Expr::symbol_expression(name, code)
-                    .with_location(*location)
-                    .address_of()
-                    .with_location(*location)
-                    .cast_to(typ.clone()),
-            ));
-        }
+        let symbol_expr = if let Some(function) = unsafe { FunctionValue::new(raw) } {
+            let name = function.get_name().to_string_lossy();
+            // Reuse the canonical symbol table entry so the `Symbol` expression inside
+            // `address_of(fn)` carries the exact pointer-hinted `Type::Code` that CBMC's
+            // `remove_function_pointers` and `pointer_logict` expect.
+            if let Some(symbol) = symbols.lookup(name.as_ref()) {
+                symbol.to_expr()
+            } else {
+                let code = lowerer.lower_function(function.get_type())?;
+                Expr::symbol_expression(name.into_owned(), code)
+            }
+        } else if unsafe { !LLVMIsAGlobalVariable(raw).is_null() } {
+            self.global_symbol_expr(unsafe { GlobalValue::new(raw) }, lowerer, symbols)?
+        } else {
+            return Ok(None);
+        };
 
-        if unsafe { !LLVMIsAGlobalVariable(raw).is_null() } {
-            let global = unsafe { GlobalValue::new(raw) };
-            let name = global.get_name().to_string_lossy().into_owned();
+        Ok(Some(
+            symbol_expr
+                .with_location(*location)
+                .address_of()
+                .with_location(*location)
+                .cast_to(typ.clone()),
+        ))
+    }
+
+    fn global_symbol_expr<'ctx>(
+        &self,
+        global: GlobalValue<'ctx>,
+        lowerer: &mut TypeLowerer,
+        symbols: &SymbolTable,
+    ) -> std::result::Result<Expr, Diagnostic> {
+        let name = global.get_name().to_string_lossy();
+        if let Some(symbol) = symbols.lookup(name.as_ref()) {
+            Ok(symbol.to_expr())
+        } else {
             let object_type = lowerer.lower_any(global.get_value_type())?;
-            return Ok(Some(
-                Expr::symbol_expression(name, object_type)
-                    .with_location(*location)
-                    .address_of()
-                    .with_location(*location)
-                    .cast_to(typ.clone()),
-            ));
+            Ok(Expr::symbol_expression(name.into_owned(), object_type))
         }
-
-        Ok(None)
     }
 
     fn lower_const_pointer_expr<'ctx>(
@@ -487,7 +501,7 @@ impl GlobalLowerer {
         let (base, indexes) = operands
             .split_first()
             .ok_or_else(|| self.unsupported(symbol, "malformed constant GEP initializer"))?;
-        let mut current = self.lower_gep_root(symbol, *base, lowerer, location)?;
+        let mut current = self.lower_gep_root(symbol, *base, lowerer, symbols, location)?;
 
         // With opaque pointers, byte-granularity GEPs use `i8` as the source element type
         // and a single index that is a raw byte offset.  Typed GEPs (struct field navigation)
@@ -565,11 +579,12 @@ impl GlobalLowerer {
         symbol: &str,
         base: BasicValueEnum<'ctx>,
         lowerer: &mut TypeLowerer,
+        symbols: &SymbolTable,
         location: &Location,
     ) -> std::result::Result<Expr, Diagnostic> {
         match base {
             BasicValueEnum::PointerValue(base) => {
-                self.lower_gep_root_pointer(symbol, base, lowerer, location)
+                self.lower_gep_root_pointer(symbol, base, lowerer, symbols, location)
             }
             _ => Err(self.unsupported(symbol, "unsupported constant GEP base")),
         }
@@ -580,15 +595,16 @@ impl GlobalLowerer {
         symbol: &str,
         value: PointerValue<'ctx>,
         lowerer: &mut TypeLowerer,
+        symbols: &SymbolTable,
         location: &Location,
     ) -> std::result::Result<Expr, Diagnostic> {
         let raw = value.as_value_ref();
 
         if unsafe { !LLVMIsAGlobalVariable(raw).is_null() } {
             let global = unsafe { GlobalValue::new(raw) };
-            let name = global.get_name().to_string_lossy().into_owned();
-            let object_type = lowerer.lower_any(global.get_value_type())?;
-            return Ok(Expr::symbol_expression(name, object_type).with_location(*location));
+            return Ok(self
+                .global_symbol_expr(global, lowerer, symbols)?
+                .with_location(*location));
         }
 
         if is_constant_expr(value.as_value_ref()) {
@@ -598,7 +614,7 @@ impl GlobalLowerer {
                         self.value_operands(raw).into_iter().next().ok_or_else(|| {
                             self.unsupported(symbol, "malformed constant GEP base")
                         })?;
-                    return self.lower_gep_root(symbol, operand, lowerer, location);
+                    return self.lower_gep_root(symbol, operand, lowerer, symbols, location);
                 }
                 _ => {}
             }

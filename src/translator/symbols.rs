@@ -118,21 +118,9 @@ impl SymbolBuilder {
                 .lower_any(global.get_value_type())
                 .map_err(|diag| diag.with_symbol(name.clone()))?;
             self.insert_pending_aggregate_symbols(&mut symbols);
-            let mut symbol =
-                Symbol::static_variable(name.clone(), name.clone(), typ, Location::none())
-                    .with_is_extern(global.is_declaration());
+            let mut symbol = Symbol::static_variable(name.clone(), name, typ, Location::none())
+                .with_is_extern(global.is_declaration());
             symbol.set_is_static_const(global.is_constant());
-            if let Some(initializer) = global.get_initializer() {
-                let expr = self.globals.lower_initializer(
-                    &name,
-                    initializer,
-                    &symbol.typ,
-                    &mut self.lowerer,
-                    &symbols,
-                    &Location::none(),
-                )?;
-                symbol.update(SymbolValues::Expr(expr));
-            }
             symbols.insert(symbol);
         }
 
@@ -174,7 +162,35 @@ impl SymbolBuilder {
             symbols.insert(symbol);
         }
 
-        self.insert_pending_aggregate_symbols(&mut symbols);
+        // Lower global initializers after all global and function symbols are registered so
+        // symbol-address initializers (such as function-pointer tables) reuse the exact lowered
+        // symbol types from `SymbolTable`.
+        for global in module.get_globals() {
+            let Some(initializer) = global.get_initializer() else {
+                continue;
+            };
+            let name = global.get_name().to_string_lossy();
+            if cone.is_some_and(|cone| !cone.reachable_globals.contains(name.as_ref())) {
+                continue;
+            }
+            let typ = symbols
+                .lookup(name.as_ref())
+                .expect("declared reachable global")
+                .typ
+                .clone();
+            let expr = self.globals.lower_initializer(
+                name.as_ref(),
+                initializer,
+                &typ,
+                &mut self.lowerer,
+                &symbols,
+                &Location::none(),
+            )?;
+            self.insert_pending_aggregate_symbols(&mut symbols);
+            if let Some(symbol) = symbols.lookup_mut(name.as_ref()) {
+                symbol.update(SymbolValues::Expr(expr));
+            }
+        }
 
         crate::contracts::inject::validate_contracts(&symbols, contracts)?;
         let replacement_map =
@@ -1163,12 +1179,27 @@ mod tests {
     fn lowers_pointer_initializer_to_function_symbol() {
         let symbols = build_symbols_from_ir(
             br#"
-            declare void @f()
             @fp = global ptr @f
+
+            define void @f(ptr %p) {
+            entry:
+              store i64 0, ptr %p, align 8
+              ret void
+            }
         "#,
         );
 
-        assert!(format!("{:?}", expr_value(&symbols, "fp")).contains("f"));
+        use cprover_bindings::goto_program::ExprValue;
+
+        let f_type = &symbols.lookup("f").expect("function symbol f").typ;
+        let fp_init = expr_value(&symbols, "fp");
+        let ExprValue::Typecast(address) = fp_init.value() else {
+            panic!("expected typecast around function address, got {fp_init:?}");
+        };
+        let ExprValue::AddressOf(target) = address.value() else {
+            panic!("expected address_of function symbol, got {address:?}");
+        };
+        assert_eq!(target.typ(), f_type);
     }
 
     #[test]
