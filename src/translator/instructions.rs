@@ -32,13 +32,14 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
     LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands, LLVMGetNumClauses,
-    LLVMGetNumMaskElements, LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetSuccessor,
-    LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
+    LLVMGetNumMaskElements, LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetOperand,
+    LLVMGetSuccessor, LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantExpr,
+    LLVMIsAGlobalVariable, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
 };
 use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
-    AnyValue, AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue,
+    AnyValue, AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue, GlobalValue,
     InstructionOpcode, InstructionValue, PhiValue,
 };
 use num::bigint::BigInt;
@@ -2000,7 +2001,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .cloned()
                 .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing assert argument"))?
                 .cast_to(Type::bool());
-            body.push(Stmt::assert(cond, "assert", "__CPROVER_assert", loc));
+            // Preserve the user's description so CBMC property reports stay meaningful; fall
+            // back to the callee name when the message is not a constant string literal.
+            let message = self
+                .constant_string_operand(instruction, 1)
+                .unwrap_or_else(|| callee_name.to_owned());
+            body.push(Stmt::assert(cond, "assert", &message, loc));
             return Ok(true);
         }
 
@@ -3645,6 +3651,32 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .with_location(self.instruction_location(instruction))
                 .into()
             })
+    }
+
+    /// Resolve an operand that points at a constant NUL-terminated string global, such as the
+    /// message of `__CPROVER_assert`. Returns `None` for non-literal (runtime) pointers.
+    fn constant_string_operand(
+        &self,
+        instruction: InstructionValue<'ctx>,
+        index: u32,
+    ) -> Option<String> {
+        let mut raw = instruction.get_operand(index)?.value()?.as_value_ref();
+        // Clang spells string arguments as `@.str` or `getelementptr (@.str, 0, 0)`; peel
+        // constant expressions down to the underlying global.
+        while unsafe { !LLVMIsAConstantExpr(raw).is_null() } {
+            raw = unsafe { LLVMGetOperand(raw, 0) };
+        }
+        if unsafe { LLVMIsAGlobalVariable(raw).is_null() } {
+            return None;
+        }
+        let BasicValueEnum::ArrayValue(array) =
+            unsafe { GlobalValue::new(raw) }.get_initializer()?
+        else {
+            return None;
+        };
+        let bytes = array.as_const_string()?;
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
     }
 
     fn operand_block(
