@@ -427,18 +427,23 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let rhs = self.lower_operand(instruction, 1)?;
         let result = self.declare_instruction_result(instruction)?;
         let target = result.typ().clone();
+        // `i1` lowers to `c_bool`, on which CBMC silently ignores arithmetic operators. Compute in
+        // a 1-bit unsigned type instead so results wrap mod 2 and division by zero stays checked.
+        let arith = if target.is_c_bool() {
+            Type::unsigned_int(1_u32)
+        } else {
+            target.clone()
+        };
         let value = match instruction.get_opcode() {
-            InstructionOpcode::Add => lhs
-                .cast_to(target.clone())
-                .plus(rhs.cast_to(target.clone())),
-            InstructionOpcode::Sub => lhs.cast_to(target.clone()).sub(rhs.cast_to(target.clone())),
-            InstructionOpcode::Mul => lhs.cast_to(target.clone()).mul(rhs.cast_to(target.clone())),
-            InstructionOpcode::UDiv => lhs.cast_to(target.clone()).div(rhs.cast_to(target.clone())),
+            InstructionOpcode::Add => lhs.cast_to(arith.clone()).plus(rhs.cast_to(arith)),
+            InstructionOpcode::Sub => lhs.cast_to(arith.clone()).sub(rhs.cast_to(arith)),
+            InstructionOpcode::Mul => lhs.cast_to(arith.clone()).mul(rhs.cast_to(arith)),
+            InstructionOpcode::UDiv => lhs.cast_to(arith.clone()).div(rhs.cast_to(arith)),
             InstructionOpcode::SDiv => self
                 .signed_view(lhs)?
                 .div(self.signed_view(rhs)?)
                 .cast_to(target.clone()),
-            InstructionOpcode::URem => lhs.cast_to(target.clone()).rem(rhs.cast_to(target.clone())),
+            InstructionOpcode::URem => lhs.cast_to(arith.clone()).rem(rhs.cast_to(arith)),
             InstructionOpcode::SRem => self
                 .signed_view(lhs)?
                 .rem(self.signed_view(rhs)?)
@@ -460,11 +465,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .cast_to(target.clone())
                 .bitxor(rhs.cast_to(target.clone())),
             InstructionOpcode::Shl | InstructionOpcode::LShr | InstructionOpcode::AShr => {
-                self.lower_shift_value(instruction.get_opcode(), lhs, rhs, target)?
+                self.lower_shift_value(instruction.get_opcode(), lhs, rhs, target.clone())?
             }
             _ => unreachable!("binary opcode dispatched incorrectly"),
         };
-        body.push(Stmt::assign(result, value, loc));
+        body.push(Stmt::assign(result, value.cast_to(target), loc));
         Ok(())
     }
 
