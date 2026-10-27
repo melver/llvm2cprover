@@ -300,13 +300,33 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     }
 
     fn declare_parameters(&mut self) -> Result<()> {
+        let loc = self.function_location();
         for (index, param) in self.function.get_params().into_iter().enumerate() {
-            let typ = self.types.lower_parameter(param)?;
+            let byval_type = self
+                .types
+                .lower_param_byval(self.function, index as u32)
+                .map_err(|diag| diag.with_symbol(self.function_name.clone()))?;
+            let typ = match &byval_type {
+                Some(pointee) => pointee.clone().to_pointer(),
+                None => self.types.lower_parameter(param)?,
+            };
             self.insert_pending_aggregate_symbols();
             let base =
                 self.value_base_name(index, "arg", param.get_name().to_string_lossy().as_ref());
-            let expr = self.insert_local_symbol(&base, typ, true, false, self.function_location());
-            self.values.insert(param.as_value_ref() as usize, expr);
+            let expr = self.insert_local_symbol(&base, typ, true, false, loc);
+            if let Some(byval_type) = byval_type {
+                // LLVM `byval(T)` passes a callee-owned copy of `*param` while keeping the formal
+                // parameter pointer in the function signature.
+                let copy = self.declare_hidden_local("byval", byval_type, loc);
+                self.prologue
+                    .push(Stmt::assign(copy.clone(), expr.dereference(), loc));
+                self.values.insert(
+                    param.as_value_ref() as usize,
+                    copy.address_of().with_location(loc),
+                );
+            } else {
+                self.values.insert(param.as_value_ref() as usize, expr);
+            }
         }
         Ok(())
     }

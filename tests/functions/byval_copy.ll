@@ -2,7 +2,6 @@
 ; description = "byval parameters are callee-owned copies; writes must not reach the caller's object"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
-; todo = "byval attribute ignored: callee mutates the caller's object through the raw pointer"
 ; ---
 ;
 ; LLVM LangRef: "The byval argument attribute ... indicates that the pointer

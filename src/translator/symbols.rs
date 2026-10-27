@@ -240,7 +240,10 @@ impl SymbolBuilder {
         }
         let mut parameters = Vec::with_capacity(function.count_params() as usize);
         for (index, param) in function.get_params().into_iter().enumerate() {
-            let typ = self.lowerer.lower_parameter(param)?;
+            let typ = match self.lowerer.lower_param_byval(function, index as u32)? {
+                Some(pointee) => pointee.to_pointer(),
+                None => self.lowerer.lower_parameter(param)?,
+            };
             let llvm_name = param.get_name().to_string_lossy();
             let base = if llvm_name.is_empty() {
                 format!("arg{index}")
@@ -2408,5 +2411,32 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn lowers_byval_parameter_to_prologue_copy() {
+        let symbols = build_symbols_from_ir(
+            br#"
+            %struct.S = type { i8, i64 }
+
+            define void @callee(ptr byval(%struct.S) %p) {
+            entry:
+              store i8 0, ptr %p, align 8
+              ret void
+            }
+        "#,
+        );
+
+        let struct_type = Type::struct_tag("struct.S");
+        assert_eq!(
+            symbols.lookup("callee::p").expect("formal param").typ,
+            struct_type.clone().to_pointer()
+        );
+        assert_eq!(
+            symbols.lookup("callee::byval0").expect("byval local").typ,
+            struct_type
+        );
+        let debug = stmt_debug(&symbols, "callee");
+        assert!(debug.contains("callee::byval0"));
     }
 }

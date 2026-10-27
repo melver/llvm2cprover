@@ -17,6 +17,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use cprover_bindings::goto_program::{DatatypeComponent, Symbol, Type};
+use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::targets::TargetData;
 use inkwell::types::{AnyType, AnyTypeEnum, AsTypeRef, BasicTypeEnum, FunctionType, StructType};
 use inkwell::values::{AsValueRef, BasicValueEnum, FunctionValue, InstructionValue};
@@ -121,6 +122,20 @@ impl TypeLowerer {
         value: BasicValueEnum<'ctx>,
     ) -> std::result::Result<Type, Diagnostic> {
         self.lower_value(value)
+    }
+
+    /// Lower the `byval(T)` pointee type for parameter `index` of `function`, if present.
+    pub fn lower_param_byval<'ctx>(
+        &mut self,
+        function: FunctionValue<'ctx>,
+        index: u32,
+    ) -> std::result::Result<Option<Type>, Diagnostic> {
+        let kind = Attribute::get_named_enum_kind_id("byval");
+        function
+            .get_enum_attribute(AttributeLoc::Param(index), kind)
+            .filter(|attr| attr.is_type())
+            .map(|attr| self.lower_any(attr.get_type_value()))
+            .transpose()
     }
 
     /// Lower a function return type, using recovered pointee information for opaque pointers.
