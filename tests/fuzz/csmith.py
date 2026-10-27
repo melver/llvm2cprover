@@ -103,13 +103,19 @@ def inject(seed: int, cfg: Config, d: Path) -> Outcome | None:
     Idempotent, so `check` re-derives the checksum from a reduced program rather
     than trusting a stale constant.
     """
-    clang = run(["clang", "-O0", "-w", "-DFUZZ_NATIVE", *INCLUDES, "t.c", "-o", "native"], d)
+    # Csmith guards arithmetic UB itself, but not `--builtins` misuse such as __builtin_ctz(0);
+    # the sanitizer turns such seeds into invalid ones instead of bogus `semantic` failures.
+    clang = run(["clang", "-O0", "-w", "-DFUZZ_NATIVE", "-fsanitize=builtin",
+                 "-fno-sanitize-recover=builtin", *INCLUDES, "t.c", "-o", "native"], d)
     if clang.returncode:
         return Outcome(seed, "invalid-seed", detail=f"clang native: {last_line(clang.stderr)}")
     try:
         native = run(["./native"], d, timeout=cfg.native_timeout)
     except subprocess.TimeoutExpired:
         return Outcome(seed, "invalid-seed", opt="nat", detail="native timeout")
+    ub = re.search(r"runtime error: (.*)", native.stderr)
+    if ub:
+        return Outcome(seed, "invalid-seed", opt="nat", detail=f"native UB: {ub[1]}")
     match = re.search(r"checksum = ([0-9A-F]+)", native.stdout)
     if match is None:
         return Outcome(seed, "invalid-seed", detail=f"native exit {native.returncode}, no checksum")
