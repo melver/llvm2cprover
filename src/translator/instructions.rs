@@ -2170,9 +2170,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         if callee_name.starts_with("llvm.cttz") {
-            let value = self
-                .scalar_int_operand(callee_name, args)?
-                .cttz(self.intrinsic_allow_zero(callee_name, args, "cttz")?);
+            let value = self.lower_count_zeros(callee_name, args, false)?;
             self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
@@ -2445,9 +2443,36 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .is_some_and(|len| len == 0.into())
     }
 
-    fn intrinsic_allow_zero(&self, callee_name: &str, args: &[Expr], kind: &str) -> Result<bool> {
+    /// `llvm.cttz` (`leading == false`) or `llvm.ctlz`.
+    ///
+    /// The `i1` flag is LLVM's `is_zero_poison`. When set, a zero input yields poison, which is
+    /// modelled as nondet like other poison sources; an assertion would misfire on the common
+    /// `x == 0 ? width : cttz(x, true)` pattern. Otherwise a zero input yields the bit width,
+    /// which is CBMC's result when zero is permitted.
+    fn lower_count_zeros(&self, callee_name: &str, args: &[Expr], leading: bool) -> Result<Expr> {
+        let value = self.scalar_int_operand(callee_name, args)?;
+        // `i1` lowers to 8-bit `c_bool`; count over a 1-bit bitvector so the width is 1.
+        let value = if value.typ().is_c_bool() {
+            value.cast_to(Type::unsigned_int(1_u32))
+        } else {
+            value
+        };
+        let is_zero = value.clone().eq(value.typ().zero());
+        let count = if leading {
+            value.ctlz(true)
+        } else {
+            value.cttz(true)
+        };
+        Ok(if self.intrinsic_zero_is_poison(callee_name, args)? {
+            is_zero.ternary(util::nondet_expr(count.typ().clone()), count)
+        } else {
+            count
+        })
+    }
+
+    fn intrinsic_zero_is_poison(&self, callee_name: &str, args: &[Expr]) -> Result<bool> {
         let flag = args.get(1).ok_or_else(|| {
-            self.unsupported_intrinsic(callee_name, format!("missing {kind} zero flag"))
+            self.unsupported_intrinsic(callee_name, "missing zero-is-poison flag")
         })?;
         if let Some(flag) = flag.int_constant_value() {
             return Ok(flag != 0.into());
@@ -2456,7 +2481,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             cprover_bindings::goto_program::ExprValue::BoolConstant(value)
             | cprover_bindings::goto_program::ExprValue::CBoolConstant(value) => Ok(*value),
             _ => Err(self
-                .unsupported_intrinsic(callee_name, format!("non-constant {kind} zero flag"))
+                .unsupported_intrinsic(callee_name, "non-constant zero-is-poison flag")
                 .into()),
         }
     }
