@@ -2,15 +2,11 @@
 ; description = "llvm.vector.reduce.* horizontal reductions over fixed-width integer vectors"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
-; todo = "llvm.vector.reduce.{and,or,xor,add,mul,umin,umax,smin,smax} are unsupported intrinsics"
 ; ---
 ;
 ; The SLP vectorizer at -O2 turns Csmith's `g[0] & g[1] & g[2] & g[3]` over a
-; 4-element global into `llvm.vector.reduce.and.v4i32` (seed 414). The whole
-; family is a lane fold with a fixed operator and is absent from the
-; intrinsic dispatcher, so translation fails closed. Vector element types
-; are already supported (see vector_minmax.ll), so the fix is a generic
-; left-fold over extracted lanes.
+; 4-element global into `llvm.vector.reduce.and.v4i32` (seed 414). Each
+; integer reduction lowers as a left fold over the extracted lanes.
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-pc-linux-gnu"

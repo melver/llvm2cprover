@@ -828,23 +828,28 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .map(|lane| {
                 let lhs_lane = self.aggregate_component(lhs.clone(), lane as usize)?;
                 let rhs_lane = self.aggregate_component(rhs.clone(), lane as usize)?;
-                let cmp = if is_signed {
-                    let lhs_cmp = self.signed_view(lhs_lane.clone())?;
-                    let rhs_cmp = self.signed_view(rhs_lane.clone())?;
-                    if is_min {
-                        lhs_cmp.lt(rhs_cmp)
-                    } else {
-                        lhs_cmp.gt(rhs_cmp)
-                    }
-                } else if is_min {
-                    lhs_lane.clone().lt(rhs_lane.clone())
-                } else {
-                    lhs_lane.clone().gt(rhs_lane.clone())
-                };
-                Ok(cmp.ternary(lhs_lane, rhs_lane))
+                self.minmax_value(is_signed, is_min, lhs_lane, rhs_lane)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Expr::vector_expr(result_type, elems))
+    }
+
+    /// Integer `min`/`max` of two scalars, as `llvm.{s,u}{min,max}` define it.
+    fn minmax_value(&self, is_signed: bool, is_min: bool, lhs: Expr, rhs: Expr) -> Result<Expr> {
+        let cmp = if is_signed {
+            let lhs_cmp = self.signed_view(lhs.clone())?;
+            let rhs_cmp = self.signed_view(rhs.clone())?;
+            if is_min {
+                lhs_cmp.lt(rhs_cmp)
+            } else {
+                lhs_cmp.gt(rhs_cmp)
+            }
+        } else if is_min {
+            lhs.clone().lt(rhs.clone())
+        } else {
+            lhs.clone().gt(rhs.clone())
+        };
+        Ok(cmp.ternary(lhs, rhs))
     }
 
     fn lower_fcmp(
@@ -2170,6 +2175,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.vector.reduce.") {
+            self.lower_vector_reduce_intrinsic(callee_name, instruction, args, body)?;
+            return Ok(true);
+        }
+
         if callee_name.starts_with("llvm.uadd.sat")
             || callee_name.starts_with("llvm.usub.sat")
             || callee_name.starts_with("llvm.sadd.sat")
@@ -2538,22 +2548,67 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         let is_signed = callee_name.starts_with("llvm.s");
         let is_min = callee_name.starts_with("llvm.umin") || callee_name.starts_with("llvm.smin");
-        let cmp = if is_signed {
-            let lhs_cmp = self.signed_view(lhs.clone())?;
-            let rhs_cmp = self.signed_view(rhs.clone())?;
-            if is_min {
-                lhs_cmp.lt(rhs_cmp)
-            } else {
-                lhs_cmp.gt(rhs_cmp)
-            }
-        } else if is_min {
-            lhs.clone().lt(rhs.clone())
-        } else {
-            lhs.clone().gt(rhs.clone())
-        };
+        let value = self.minmax_value(is_signed, is_min, lhs, rhs)?;
+        self.assign_result(instruction, body, value)
+    }
 
-        self.assign_result(instruction, body, cmp.ternary(lhs, rhs))?;
-        Ok(())
+    /// `llvm.vector.reduce.<op>` over integer lanes: a left fold with the scalar operator. Integer
+    /// `add`/`mul` wrap like their scalar LLVM counterparts, so the fold order is unobservable. The
+    /// accumulator is a hidden local so `min`/`max` steps stay linear in size instead of
+    /// duplicating the running value into both ternary arms.
+    fn lower_vector_reduce_intrinsic(
+        &mut self,
+        callee_name: &str,
+        instruction: InstructionValue<'ctx>,
+        args: &[Expr],
+        body: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let op = callee_name
+            .strip_prefix("llvm.vector.reduce.")
+            .and_then(|rest| rest.split('.').next())
+            .unwrap_or_default();
+        if !matches!(
+            op,
+            "add" | "mul" | "and" | "or" | "xor" | "smin" | "smax" | "umin" | "umax"
+        ) {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "unsupported vector reduction")
+                .into());
+        }
+        let vector = args
+            .first()
+            .cloned()
+            .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing reduction operand"))?;
+        let lane_type = vector
+            .typ()
+            .base_type()
+            .filter(|typ| vector.typ().is_vector() && typ.is_integer())
+            .cloned()
+            .ok_or_else(|| {
+                self.unsupported_intrinsic(callee_name, "vector reduction expects integer lanes")
+            })?;
+        let len = vector.typ().len().unwrap_or(0) as usize;
+        let loc = self.instruction_location(instruction);
+        let acc = self.declare_hidden_local("reduce", lane_type, loc);
+        body.push(Stmt::assign(
+            acc.clone(),
+            self.aggregate_component(vector.clone(), 0)?,
+            loc,
+        ));
+        for lane in 1..len {
+            let x = self.aggregate_component(vector.clone(), lane)?;
+            let a = acc.clone();
+            let value = match op {
+                "add" => a.plus(x),
+                "mul" => a.mul(x),
+                "and" => a.bitand(x),
+                "or" => a.bitor(x),
+                "xor" => a.bitxor(x),
+                _ => self.minmax_value(op.starts_with('s'), op.ends_with("min"), a, x)?,
+            };
+            body.push(Stmt::assign(acc.clone(), value, loc));
+        }
+        self.assign_result(instruction, body, acc)
     }
 
     fn lower_funnel_shift_intrinsic(
