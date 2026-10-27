@@ -41,7 +41,7 @@ SHORT = {"check-failure": "check", "translate-crash": "crash", "cbmc-error": "cb
          "unsupported": "unsup", "invalid-seed": "invalid"}
 MAIN_END = "platform_main_end(crc32_context ^ 0xFFFFFFFFUL, print_hash_value);"
 INJECT_RE = re.compile(re.escape(MAIN_END) + r"( __CPROVER_assert\(.*\);)?")
-FAILURE_RE = re.compile(r"^\[(\S+)\] (?:line \d+ )?(.*): FAILURE$", re.M)
+FAILURE_RE = re.compile(r"^\[(\S+)\] (?:(?:file \S+ )?line \d+ )?(.*): FAILURE$", re.M)
 
 
 @dataclass(frozen=True)
