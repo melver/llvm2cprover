@@ -1168,9 +1168,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .cast_to(target.to_signed().unwrap_or_else(|| target.clone()))
                 .cast_to(target.clone()),
             // `i1` lowers to 8-bit `c_bool`, so truncate through a 1-bit bitvector first to
-            // extract the least-significant bit instead of the low byte.
-            InstructionOpcode::Trunc if target.is_c_bool() => value
+            // extract the least-significant bit instead of the low byte. Float conversions go
+            // the same way because CBMC cannot convert a float to `c_bool` directly.
+            InstructionOpcode::Trunc | InstructionOpcode::FPToUI if target.is_c_bool() => value
                 .cast_to(Type::unsigned_int(1_u32))
+                .cast_to(target.clone()),
+            InstructionOpcode::FPToSI if target.is_c_bool() => value
+                .cast_to(Type::signed_int(1_u32))
                 .cast_to(target.clone()),
             InstructionOpcode::ZExt
             | InstructionOpcode::Trunc
