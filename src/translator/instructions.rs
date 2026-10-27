@@ -2235,6 +2235,19 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.bitreverse") {
+            let value = self.scalar_int_operand(callee_name, args)?;
+            // `i1` lowers to 8-bit `c_bool`; reversing one bit is the identity, whereas reversing
+            // the byte would move the value bit to bit 7.
+            let value = if value.typ().is_c_bool() {
+                value
+            } else {
+                value.bitreverse()
+            };
+            self.assign_result(instruction, body, value)?;
+            return Ok(true);
+        }
+
         if let Some(is_left) = if callee_name.starts_with("llvm.fshl") {
             Some(true)
         } else if callee_name.starts_with("llvm.fshr") {
@@ -4026,6 +4039,18 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     fn unsupported_intrinsic(&self, name: &str, message: impl Into<String>) -> Diagnostic {
         Diagnostic::unsupported_feature(UnsupportedFeature::Intrinsic, message)
             .with_symbol(name.to_owned())
+    }
+
+    /// The operand of a bit-manipulation intrinsic. Only scalar integer forms are lowered; vector
+    /// overloads fail closed rather than reaching CBMC operators that reject vector operands.
+    fn scalar_int_operand(&self, callee_name: &str, args: &[Expr]) -> Result<Expr> {
+        args.first()
+            .filter(|value| value.typ().is_integer())
+            .cloned()
+            .ok_or_else(|| {
+                self.unsupported_intrinsic(callee_name, "expects one scalar integer operand")
+                    .into()
+            })
     }
 
     fn validate_inline_asm_model_signature(
