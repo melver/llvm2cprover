@@ -1571,6 +1571,9 @@ mod tests {
         let debug = stmt_debug(&symbols, "f");
         assert!(debug.contains("FunctionCall"));
         assert!(debug.contains("memcpy"));
+        // LLVM permits `dst == src`; C `memcpy` does not, so the call must be guarded.
+        assert!(debug.contains("Ifthenelse"));
+        assert!(debug.contains("Notequal"));
     }
 
     #[test]

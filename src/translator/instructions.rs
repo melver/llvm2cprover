@@ -2175,12 +2175,24 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             if self.is_zero_length_memory_intrinsic(args) {
                 return Ok(true);
             }
-            self.lower_builtin_call(
-                BuiltinFn::Memcpy,
-                args.get(0..3).unwrap_or(&[]),
-                instruction,
-                body,
-            )?;
+            // LLVM allows `src == dst` (clang emits it for `*p = *p;`), while C `memcpy` forbids
+            // any overlap. Guard the call so the equal case is the no-op LLVM promises, without
+            // lowering to `memmove`, which would also accept the partial overlap LLVM forbids.
+            let [dst, src, _, ..] = args else {
+                return Err(self
+                    .unsupported_intrinsic(callee_name, "missing memcpy operands")
+                    .with_location(loc)
+                    .into());
+            };
+            let (dst, src) = self.normalize_icmp_operands(dst.clone(), src.clone());
+            let mut call = vec![];
+            self.lower_builtin_call(BuiltinFn::Memcpy, &args[..3], instruction, &mut call)?;
+            body.push(Stmt::if_then_else(
+                dst.neq(src),
+                Stmt::block(call, loc),
+                None,
+                loc,
+            ));
             return Ok(true);
         }
 
