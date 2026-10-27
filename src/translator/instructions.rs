@@ -427,22 +427,35 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let rhs = self.lower_operand(instruction, 1)?;
         let result = self.declare_instruction_result(instruction)?;
         let target = result.typ().clone();
-        if let Some(value) = self.lower_i1_arith(instruction.get_opcode(), &lhs, &rhs, &target)? {
-            body.push(Stmt::assign(result, value, loc));
-            return Ok(());
-        }
-        let value = match instruction.get_opcode() {
-            InstructionOpcode::Add => lhs
-                .cast_to(target.clone())
-                .plus(rhs.cast_to(target.clone())),
-            InstructionOpcode::Sub => lhs.cast_to(target.clone()).sub(rhs.cast_to(target.clone())),
-            InstructionOpcode::Mul => lhs.cast_to(target.clone()).mul(rhs.cast_to(target.clone())),
-            InstructionOpcode::UDiv => lhs.cast_to(target.clone()).div(rhs.cast_to(target.clone())),
+        let opcode = instruction.get_opcode();
+        let value = match opcode {
+            InstructionOpcode::Add
+            | InstructionOpcode::Sub
+            | InstructionOpcode::Mul
+            | InstructionOpcode::UDiv
+            | InstructionOpcode::URem => {
+                let (lhs, rhs) = (lhs.cast_to(target.clone()), rhs.cast_to(target.clone()));
+                match target.base_type() {
+                    // `<N x i1>` cannot be cast as a whole to a 1-bit vector, so go lane by lane.
+                    Some(lane) if target.is_vector() && lane.is_c_bool() => {
+                        let elems = (0..target.len().unwrap_or(0) as usize)
+                            .map(|i| {
+                                Ok(Self::int_arith(
+                                    opcode,
+                                    self.aggregate_component(lhs.clone(), i)?,
+                                    self.aggregate_component(rhs.clone(), i)?,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Expr::vector_expr(target.clone(), elems)
+                    }
+                    _ => Self::int_arith(opcode, lhs, rhs),
+                }
+            }
             InstructionOpcode::SDiv => self
                 .signed_view(lhs)?
                 .div(self.signed_view(rhs)?)
                 .cast_to(target.clone()),
-            InstructionOpcode::URem => lhs.cast_to(target.clone()).rem(rhs.cast_to(target.clone())),
             InstructionOpcode::SRem => self
                 .signed_view(lhs)?
                 .rem(self.signed_view(rhs)?)
@@ -464,7 +477,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .cast_to(target.clone())
                 .bitxor(rhs.cast_to(target.clone())),
             InstructionOpcode::Shl | InstructionOpcode::LShr | InstructionOpcode::AShr => {
-                self.lower_shift_value(instruction.get_opcode(), lhs, rhs, target)?
+                self.lower_shift_value(opcode, lhs, rhs, target)?
             }
             _ => unreachable!("binary opcode dispatched incorrectly"),
         };
@@ -472,58 +485,27 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(())
     }
 
-    /// Lower `add`/`sub`/`mul`/`udiv`/`urem` on `i1` or `<N x i1>`, or return `None` otherwise.
+    /// Integer `add`/`sub`/`mul`/`udiv`/`urem` on two scalars (or non-`i1` vectors) of one type.
     ///
-    /// `i1` lowers to `c_bool`, on which CBMC silently ignores arithmetic operators (and crashes on
-    /// vector `+`), and vector typecasts are not expressible. Compute each lane in a 1-bit unsigned
-    /// type instead so results wrap mod 2 and division by zero stays checked.
-    fn lower_i1_arith(
-        &self,
-        opcode: InstructionOpcode,
-        lhs: &Expr,
-        rhs: &Expr,
-        target: &Type,
-    ) -> Result<Option<Expr>> {
-        if !matches!(
-            opcode,
-            InstructionOpcode::Add
-                | InstructionOpcode::Sub
-                | InstructionOpcode::Mul
-                | InstructionOpcode::UDiv
-                | InstructionOpcode::URem
-        ) {
-            return Ok(None);
-        }
-        let u1 = Type::unsigned_int(1_u32);
-        let lane_op = |l: Expr, r: Expr| {
-            let (l, r) = (l.cast_to(u1.clone()), r.cast_to(u1.clone()));
-            let value = match opcode {
-                InstructionOpcode::Add => l.plus(r),
-                InstructionOpcode::Sub => l.sub(r),
-                InstructionOpcode::Mul => l.mul(r),
-                InstructionOpcode::UDiv => l.div(r),
-                _ => l.rem(r),
-            };
-            value.cast_to(Type::c_bool())
+    /// `i1` lowers to `c_bool`, on which CBMC silently ignores arithmetic operators. Compute it in
+    /// a 1-bit unsigned type instead so results wrap mod 2 and division by zero stays checked.
+    fn int_arith(opcode: InstructionOpcode, lhs: Expr, rhs: Expr) -> Expr {
+        let typ = lhs.typ().clone();
+        let arith = if typ.is_c_bool() {
+            Type::unsigned_int(1_u32)
+        } else {
+            typ.clone()
         };
-        if target.is_c_bool() {
-            return Ok(Some(lane_op(lhs.clone(), rhs.clone())));
+        let (lhs, rhs) = (lhs.cast_to(arith.clone()), rhs.cast_to(arith));
+        match opcode {
+            InstructionOpcode::Add => lhs.plus(rhs),
+            InstructionOpcode::Sub => lhs.sub(rhs),
+            InstructionOpcode::Mul => lhs.mul(rhs),
+            InstructionOpcode::UDiv => lhs.div(rhs),
+            InstructionOpcode::URem => lhs.rem(rhs),
+            _ => unreachable!("not an integer arithmetic opcode"),
         }
-        let (Some(lane), Some(len)) = (target.base_type(), target.len()) else {
-            return Ok(None);
-        };
-        if !target.is_vector() || !lane.is_c_bool() {
-            return Ok(None);
-        }
-        let elems = (0..len as usize)
-            .map(|i| {
-                Ok(lane_op(
-                    self.aggregate_component(lhs.clone(), i)?,
-                    self.aggregate_component(rhs.clone(), i)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Some(Expr::vector_expr(target.clone(), elems)))
+        .cast_to(typ)
     }
 
     /// Lower an integer or vector shift (`shl`, `lshr`, `ashr`).
@@ -2646,8 +2628,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 self.unsupported_intrinsic(callee_name, "vector reduction expects integer lanes")
             })?;
         let len = vector.typ().len().unwrap_or(0) as usize;
-        // `i1` lanes lower to `c_bool`, on which CBMC ignores `+`/`*`; mod 2 they are `^`/`&`.
-        let is_i1 = lane_type.is_c_bool();
         let loc = self.instruction_location(instruction);
         let acc = self.declare_hidden_local("reduce", lane_type, loc);
         body.push(Stmt::assign(
@@ -2659,11 +2639,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             let x = self.aggregate_component(vector.clone(), lane)?;
             let a = acc.clone();
             let value = match op {
-                "add" if !is_i1 => a.plus(x),
-                "mul" if !is_i1 => a.mul(x),
-                "and" | "mul" => a.bitand(x),
+                "add" => Self::int_arith(InstructionOpcode::Add, a, x),
+                "mul" => Self::int_arith(InstructionOpcode::Mul, a, x),
+                "and" => a.bitand(x),
                 "or" => a.bitor(x),
-                "xor" | "add" => a.bitxor(x),
+                "xor" => a.bitxor(x),
                 _ => self.minmax_value(op.starts_with('s'), op.ends_with("min"), a, x)?,
             };
             body.push(Stmt::assign(acc.clone(), value, loc));
