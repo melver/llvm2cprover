@@ -3597,6 +3597,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     /// aggregate subobject (such as a row of a 2D array), a subsequent 1-index GEP with a negative
     /// offset may legally step into the preceding subobject in the enclosing allocation, which
     /// GOTO `Index` on the sub-array value would reject as out of bounds.
+    ///
+    /// The current lowering only inserts at most one pointer typecast around such addresses, so a
+    /// single `Typecast(AddressOf(...))` peel is sufficient here.
     fn decayed_array_base(&self, base: &Expr, pointee: &Type) -> Option<(Expr, Expr)> {
         let peeled = match base.value() {
             ExprValue::AddressOf(inner) => inner.clone(),
@@ -3811,10 +3814,23 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         })
     }
 
-    fn is_direct_stack_slot(slot: &Expr) -> bool {
+    /// True when `*(&slot)` may be lowered as plain `slot`.
+    ///
+    /// In GOTO, `*(&a[i])` is pointer arithmetic: an out-of-object `i` is a `--pointer-check`
+    /// failure. Bare `a[i]` is array value selection instead: an out-of-range read is
+    /// unconstrained, an out-of-range write is dropped, and only `--bounds-check` reports it.
+    /// LLVM GEPs may legally step out of a subarray into its neighbour, so a bare `Index` is only
+    /// kept on VLA `alloca` symbols, where CBMC cannot bound `*(&vla[i])` and reports a spurious
+    /// "pointer outside object bounds"; out-of-range VLA accesses therefore rely on
+    /// `--bounds-check`. `Member` and `Dereference` keep pointer semantics as long as they contain
+    /// no such `Index`.
+    fn is_peelable_slot(slot: &Expr) -> bool {
         match slot.value() {
-            ExprValue::Symbol { .. } => true,
-            ExprValue::Index { array, .. } => array.is_symbol(),
+            ExprValue::Symbol { .. } | ExprValue::Dereference(_) => true,
+            ExprValue::Member { lhs, .. } => Self::is_peelable_slot(lhs),
+            ExprValue::Index { array, .. } => {
+                array.is_symbol() && matches!(array.typ(), Type::VariableArray { .. })
+            }
             _ => false,
         }
     }
@@ -3828,12 +3844,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             },
             _ => return None,
         };
-        // Preserve direct stack-slot accesses where the LLVM pointer is just `&local` (or
-        // `&vla[i]` on a root `alloca` symbol). Do not peel `AddressOf` from GEP-derived `Index`
-        // expressions on dereferenced pointers or sub-arrays: in GOTO IR, `*(address_of(arr[idx]))`
-        // is pointer offset arithmetic, whereas bare `arr[idx]` is SMT array value selection that
-        // is unsound when `idx` steps outside `[0, N)`.
-        (Self::is_direct_stack_slot(&slot) && slot.typ() == pointee).then_some(slot)
+        (Self::is_peelable_slot(&slot) && slot.typ() == pointee).then_some(slot)
     }
 
     fn direct_load_pointee(&self, ptr: &Expr, pointee: &Type) -> Option<Expr> {
@@ -3845,7 +3856,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             },
             _ => return None,
         };
-        if !Self::is_direct_stack_slot(&slot) {
+        if !Self::is_peelable_slot(&slot) {
             return None;
         }
         if slot.typ() == pointee {
