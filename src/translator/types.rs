@@ -275,15 +275,21 @@ impl TypeLowerer {
         let mut pad_counter: usize = 0;
 
         if let Some(td) = &self.target_data {
-            let mut cursor: u64 = 0; // running byte offset
+            // Track the cursor in bits and advance by the lowered GOTO field's
+            // actual bit span rather than LLVM's ABI size: non-ABI-sized integers
+            // like `i24` lower to a 24-bit bitvector in CBMC even though LLVM's
+            // `get_abi_size` reports 4 bytes, so advancing by ABI size would omit
+            // the trailing padding CBMC needs to match LLVM's allocation size.
+            let mut cursor_bits: u64 = 0;
             for i in 0..nfields {
-                let field_offset = td.offset_of_element(&typ, i as u32).unwrap_or(cursor);
+                let field_offset_bits = td
+                    .offset_of_element(&typ, i as u32)
+                    .map_or(cursor_bits, |off| off * 8);
                 // Insert padding between cursor and this field's actual start.
-                if field_offset > cursor {
-                    let pad_bits = (field_offset - cursor) * 8;
+                if field_offset_bits > cursor_bits {
                     components.push(DatatypeComponent::padding(
                         format!("$pad{pad_counter}"),
-                        pad_bits,
+                        field_offset_bits - cursor_bits,
                     ));
                     pad_counter += 1;
                 }
@@ -291,15 +297,14 @@ impl TypeLowerer {
                     format!("field{i}"),
                     goto_fields[i].clone(),
                 ));
-                cursor = field_offset + td.get_abi_size(&field_types[i]);
+                cursor_bits = field_offset_bits + Self::lowered_bit_size(td, field_types[i]);
             }
             // Trailing padding to reach the struct's total ABI size.
-            let struct_size = td.get_abi_size(&typ);
-            if struct_size > cursor {
-                let pad_bits = (struct_size - cursor) * 8;
+            let struct_bits = td.get_abi_size(&typ) * 8;
+            if struct_bits > cursor_bits {
                 components.push(DatatypeComponent::padding(
                     format!("$pad{pad_counter}"),
-                    pad_bits,
+                    struct_bits - cursor_bits,
                 ));
             }
         } else {
@@ -348,6 +353,31 @@ impl TypeLowerer {
         };
 
         Ok(Type::struct_tag(tag))
+    }
+
+    /// Return the bit width that CBMC's `sizeof` sums for `typ` after lowering.
+    fn lowered_bit_size(td: &TargetData, typ: BasicTypeEnum<'_>) -> u64 {
+        match typ {
+            BasicTypeEnum::ArrayType(typ) => {
+                u64::from(typ.len()) * Self::lowered_bit_size(td, typ.get_element_type())
+            }
+            BasicTypeEnum::FloatType(typ) => u64::from(typ.get_bit_width()),
+            // `i1` lowers to 8-bit `c_bool`; all other `iN` lower to `unsignedbv[N]`.
+            BasicTypeEnum::IntType(typ) => {
+                let bits = typ.get_bit_width();
+                if bits == 1 { 8 } else { u64::from(bits) }
+            }
+            // `lower_struct` pads nested structs to their LLVM ABI size.
+            BasicTypeEnum::PointerType(_) | BasicTypeEnum::StructType(_) => {
+                td.get_abi_size(&typ) * 8
+            }
+            BasicTypeEnum::VectorType(typ) => {
+                u64::from(typ.get_size()) * Self::lowered_bit_size(td, typ.get_element_type())
+            }
+            BasicTypeEnum::ScalableVectorType(_) => {
+                unreachable!("scalable vectors are rejected before struct layout")
+            }
+        }
     }
 
     fn note_hint(hints: &mut HashMap<usize, PointerHint>, key: usize, pointee: Type) -> bool {
@@ -430,5 +460,34 @@ mod tests {
             .expect("pointer should lower");
 
         assert_eq!(lowered, Type::unsigned_int(32_u32).to_pointer());
+    }
+
+    #[test]
+    fn pads_non_abi_sized_integer_struct_field_to_alloc_size() {
+        let context = Context::create();
+        let i24 = context
+            .custom_width_int_type(std::num::NonZeroU32::new(24).unwrap())
+            .expect("i24 should construct");
+        let struct_type = context.opaque_struct_type("union.U");
+        struct_type.set_body(&[i24.into()], false);
+
+        let mut lowerer = TypeLowerer::default();
+        lowerer.set_target_data(
+            "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+        );
+        let lowered = lowerer
+            .lower_any(struct_type.as_any_type_enum())
+            .expect("struct should lower");
+        assert_eq!(lowered, Type::struct_tag("union.U"));
+
+        let symbols = lowerer.take_aggregate_symbols();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(
+            symbols[0].typ.components(),
+            Some(&vec![
+                DatatypeComponent::field("field0", Type::unsigned_int(24_u32)),
+                DatatypeComponent::padding("$pad0", 8),
+            ])
+        );
     }
 }

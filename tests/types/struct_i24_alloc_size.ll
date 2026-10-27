@@ -2,7 +2,6 @@
 ; description = "a struct whose field is a non-byte-aligned integer (i24) must keep its LLVM alloc size (4), not its store size (3)"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
-; todo = "struct padding cursor advances by the field's ABI size while the GOTO field only spans its bit width; sizeof({i24}) becomes 3"
 ; ---
 ;
 ; Clang models a C union containing a 22-bit bitfield as `{ i24 }`. Its
