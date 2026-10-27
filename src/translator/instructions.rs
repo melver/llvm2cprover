@@ -3590,11 +3590,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(ptr)
     }
 
-    /// Recognize pointers that came from array decay (`&array[0]`) so the first GEP index can be
-    /// folded back into `&array[i]`.
+    /// Recognize pointers that came from counted/VLA `alloca` array decay (`&slot[0]`) so the
+    /// first GEP index can be folded into `&slot[i]`.
     ///
-    /// The current lowering only inserts at most one pointer typecast around such addresses, so a
-    /// single `Typecast(AddressOf(...))` peel is sufficient here.
+    /// Only fold when `array` is the root `Symbol` itself: if `array` is a dereferenced pointer or
+    /// aggregate subobject (such as a row of a 2D array), a subsequent 1-index GEP with a negative
+    /// offset may legally step into the preceding subobject in the enclosing allocation, which
+    /// GOTO `Index` on the sub-array value would reject as out of bounds.
     fn decayed_array_base(&self, base: &Expr, pointee: &Type) -> Option<(Expr, Expr)> {
         let peeled = match base.value() {
             ExprValue::AddressOf(inner) => inner.clone(),
@@ -3607,8 +3609,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let ExprValue::Index { array, index } = peeled.value() else {
             return None;
         };
-        (array.typ().is_array_like() && array.typ().base_type() == Some(pointee))
-            .then(|| (array.clone(), index.clone()))
+        (array.is_symbol()
+            && array.typ().is_array_like()
+            && array.typ().base_type() == Some(pointee))
+        .then(|| (array.clone(), index.clone()))
     }
 
     /// Returns true when the expression is already a plain address and does not need a temporary
@@ -3807,6 +3811,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         })
     }
 
+    fn is_direct_stack_slot(slot: &Expr) -> bool {
+        match slot.value() {
+            ExprValue::Symbol { .. } => true,
+            ExprValue::Index { array, .. } => array.is_symbol(),
+            _ => false,
+        }
+    }
+
     fn direct_store_slot(&self, ptr: &Expr, pointee: &Type) -> Option<Expr> {
         let slot = match ptr.value() {
             ExprValue::AddressOf(slot) => slot.clone(),
@@ -3816,10 +3828,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             },
             _ => return None,
         };
-        // Preserve direct stack-slot accesses where the LLVM pointer is just `&local`.
-        // This keeps the emitted GOTO closer to CBMC's own C frontend and avoids
-        // manufacturing extra dereference traffic for automatic locals.
-        (slot.typ() == pointee).then_some(slot)
+        // Preserve direct stack-slot accesses where the LLVM pointer is just `&local` (or
+        // `&vla[i]` on a root `alloca` symbol). Do not peel `AddressOf` from GEP-derived `Index`
+        // expressions on dereferenced pointers or sub-arrays: in GOTO IR, `*(address_of(arr[idx]))`
+        // is pointer offset arithmetic, whereas bare `arr[idx]` is SMT array value selection that
+        // is unsound when `idx` steps outside `[0, N)`.
+        (Self::is_direct_stack_slot(&slot) && slot.typ() == pointee).then_some(slot)
     }
 
     fn direct_load_pointee(&self, ptr: &Expr, pointee: &Type) -> Option<Expr> {
@@ -3831,6 +3845,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             },
             _ => return None,
         };
+        if !Self::is_direct_stack_slot(&slot) {
+            return None;
+        }
         if slot.typ() == pointee {
             return Some(slot);
         }
