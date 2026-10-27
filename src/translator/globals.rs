@@ -372,16 +372,12 @@ impl GlobalLowerer {
         }
 
         let elem_type = lowerer.lower_basic(value.get_type().get_element_type())?;
+        // `get_element_as_constant` is only valid on ConstantDataVector; `i1` and other
+        // non-simple lanes form a ConstantVector, so go through `LLVMGetAggregateElement`.
         let elems = (0..value.get_type().get_size())
             .map(|index| {
-                self.lower_initializer(
-                    symbol,
-                    value.get_element_as_constant(index),
-                    &elem_type,
-                    lowerer,
-                    symbols,
-                    location,
-                )
+                let elem = self.aggregate_element(symbol, value.as_value_ref(), index)?;
+                self.lower_initializer(symbol, elem, &elem_type, lowerer, symbols, location)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
