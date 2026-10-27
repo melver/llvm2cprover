@@ -2164,7 +2164,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         if callee_name.starts_with("llvm.ctpop") {
-            let value = self.scalar_int_operand(callee_name, args)?.popcount();
+            let value = self.lower_int_unary(callee_name, args, Expr::popcount)?;
             self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
@@ -2190,20 +2190,21 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         if callee_name.starts_with("llvm.bswap") {
-            let value = self.scalar_int_operand(callee_name, args)?.bswap();
+            let value = self.lower_int_unary(callee_name, args, Expr::bswap)?;
             self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
 
         if callee_name.starts_with("llvm.bitreverse") {
-            let value = self.scalar_int_operand(callee_name, args)?;
             // `i1` lowers to 8-bit `c_bool`; reversing one bit is the identity, whereas reversing
             // the byte would move the value bit to bit 7.
-            let value = if value.typ().is_c_bool() {
-                value
-            } else {
-                value.bitreverse()
-            };
+            let value = self.lower_int_unary(callee_name, args, |value| {
+                if value.typ().is_c_bool() {
+                    value
+                } else {
+                    value.bitreverse()
+                }
+            })?;
             self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
@@ -2451,23 +2452,25 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     /// `x == 0 ? width : cttz(x, true)` pattern. Otherwise a zero input yields the bit width,
     /// which is CBMC's result when zero is permitted.
     fn lower_count_zeros(&self, callee_name: &str, args: &[Expr], leading: bool) -> Result<Expr> {
-        let value = self.scalar_int_operand(callee_name, args)?;
-        // `i1` lowers to 8-bit `c_bool`; count over a 1-bit bitvector so the width is 1.
-        let value = if value.typ().is_c_bool() {
-            value.cast_to(Type::unsigned_int(1_u32))
-        } else {
-            value
-        };
-        let is_zero = value.clone().eq(value.typ().zero());
-        let count = if leading {
-            value.ctlz(true)
-        } else {
-            value.cttz(true)
-        };
-        Ok(if self.intrinsic_zero_is_poison(callee_name, args)? {
-            is_zero.ternary(util::nondet_expr(count.typ().clone()), count)
-        } else {
-            count
+        let zero_is_poison = self.intrinsic_zero_is_poison(callee_name, args)?;
+        self.lower_int_unary(callee_name, args, |value| {
+            // `i1` lowers to 8-bit `c_bool`; count over a 1-bit bitvector so the width is 1.
+            let value = if value.typ().is_c_bool() {
+                value.cast_to(Type::unsigned_int(1_u32))
+            } else {
+                value
+            };
+            let is_zero = value.clone().eq(value.typ().zero());
+            let count = if leading {
+                value.ctlz(true)
+            } else {
+                value.cttz(true)
+            };
+            if zero_is_poison {
+                is_zero.ternary(util::nondet_expr(count.typ().clone()), count)
+            } else {
+                count
+            }
         })
     }
 
@@ -4028,16 +4031,29 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .with_symbol(name.to_owned())
     }
 
-    /// The operand of a bit-manipulation intrinsic. Only scalar integer forms are lowered; vector
-    /// overloads fail closed rather than reaching CBMC operators that reject vector operands.
-    fn scalar_int_operand(&self, callee_name: &str, args: &[Expr]) -> Result<Expr> {
-        args.first()
-            .filter(|value| value.typ().is_integer())
-            .cloned()
-            .ok_or_else(|| {
-                self.unsupported_intrinsic(callee_name, "expects one scalar integer operand")
-                    .into()
-            })
+    /// Apply the scalar bit-manipulation operation `op` to `args[0]`, lane by lane for vector
+    /// overloads (whose lanes keep the operand's lane type). Other operands fail closed rather
+    /// than reaching CBMC operators that reject them. A scalar result keeps `op`'s type (CBMC's
+    /// bit counts are `unsigned int`); callers cast it to the LLVM type via `assign_result`.
+    fn lower_int_unary(
+        &self,
+        callee_name: &str,
+        args: &[Expr],
+        op: impl Fn(Expr) -> Expr,
+    ) -> Result<Expr> {
+        let value = args
+            .first()
+            .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing operand"))?;
+        let typ = value.typ();
+        match typ.base_type() {
+            Some(lane) if typ.is_vector() && lane.is_integer() => self.map_lanes(typ, |i| {
+                Ok(op(self.aggregate_component(value.clone(), i)?).cast_to(lane.clone()))
+            }),
+            _ if typ.is_integer() => Ok(op(value.clone())),
+            _ => Err(self
+                .unsupported_intrinsic(callee_name, "expects an integer or integer vector operand")
+                .into()),
+        }
     }
 
     fn validate_inline_asm_model_signature(
