@@ -312,7 +312,8 @@ def instrument_contract(
 
 
 def expect_translation_failure(result: subprocess.CompletedProcess[str]) -> RunResult:
-    if result.returncode != 0:
+    # Fail-closed means a diagnostic, not a crash: reject Rust panics (101) and signals (< 0).
+    if result.returncode > 0 and result.returncode != 101:
         return RunResult(True)
     return RunResult(
         False,
