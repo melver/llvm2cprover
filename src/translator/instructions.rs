@@ -751,7 +751,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let lhs = self.lower_operand(instruction, 0)?;
         let rhs = self.lower_operand(instruction, 1)?;
         let result = self.declare_instruction_result(instruction)?;
-        let value = if lhs.typ().is_vector() || rhs.typ().is_vector() {
+        let value = if instruction.get_type().is_vector_type() {
             self.lower_vector_icmp_value(pred, lhs, rhs, result.typ().clone())?
         } else {
             self.lower_scalar_icmp_value(pred, lhs, rhs)?
@@ -1087,6 +1087,16 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         body: &mut Vec<Stmt>,
     ) -> Result<()> {
         let loc = self.instruction_location(instruction);
+        // Vector GEPs compute one address per lane; only the scalar form is lowered.
+        if instruction.get_type().is_vector_type() {
+            return Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!("unsupported vector getelementptr in {}", self.function_name),
+            )
+            .with_symbol(self.function_name.clone())
+            .with_location(loc)
+            .into());
+        }
         let base = self.lower_operand(instruction, 0)?;
         let source_type =
             self.types
@@ -1134,13 +1144,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 self.lower_bitcast_value(instruction, value, target)?
             }
             // Vector casts convert lane by lane; GOTO cannot cast between vector element types.
-            (_, Some(lane)) if target.is_vector() => {
+            (_, Some(lane)) if instruction.get_type().is_vector_type() => {
                 let elems = (0..target.len().unwrap_or(0) as usize)
                     .map(|i| {
                         self.scalar_cast(opcode, self.aggregate_component(value.clone(), i)?, lane)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Expr::vector_expr(target.clone(), elems)
+                self.rebuild_aggregate(target.clone(), elems)?
             }
             _ => self.scalar_cast(opcode, value, &target)?,
         };
@@ -3200,11 +3210,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             })
             .collect::<Result<Vec<_>>>()?;
         let result = self.declare_instruction_result(instruction)?;
-        body.push(Stmt::assign(
-            result.clone(),
-            Expr::vector_expr(result.typ().clone(), elems),
-            loc,
-        ));
+        let value = self.rebuild_aggregate(result.typ().clone(), elems)?;
+        body.push(Stmt::assign(result, value, loc));
         Ok(())
     }
 
@@ -3272,11 +3279,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
-        body.push(Stmt::assign(
-            result.clone(),
-            Expr::vector_expr(result.typ().clone(), elems),
-            loc,
-        ));
+        let value = self.rebuild_aggregate(result.typ().clone(), elems)?;
+        body.push(Stmt::assign(result, value, loc));
         Ok(())
     }
 

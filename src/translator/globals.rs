@@ -381,7 +381,12 @@ impl GlobalLowerer {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        Ok(Expr::vector_expr(typ.clone(), elems))
+        // `<N x ptr>` lowers to an array; see `TypeLowerer::lower_any`.
+        Ok(if typ.is_array() {
+            Expr::array_expr(typ.clone(), elems)
+        } else {
+            Expr::vector_expr(typ.clone(), elems)
+        })
     }
 
     fn unsupported(&self, symbol: &str, message: impl Into<String>) -> Diagnostic {

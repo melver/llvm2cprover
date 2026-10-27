@@ -76,10 +76,17 @@ impl TypeLowerer {
             AnyTypeEnum::PointerType(_) => Ok(Type::void_pointer()),
             AnyTypeEnum::StructType(typ) => self.lower_struct(typ),
             AnyTypeEnum::VoidType(_) => Ok(Type::empty()),
-            AnyTypeEnum::VectorType(typ) => Ok(Type::vector(
-                self.lower_basic(typ.get_element_type())?,
-                typ.get_size().into(),
-            )),
+            // CBMC vectors only take numeric lanes, so `<N x ptr>` lowers to a pointer array.
+            // Arrays are values in GOTO too, and lane access goes through the same indexing.
+            AnyTypeEnum::VectorType(typ) => {
+                let lane = self.lower_basic(typ.get_element_type())?;
+                let len = typ.get_size().into();
+                Ok(if lane.is_pointer() {
+                    lane.array_of(len)
+                } else {
+                    Type::vector(lane, len)
+                })
+            }
             AnyTypeEnum::ScalableVectorType(_) => Err(Diagnostic::unsupported_type(
                 "unsupported scalable vector type",
             )),
