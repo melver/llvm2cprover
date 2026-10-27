@@ -2,7 +2,6 @@
 ; description = "shift by >= bit width is poison, not UB; a select that discards it must not trip CBMC's undefined-shift check"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
-; todo = "shl/lshr/ashr lowered to bare GOTO shifts; CBMC's default undefined-shift-check fires on speculated poison"
 ; ---
 ;
 ; LLVM LangRef: for shl/lshr/ashr, "If op2 is (statically or dynamically)
@@ -33,7 +32,20 @@ entry:
   %c = select i1 %big, i32 -256, i32 %ashr
   %sum = add i32 %a, %b
   %sum2 = add i32 %sum, %c
-  %ok = icmp eq i32 %sum2, 0
+  %scalar_ok = icmp eq i32 %sum2, 0
+
+  %vn = insertelement <2 x i32> <i32 2, i32 0>, i32 %n, i32 1
+  %vshl = shl <2 x i32> <i32 3, i32 1>, %vn
+  %vlshr = lshr <2 x i32> <i32 12, i32 255>, %vn
+  %vashr = ashr <2 x i32> <i32 -16, i32 -256>, %vn
+  %vshl0 = extractelement <2 x i32> %vshl, i32 0
+  %vlshr0 = extractelement <2 x i32> %vlshr, i32 0
+  %vashr0 = extractelement <2 x i32> %vashr, i32 0
+  %vsum = add i32 %vshl0, %vlshr0
+  %vsum2 = add i32 %vsum, %vashr0
+  %vec_ok = icmp eq i32 %vsum2, 11
+
+  %ok = and i1 %scalar_ok, %vec_ok
   call void @__CPROVER_assert(i1 %ok, ptr null)
   ret i32 0
 }

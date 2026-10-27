@@ -2439,4 +2439,41 @@ mod tests {
         let debug = stmt_debug(&symbols, "callee");
         assert!(debug.contains("callee::byval0"));
     }
+
+    #[test]
+    fn clamps_scalar_and_vector_shift_distances() {
+        let symbols = build_symbols_from_ir(
+            br#"
+            define i32 @scalar_shifts(i32 %x, i32 %n) {
+            entry:
+              %a = shl i32 %x, %n
+              %b = lshr i32 %a, %n
+              %c = ashr i32 %b, %n
+              ret i32 %c
+            }
+
+            define <2 x i32> @vector_shifts(<2 x i32> %x, <2 x i32> %n) {
+            entry:
+              %a = shl <2 x i32> %x, %n
+              %b = lshr <2 x i32> %a, %n
+              %c = ashr <2 x i32> %b, %n
+              ret <2 x i32> %c
+            }
+        "#,
+        );
+
+        let scalar_debug = stmt_debug(&symbols, "scalar_shifts");
+        assert!(scalar_debug.contains("Shl"));
+        assert!(scalar_debug.contains("Lshr"));
+        assert!(scalar_debug.contains("Ashr"));
+        assert!(scalar_debug.contains("IntConstant(32)"));
+        assert!(scalar_debug.contains("Nondet"));
+
+        let vector_debug = stmt_debug(&symbols, "vector_shifts");
+        assert!(vector_debug.contains("Vector"));
+        assert!(vector_debug.contains("Shl"));
+        assert!(vector_debug.contains("Lshr"));
+        assert!(vector_debug.contains("Ashr"));
+        assert!(vector_debug.contains("Nondet"));
+    }
 }

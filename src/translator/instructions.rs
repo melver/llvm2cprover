@@ -459,18 +459,77 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             InstructionOpcode::Xor => lhs
                 .cast_to(target.clone())
                 .bitxor(rhs.cast_to(target.clone())),
-            InstructionOpcode::Shl => lhs.cast_to(target.clone()).shl(rhs.cast_to(target.clone())),
-            InstructionOpcode::LShr => lhs
-                .cast_to(target.clone())
-                .lshr(rhs.cast_to(target.clone())),
-            InstructionOpcode::AShr => self
-                .signed_view(lhs)?
-                .ashr(rhs.cast_to(target.clone()))
-                .cast_to(target.clone()),
+            InstructionOpcode::Shl | InstructionOpcode::LShr | InstructionOpcode::AShr => {
+                self.lower_shift_value(instruction.get_opcode(), lhs, rhs, target)?
+            }
             _ => unreachable!("binary opcode dispatched incorrectly"),
         };
         body.push(Stmt::assign(result, value, loc));
         Ok(())
+    }
+
+    /// Lower an integer or vector shift (`shl`, `lshr`, `ashr`).
+    ///
+    /// In LLVM IR, a shift count `>=` the operand bit width produces `poison`, not immediate UB,
+    /// so optimizer passes routinely hoist shifts out of their `< width` guards and select over
+    /// the result. Guard the shift with `(rhs < width) ? (lhs op clamped_rhs) : nondet` (clamping
+    /// `clamped_rhs` inside the taken arm so CBMC's eager `--undefined-shift-check` does not
+    /// fault on the untaken expression) to match how literal `poison` is lowered.
+    fn lower_shift_value(
+        &self,
+        opcode: InstructionOpcode,
+        lhs: Expr,
+        rhs: Expr,
+        target: Type,
+    ) -> Result<Expr> {
+        if target.is_vector() {
+            let (len, lane_type) =
+                target
+                    .len()
+                    .zip(target.base_type().cloned())
+                    .ok_or_else(|| {
+                        Diagnostic::unsupported_feature(
+                            UnsupportedFeature::Instruction,
+                            format!(
+                                "vector shift expects a fixed vector in {}",
+                                self.function_name
+                            ),
+                        )
+                        .with_symbol(self.function_name.clone())
+                    })?;
+            let elems = (0..len)
+                .map(|lane| {
+                    let lhs_lane = self.aggregate_component(lhs.clone(), lane as usize)?;
+                    let rhs_lane = self.aggregate_component(rhs.clone(), lane as usize)?;
+                    self.lower_scalar_shift_value(opcode, lhs_lane, rhs_lane, lane_type.clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Expr::vector_expr(target, elems));
+        }
+        self.lower_scalar_shift_value(opcode, lhs, rhs, target)
+    }
+
+    fn lower_scalar_shift_value(
+        &self,
+        opcode: InstructionOpcode,
+        lhs: Expr,
+        rhs: Expr,
+        target: Type,
+    ) -> Result<Expr> {
+        let width = self.integer_width(&target)?;
+        let rhs = rhs.cast_to(target.clone());
+        let in_range = rhs.clone().lt(Expr::int_constant(width, target.clone()));
+        let clamped_rhs = in_range.clone().ternary(rhs, target.zero());
+        let shifted = match opcode {
+            InstructionOpcode::Shl => lhs.cast_to(target.clone()).shl(clamped_rhs),
+            InstructionOpcode::LShr => lhs.cast_to(target.clone()).lshr(clamped_rhs),
+            InstructionOpcode::AShr => self
+                .signed_view(lhs)?
+                .ashr(clamped_rhs)
+                .cast_to(target.clone()),
+            _ => unreachable!("shift opcode dispatched incorrectly"),
+        };
+        Ok(in_range.ternary(shifted, util::nondet_expr(target)))
     }
 
     fn lower_branch(
@@ -2753,6 +2812,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     }
 
     fn integer_width(&self, typ: &Type) -> Result<u64> {
+        if typ.is_c_bool() || typ.is_bool() {
+            return Ok(1);
+        }
         typ.native_width(self.symbols.machine_model())
             .ok_or_else(|| {
                 Diagnostic::unsupported_feature(
