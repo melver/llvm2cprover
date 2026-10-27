@@ -32,9 +32,9 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
     LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands, LLVMGetNumClauses,
-    LLVMGetNumMaskElements, LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetOperand,
-    LLVMGetSuccessor, LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantExpr,
-    LLVMIsAGlobalVariable, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
+    LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetSuccessor,
+    LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantExpr, LLVMIsAGlobalVariable,
+    LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
 };
 use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
@@ -438,16 +438,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 match target.base_type() {
                     // `<N x i1>` cannot be cast as a whole to a 1-bit vector, so go lane by lane.
                     Some(lane) if target.is_vector() && lane.is_c_bool() => {
-                        let elems = (0..target.len().unwrap_or(0) as usize)
-                            .map(|i| {
-                                Ok(Self::int_arith(
-                                    opcode,
-                                    self.aggregate_component(lhs.clone(), i)?,
-                                    self.aggregate_component(rhs.clone(), i)?,
-                                ))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        Expr::vector_expr(target.clone(), elems)
+                        self.map_lanes(&target, |i| {
+                            Ok(Self::int_arith(
+                                opcode,
+                                self.aggregate_component(lhs.clone(), i)?,
+                                self.aggregate_component(rhs.clone(), i)?,
+                            ))
+                        })?
                     }
                     _ => Self::int_arith(opcode, lhs, rhs),
                 }
@@ -522,31 +519,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         rhs: Expr,
         target: Type,
     ) -> Result<Expr> {
-        if target.is_vector() {
-            let (len, lane_type) =
-                target
-                    .len()
-                    .zip(target.base_type().cloned())
-                    .ok_or_else(|| {
-                        Diagnostic::unsupported_feature(
-                            UnsupportedFeature::Instruction,
-                            format!(
-                                "vector shift expects a fixed vector in {}",
-                                self.function_name
-                            ),
-                        )
-                        .with_symbol(self.function_name.clone())
-                    })?;
-            let elems = (0..len)
-                .map(|lane| {
-                    let lhs_lane = self.aggregate_component(lhs.clone(), lane as usize)?;
-                    let rhs_lane = self.aggregate_component(rhs.clone(), lane as usize)?;
-                    self.lower_scalar_shift_value(opcode, lhs_lane, rhs_lane, lane_type.clone())
-                })
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(Expr::vector_expr(target, elems));
+        match target.base_type() {
+            Some(lane) if target.is_vector() => self.map_lanes(&target, |i| {
+                let lhs_lane = self.aggregate_component(lhs.clone(), i)?;
+                let rhs_lane = self.aggregate_component(rhs.clone(), i)?;
+                self.lower_scalar_shift_value(opcode, lhs_lane, rhs_lane, lane.clone())
+            }),
+            _ => self.lower_scalar_shift_value(opcode, lhs, rhs, target),
         }
-        self.lower_scalar_shift_value(opcode, lhs, rhs, target)
     }
 
     fn lower_scalar_shift_value(
@@ -818,16 +798,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         debug_assert_eq!(lhs_len, rhs_len);
         debug_assert_eq!(lhs_len, result_len);
 
-        let elems = (0..lhs_len)
-            .map(|lane| {
-                let lhs_lane = self.aggregate_component(lhs.clone(), lane as usize)?;
-                let rhs_lane = self.aggregate_component(rhs.clone(), lane as usize)?;
-                Ok(self
-                    .lower_scalar_icmp_value(pred, lhs_lane, rhs_lane)?
-                    .cast_to(result_lane_type.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Expr::vector_expr(result_type, elems))
+        self.map_lanes(&result_type, |i| {
+            let lhs_lane = self.aggregate_component(lhs.clone(), i)?;
+            let rhs_lane = self.aggregate_component(rhs.clone(), i)?;
+            Ok(self
+                .lower_scalar_icmp_value(pred, lhs_lane, rhs_lane)?
+                .cast_to(result_lane_type.clone()))
+        })
     }
 
     fn vector_icmp_err(&self, msg: &str) -> Diagnostic {
@@ -864,14 +841,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         let is_signed = callee_name.starts_with("llvm.s");
         let is_min = callee_name.starts_with("llvm.umin") || callee_name.starts_with("llvm.smin");
-        let elems = (0..lhs_len)
-            .map(|lane| {
-                let lhs_lane = self.aggregate_component(lhs.clone(), lane as usize)?;
-                let rhs_lane = self.aggregate_component(rhs.clone(), lane as usize)?;
-                self.minmax_value(is_signed, is_min, lhs_lane, rhs_lane)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Expr::vector_expr(result_type, elems))
+        self.map_lanes(&result_type, |i| {
+            let lhs_lane = self.aggregate_component(lhs.clone(), i)?;
+            let rhs_lane = self.aggregate_component(rhs.clone(), i)?;
+            self.minmax_value(is_signed, is_min, lhs_lane, rhs_lane)
+        })
     }
 
     /// Integer `min`/`max` of two scalars, as `llvm.{s,u}{min,max}` define it.
@@ -1144,14 +1118,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 self.lower_bitcast_value(instruction, value, target)?
             }
             // Vector casts convert lane by lane; GOTO cannot cast between vector element types.
-            (_, Some(lane)) if instruction.get_type().is_vector_type() => {
-                let elems = (0..target.len().unwrap_or(0) as usize)
-                    .map(|i| {
-                        self.scalar_cast(opcode, self.aggregate_component(value.clone(), i)?, lane)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                self.rebuild_aggregate(target.clone(), elems)?
-            }
+            (_, Some(lane)) if instruction.get_type().is_vector_type() => self
+                .map_lanes(&target, |i| {
+                    self.scalar_cast(opcode, self.aggregate_component(value.clone(), i)?, lane)
+                })?,
             _ => self.scalar_cast(opcode, value, &target)?,
         };
         body.push(Stmt::assign(result, cast, loc));
@@ -1326,18 +1296,15 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .is_some_and(|op| op.get_type().is_vector_type())
         {
             // A vector condition selects each lane independently.
-            let elems = (0..result.typ().len().unwrap_or(0) as usize)
-                .map(|i| {
-                    Ok(self
-                        .aggregate_component(cond.clone(), i)?
-                        .cast_to(Type::bool())
-                        .ternary(
-                            self.aggregate_component(then_value.clone(), i)?,
-                            self.aggregate_component(else_value.clone(), i)?,
-                        ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            self.rebuild_aggregate(result.typ().clone(), elems)?
+            self.map_lanes(result.typ(), |i| {
+                Ok(self
+                    .aggregate_component(cond.clone(), i)?
+                    .cast_to(Type::bool())
+                    .ternary(
+                        self.aggregate_component(then_value.clone(), i)?,
+                        self.aggregate_component(else_value.clone(), i)?,
+                    ))
+            })?
         } else {
             cond.cast_to(Type::bool()).ternary(then_value, else_value)
         };
@@ -3206,15 +3173,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let vector = self.lower_operand(instruction, 0)?;
         let value = self.lower_operand(instruction, 1)?;
         let index = self.lower_operand(instruction, 2)?;
-        let typ = vector.typ().clone();
-        let len = typ.len().ok_or_else(|| {
-            Diagnostic::unsupported_feature(
-                UnsupportedFeature::Instruction,
-                format!("insertelement expects a vector in {}", self.function_name),
-            )
-            .with_symbol(self.function_name.clone())
-        })?;
-        let elem_type = typ.base_type().cloned().ok_or_else(|| {
+        let elem_type = vector.typ().base_type().cloned().ok_or_else(|| {
             Diagnostic::unsupported_feature(
                 UnsupportedFeature::Instruction,
                 format!("insertelement expects a vector in {}", self.function_name),
@@ -3224,17 +3183,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         // GOTO has vector values but no persistent single-lane update primitive, so model
         // insertelement by rebuilding the whole vector with a lane-wise select.
-        let elems = (0..len)
-            .map(|lane| {
-                let current = self.aggregate_component(vector.clone(), lane as usize)?;
-                Ok(index
-                    .clone()
-                    .eq(Expr::int_constant(lane, index.typ().clone()))
-                    .ternary(value.clone().cast_to(elem_type.clone()), current))
-            })
-            .collect::<Result<Vec<_>>>()?;
         let result = self.declare_instruction_result(instruction)?;
-        let value = self.rebuild_aggregate(result.typ().clone(), elems)?;
+        let value = self.map_lanes(result.typ(), |lane| {
+            let current = self.aggregate_component(vector.clone(), lane)?;
+            Ok(index
+                .clone()
+                .eq(Expr::int_constant(lane, index.typ().clone()))
+                .ternary(value.clone().cast_to(elem_type.clone()), current))
+        })?;
         body.push(Stmt::assign(result, value, loc));
         Ok(())
     }
@@ -3289,23 +3245,34 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         // Undef mask lanes are unconstrained in LLVM IR; emit nondet for those lanes rather
         // than silently pinning them to one arbitrary source element.
-        let elems = (0..unsafe { LLVMGetNumMaskElements(instruction.as_value_ref()) })
-            .map(|lane| {
-                let mask = unsafe { LLVMGetMaskValue(instruction.as_value_ref(), lane) };
-                if mask < 0 {
-                    return Ok(util::nondet_expr(elem_type.clone()));
-                }
-                let index = mask as u64;
-                if index < vector1_len {
-                    self.aggregate_component(vector1.clone(), index as usize)
-                } else {
-                    self.aggregate_component(vector2.clone(), (index - vector1_len) as usize)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let value = self.rebuild_aggregate(result.typ().clone(), elems)?;
+        let value = self.map_lanes(result.typ(), |lane| {
+            let mask = unsafe { LLVMGetMaskValue(instruction.as_value_ref(), lane as u32) };
+            if mask < 0 {
+                return Ok(util::nondet_expr(elem_type.clone()));
+            }
+            let index = mask as u64;
+            if index < vector1_len {
+                self.aggregate_component(vector1.clone(), index as usize)
+            } else {
+                self.aggregate_component(vector2.clone(), (index - vector1_len) as usize)
+            }
+        })?;
         body.push(Stmt::assign(result, value, loc));
         Ok(())
+    }
+
+    /// Build a value of vector type `typ` (or the array that `<N x ptr>` lowers to) whose lane
+    /// `i` is `lane(i)`.
+    fn map_lanes(&self, typ: &Type, lane: impl FnMut(usize) -> Result<Expr>) -> Result<Expr> {
+        let len = typ.len().ok_or_else(|| {
+            Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!("expected a fixed vector in {}", self.function_name),
+            )
+            .with_symbol(self.function_name.clone())
+        })?;
+        let elems = (0..len as usize).map(lane).collect::<Result<Vec<_>>>()?;
+        self.rebuild_aggregate(typ.clone(), elems)
     }
 
     fn project_aggregate_value(&self, aggregate: Expr, indices: &[u32]) -> Result<Expr> {
