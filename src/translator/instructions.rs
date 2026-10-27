@@ -2588,6 +2588,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 self.unsupported_intrinsic(callee_name, "vector reduction expects integer lanes")
             })?;
         let len = vector.typ().len().unwrap_or(0) as usize;
+        // `i1` lanes lower to `c_bool`, on which CBMC ignores `+`/`*`; mod 2 they are `^`/`&`.
+        let is_i1 = lane_type.is_c_bool();
         let loc = self.instruction_location(instruction);
         let acc = self.declare_hidden_local("reduce", lane_type, loc);
         body.push(Stmt::assign(
@@ -2599,11 +2601,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             let x = self.aggregate_component(vector.clone(), lane)?;
             let a = acc.clone();
             let value = match op {
-                "add" => a.plus(x),
-                "mul" => a.mul(x),
-                "and" => a.bitand(x),
+                "add" if !is_i1 => a.plus(x),
+                "mul" if !is_i1 => a.mul(x),
+                "and" | "mul" => a.bitand(x),
                 "or" => a.bitor(x),
-                "xor" => a.bitxor(x),
+                "xor" | "add" => a.bitxor(x),
                 _ => self.minmax_value(op.starts_with('s'), op.ends_with("min"), a, x)?,
             };
             body.push(Stmt::assign(acc.clone(), value, loc));
