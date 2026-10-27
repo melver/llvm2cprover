@@ -109,7 +109,7 @@ def inject(seed: int, cfg: Config, d: Path) -> Outcome | None:
     try:
         native = run(["./native"], d, timeout=cfg.native_timeout)
     except subprocess.TimeoutExpired:
-        return Outcome(seed, "timeout", opt="nat", detail="native")
+        return Outcome(seed, "invalid-seed", opt="nat", detail="native timeout")
     match = re.search(r"checksum = ([0-9A-F]+)", native.stdout)
     if match is None:
         return Outcome(seed, "invalid-seed", detail=f"native exit {native.returncode}, no checksum")
