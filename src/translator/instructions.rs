@@ -1308,7 +1308,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         body: &mut Vec<Stmt>,
     ) -> Result<()> {
         let loc = self.instruction_location(instruction);
-        let cond = self.lower_operand(instruction, 0)?.cast_to(Type::bool());
+        let cond = self.lower_operand(instruction, 0)?;
         let result = self.declare_instruction_result(instruction)?;
         let then_value = self
             .lower_operand(instruction, 1)?
@@ -1316,11 +1316,28 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let else_value = self
             .lower_operand(instruction, 2)?
             .cast_to(result.typ().clone());
-        body.push(Stmt::assign(
-            result,
-            cond.ternary(then_value, else_value),
-            loc,
-        ));
+        let value = if instruction
+            .get_operand(0)
+            .and_then(|op| op.value())
+            .is_some_and(|op| op.get_type().is_vector_type())
+        {
+            // A vector condition selects each lane independently.
+            let elems = (0..result.typ().len().unwrap_or(0) as usize)
+                .map(|i| {
+                    Ok(self
+                        .aggregate_component(cond.clone(), i)?
+                        .cast_to(Type::bool())
+                        .ternary(
+                            self.aggregate_component(then_value.clone(), i)?,
+                            self.aggregate_component(else_value.clone(), i)?,
+                        ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.rebuild_aggregate(result.typ().clone(), elems)?
+        } else {
+            cond.cast_to(Type::bool()).ternary(then_value, else_value)
+        };
+        body.push(Stmt::assign(result, value, loc));
         Ok(())
     }
 
