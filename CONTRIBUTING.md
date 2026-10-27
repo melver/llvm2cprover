@@ -41,6 +41,24 @@ End-to-end tests live under `tests/<category>/` as standalone `.c`, `.cc`,
 llvm2cprover, runs CBMC, and checks the outcome against `expected`. Output is
 TAP. Run with `make test-e2e`.
 
+### Fuzzing (Optional)
+
+`tests/fuzz/csmith.py` differentially fuzzes the translator with
+[Csmith](https://github.com/csmith-project/csmith): the native `-O0` checksum
+is the oracle; the same program must verify under `clang → llvm2cprover → cbmc`.
+It is not part of `make` and is not required for ordinary changes; run it
+deliberately (e.g. before a release or after touching instruction lowering).
+It needs `csmith`, `clang`, and `cbmc` on `PATH` plus a built
+`target/debug/llvm2cprover`:
+
+```sh
+tests/fuzz/csmith.py run --out /tmp/fuzz --seeds 1-500 -j 16   # exit 1 iff actionable
+tests/fuzz/csmith.py reduce --out /tmp/fuzz --seed 18           # creduce a failing seed
+```
+
+Failing seeds keep their artifacts under `<out>/seed-N/`; every outcome is
+appended to `<out>/results.jsonl`.
+
 ## Documentation
 
 - Keep public rustdoc minimal and useful.
