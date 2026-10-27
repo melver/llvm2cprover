@@ -2169,8 +2169,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
-        if callee_name.starts_with("llvm.cttz") {
-            let value = self.lower_count_zeros(callee_name, args, false)?;
+        let leading = callee_name.starts_with("llvm.ctlz");
+        if leading || callee_name.starts_with("llvm.cttz") {
+            let value = self.lower_count_zeros(callee_name, args, leading)?;
             self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
