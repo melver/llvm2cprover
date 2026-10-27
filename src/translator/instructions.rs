@@ -1127,23 +1127,41 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let loc = self.instruction_location(instruction);
         let value = self.lower_operand(instruction, 0)?;
         let result = self.declare_instruction_result(instruction)?;
-        let cast = match instruction.get_opcode() {
+        let opcode = instruction.get_opcode();
+        let target = result.typ().clone();
+        let cast = match (opcode, target.base_type()) {
+            (InstructionOpcode::BitCast, _) => {
+                self.lower_bitcast_value(instruction, value, target)?
+            }
+            // Vector casts convert lane by lane; GOTO cannot cast between vector element types.
+            (_, Some(lane)) if target.is_vector() => {
+                let elems = (0..target.len().unwrap_or(0) as usize)
+                    .map(|i| {
+                        self.scalar_cast(opcode, self.aggregate_component(value.clone(), i)?, lane)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Expr::vector_expr(target.clone(), elems)
+            }
+            _ => self.scalar_cast(opcode, value, &target)?,
+        };
+        body.push(Stmt::assign(result, cast, loc));
+        Ok(())
+    }
+
+    /// Lower a non-bitcast LLVM conversion of a single (non-vector) value to `target`.
+    fn scalar_cast(&self, opcode: InstructionOpcode, value: Expr, target: &Type) -> Result<Expr> {
+        Ok(match opcode {
             // LLVM signed extension is not a plain type-width change in our normalized
             // unsigned-bitvector world, so reinterpret the source as signed first.
             InstructionOpcode::SExt => self
                 .signed_view(value)?
-                .cast_to(
-                    result
-                        .typ()
-                        .to_signed()
-                        .unwrap_or_else(|| result.typ().clone()),
-                )
-                .cast_to(result.typ().clone()),
+                .cast_to(target.to_signed().unwrap_or_else(|| target.clone()))
+                .cast_to(target.clone()),
             // `i1` lowers to 8-bit `c_bool`, so truncate through a 1-bit bitvector first to
             // extract the least-significant bit instead of the low byte.
-            InstructionOpcode::Trunc if result.typ().is_c_bool() => value
+            InstructionOpcode::Trunc if target.is_c_bool() => value
                 .cast_to(Type::unsigned_int(1_u32))
-                .cast_to(result.typ().clone()),
+                .cast_to(target.clone()),
             InstructionOpcode::ZExt
             | InstructionOpcode::Trunc
             | InstructionOpcode::PtrToInt
@@ -1154,14 +1172,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             | InstructionOpcode::FPToSI
             | InstructionOpcode::FPToUI
             | InstructionOpcode::SIToFP
-            | InstructionOpcode::UIToFP => value.cast_to(result.typ().clone()),
-            InstructionOpcode::BitCast => {
-                self.lower_bitcast_value(instruction, value, result.typ().clone())?
-            }
+            | InstructionOpcode::UIToFP => value.cast_to(target.clone()),
             _ => unreachable!("cast opcode dispatched incorrectly"),
-        };
-        body.push(Stmt::assign(result, cast, loc));
-        Ok(())
+        })
     }
 
     fn lower_bitcast_value(
