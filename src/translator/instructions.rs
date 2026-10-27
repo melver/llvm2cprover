@@ -2193,20 +2193,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         if callee_name.starts_with("llvm.ctpop") {
-            let value = args
-                .first()
-                .cloned()
-                .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing ctpop argument"))?
-                .popcount();
+            let value = self.scalar_int_operand(callee_name, args)?.popcount();
             self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
 
         if callee_name.starts_with("llvm.cttz") {
-            let value = args
-                .first()
-                .cloned()
-                .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing cttz argument"))?
+            let value = self
+                .scalar_int_operand(callee_name, args)?
                 .cttz(self.intrinsic_allow_zero(callee_name, args, "cttz")?);
             self.assign_result(instruction, body, value)?;
             return Ok(true);
@@ -2226,11 +2220,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
 
         if callee_name.starts_with("llvm.bswap") {
-            let value = args
-                .first()
-                .cloned()
-                .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing bswap argument"))?
-                .bswap();
+            let value = self.scalar_int_operand(callee_name, args)?.bswap();
             self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
