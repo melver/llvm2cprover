@@ -397,11 +397,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             InstructionOpcode::ExtractValue => self.lower_extractvalue(instruction, body),
             InstructionOpcode::InsertValue => self.lower_insertvalue(instruction, body),
             InstructionOpcode::Unreachable => {
-                body.push(Stmt::assert_false(
-                    "unreachable",
-                    "llvm.unreachable",
-                    self.instruction_location(instruction),
-                ));
+                let loc = self.instruction_location(instruction);
+                body.push(Stmt::assert_false("unreachable", "llvm.unreachable", loc));
+                // `unreachable` is a terminator without successors. GOTO code falls through to
+                // the next block in layout order, so end the path explicitly; otherwise the
+                // (possibly infeasible) path continues with state it never set up.
+                body.push(Stmt::assume(Expr::bool_false(), loc));
                 Ok(())
             }
             opcode => Err(Diagnostic::unsupported_feature(
