@@ -2300,13 +2300,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
-        if matches!(callee_name, "llvm.trap" | "llvm.debugtrap") {
-            body.push(Stmt::assert_false("trap", callee_name, loc));
-            return Ok(true);
-        }
-
-        if is_rust_panic_symbol(callee_name) {
-            body.push(Stmt::assert_false("panic", "Rust panic", loc));
+        if let Some((property, message)) = failure_hook(callee_name) {
+            // `__assert_fail(assertion, file, line, function)`: report the assertion text.
+            let message = (callee_name == "__assert_fail")
+                .then(|| self.constant_string_operand(instruction, 0))
+                .flatten()
+                .unwrap_or_else(|| message.to_owned());
+            body.push(Stmt::assert_false(property, &message, loc));
             return Ok(true);
         }
 
@@ -4263,8 +4263,22 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     }
 }
 
-/// Recognize Rust's `core::panicking::*` and `core::slice::index::slice_index_fail` ABI entry
-/// points across both v0 (`_R...`) and legacy (`_ZN...E`) symbol mangling.
+/// Calls that are assertion failures, as `(property, message)`: each lowers to `ASSERT false`.
+/// The list is explicit; there is no heuristic such as `noreturn`, which also covers `exit`.
+fn failure_hook(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "llvm.trap" => Some(("trap", "llvm.trap")),
+        "llvm.debugtrap" => Some(("trap", "llvm.debugtrap")),
+        // glibc/musl `<assert.h>`. CBMC special-cases calls to it by name and requires a
+        // string literal argument, so the call must never be emitted as-is.
+        "__assert_fail" => Some(("assertion", "C assert failure")),
+        _ if is_rust_panic_symbol(name) => Some(("panic", "Rust panic")),
+        _ => None,
+    }
+}
+
+/// Recognize Rust's cold panic entry points in `core` across both v0 (`_R...`) and legacy
+/// (`_ZN...E`) symbol mangling.
 fn is_rust_panic_symbol(name: &str) -> bool {
     if let Some(rest) = name
         .strip_prefix("_ZN4core")
@@ -4295,10 +4309,21 @@ fn is_rust_panic_symbol(name: &str) -> bool {
         .is_some_and(is_rust_core_panic_path)
 }
 
+/// `rest` is the path below `core`, as length-prefixed identifiers. All of `core::panicking` is a
+/// panic; outside it, only the listed functions are.
 fn is_rust_core_panic_path(rest: &str) -> bool {
+    const PANIC_FNS: &[&str] = &[
+        "5slice5index16slice_index_fail",
+        "6result13unwrap_failed",
+        "6option13unwrap_failed",
+        "6option13expect_failed",
+    ];
     if let Some(tail) = rest.strip_prefix("9panicking") {
         return tail.as_bytes().first().is_some_and(u8::is_ascii_digit);
     }
-    rest.strip_prefix("5slice5index16slice_index_fail")
-        .is_some_and(|tail| tail.is_empty() || tail.starts_with("17h"))
+    // Legacy mangling appends a `17h<hash>` disambiguator.
+    PANIC_FNS.iter().any(|path| {
+        rest.strip_prefix(path)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with("17h"))
+    })
 }

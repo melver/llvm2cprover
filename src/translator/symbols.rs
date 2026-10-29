@@ -2201,6 +2201,9 @@ mod tests {
             declare void @_RNvNtNtCs1234_4core5slice5index16slice_index_fail(i64, i64, i64, ptr)
             declare void @_ZN4core9panicking5panic17h0123456789abcdefE(ptr, i64, ptr)
             declare void @_ZN4core5slice5index16slice_index_fail17h0123456789abcdefE(i64, i64, i64, ptr)
+            declare void @_RNvNtCskADBYZwJmSU_4core6result13unwrap_failed(ptr, i64, ptr, ptr, ptr)
+            declare void @_RNvNtCskADBYZwJmSU_4core6option13unwrap_failed(ptr)
+            declare void @_ZN4core6option13expect_failed17h0123456789abcdefE(ptr, i64, ptr)
 
             define void @f() {
             entry:
@@ -2209,13 +2212,16 @@ mod tests {
               call void @_RNvNtNtCs1234_4core5slice5index16slice_index_fail(i64 0, i64 0, i64 0, ptr null)
               call void @_ZN4core9panicking5panic17h0123456789abcdefE(ptr null, i64 0, ptr null)
               call void @_ZN4core5slice5index16slice_index_fail17h0123456789abcdefE(i64 0, i64 0, i64 0, ptr null)
+              call void @_RNvNtCskADBYZwJmSU_4core6result13unwrap_failed(ptr null, i64 0, ptr null, ptr null, ptr null)
+              call void @_RNvNtCskADBYZwJmSU_4core6option13unwrap_failed(ptr null)
+              call void @_ZN4core6option13expect_failed17h0123456789abcdefE(ptr null, i64 0, ptr null)
               ret void
             }
         "#,
         );
 
         let debug = stmt_debug(&symbols, "f");
-        assert_eq!(debug.matches("Assert {").count(), 5);
+        assert_eq!(debug.matches("Assert {").count(), 8);
         assert!(debug.contains("Rust panic"));
         assert!(!debug.contains("FunctionCall"));
     }
