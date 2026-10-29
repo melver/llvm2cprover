@@ -2189,6 +2189,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.abs") {
+            let value = self.lower_abs(callee_name, args)?;
+            self.assign_result(instruction, body, value)?;
+            return Ok(true);
+        }
+
         if callee_name.starts_with("llvm.bswap") {
             let value = self.lower_int_unary(callee_name, args, Expr::bswap)?;
             self.assign_result(instruction, body, value)?;
@@ -2452,7 +2458,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     /// `x == 0 ? width : cttz(x, true)` pattern. Otherwise a zero input yields the bit width,
     /// which is CBMC's result when zero is permitted.
     fn lower_count_zeros(&self, callee_name: &str, args: &[Expr], leading: bool) -> Result<Expr> {
-        let zero_is_poison = self.intrinsic_zero_is_poison(callee_name, args)?;
+        let zero_is_poison = self.intrinsic_poison_flag(callee_name, args)?;
         self.lower_int_unary(callee_name, args, |value| {
             // `i1` lowers to 8-bit `c_bool`; count over a 1-bit bitvector so the width is 1.
             let value = if value.typ().is_c_bool() {
@@ -2474,10 +2480,36 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         })
     }
 
-    fn intrinsic_zero_is_poison(&self, callee_name: &str, args: &[Expr]) -> Result<bool> {
-        let flag = args.get(1).ok_or_else(|| {
-            self.unsupported_intrinsic(callee_name, "missing zero-is-poison flag")
-        })?;
+    /// `llvm.abs`. The `i1` flag is LLVM's `is_int_min_poison`; INT_MIN otherwise wraps to
+    /// itself.
+    ///
+    /// Lanes are unsigned bitvectors (and `i1` is handled mod 2 by `int_arith`), so with
+    /// `neg = 0 - x` the result is `neg < x ? neg : x`: for negative `x` the wrapped negation is
+    /// the smaller value, and INT_MIN is the only nonzero `x` with `neg == x`.
+    fn lower_abs(&self, callee_name: &str, args: &[Expr]) -> Result<Expr> {
+        let int_min_is_poison = self.intrinsic_poison_flag(callee_name, args)?;
+        self.lower_int_unary(callee_name, args, |value| {
+            let zero = value.typ().zero();
+            let neg = Self::int_arith(InstructionOpcode::Sub, zero.clone(), value.clone());
+            let abs = neg
+                .clone()
+                .lt(value.clone())
+                .ternary(neg.clone(), value.clone());
+            if int_min_is_poison {
+                let is_min = neg.eq(value.clone()).and(value.neq(zero));
+                is_min.ternary(util::nondet_expr(abs.typ().clone()), abs)
+            } else {
+                abs
+            }
+        })
+    }
+
+    /// The constant `i1` poison flag of `llvm.cttz`/`llvm.ctlz` (`is_zero_poison`) and
+    /// `llvm.abs` (`is_int_min_poison`).
+    fn intrinsic_poison_flag(&self, callee_name: &str, args: &[Expr]) -> Result<bool> {
+        let flag = args
+            .get(1)
+            .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing poison flag"))?;
         if let Some(flag) = flag.int_constant_value() {
             return Ok(flag != 0.into());
         }
@@ -2485,7 +2517,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             cprover_bindings::goto_program::ExprValue::BoolConstant(value)
             | cprover_bindings::goto_program::ExprValue::CBoolConstant(value) => Ok(*value),
             _ => Err(self
-                .unsupported_intrinsic(callee_name, "non-constant zero-is-poison flag")
+                .unsupported_intrinsic(callee_name, "non-constant poison flag")
                 .into()),
         }
     }
