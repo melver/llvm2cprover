@@ -100,7 +100,6 @@ pub fn machine_model(
             machine.long_int_width = 32;
             machine.memory_operand_size = 4;
             machine.pointer_width = 32;
-            machine.word_size = 32;
             machine
         }
         MachineModel::Lp64 => machine,
@@ -135,7 +134,9 @@ fn common_machine_model(architecture: String, is_big_endian: bool) -> GotoMachin
         single_width: 32,
         wchar_t_is_unsigned: false,
         wchar_t_width: 32,
-        word_size: 64,
+        // CBMC's legacy alias of `int_width` (`architecture_string(int_width, "word_size") // old`
+        // in ansi_c_internal_additions.cpp); any other value conflicts with its built-in library.
+        word_size: 32,
     }
 }
 
@@ -493,6 +494,14 @@ mod tests {
 
         let model_32 = resolve_machine_model(&module, MachineModel::Ilp32).expect("resolve");
         assert_eq!(model_32.architecture, "i386");
+    }
+
+    #[test]
+    fn word_size_is_int_width() {
+        for model in [MachineModel::Ilp32, MachineModel::Lp64, MachineModel::Llp64] {
+            let machine = machine_model(model, "x86_64".into(), false);
+            assert_eq!(machine.word_size, machine.int_width);
+        }
     }
 
     #[test]
