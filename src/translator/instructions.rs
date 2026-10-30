@@ -2236,6 +2236,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.ucmp.") || callee_name.starts_with("llvm.scmp.") {
+            self.lower_three_way_cmp_intrinsic(callee_name, instruction, args, body)?;
+            return Ok(true);
+        }
+
         if callee_name.starts_with("llvm.vector.reduce.") {
             self.lower_vector_reduce_intrinsic(callee_name, instruction, args, body)?;
             return Ok(true);
@@ -2665,6 +2670,49 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let is_signed = callee_name.starts_with("llvm.s");
         let is_min = callee_name.starts_with("llvm.umin") || callee_name.starts_with("llvm.smin");
         let value = self.minmax_value(is_signed, is_min, lhs, rhs)?;
+        self.assign_result(instruction, body, value)
+    }
+
+    /// `llvm.{u,s}cmp`: three-way comparison, `-1`/`0`/`1` in the result type; vector overloads
+    /// compare lane by lane.
+    fn lower_three_way_cmp_intrinsic(
+        &mut self,
+        callee_name: &str,
+        instruction: InstructionValue<'ctx>,
+        args: &[Expr],
+        body: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let [lhs, rhs] = args else {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "expects two operands")
+                .into());
+        };
+        let (lhs, rhs) = self.normalize_icmp_operands(lhs.clone(), rhs.clone());
+        let result_type = self.declare_instruction_result(instruction)?.typ().clone();
+        let signed = callee_name.starts_with("llvm.scmp.");
+        // The `c_int` constants are cast to the result type: -1 wraps to all-ones in iN.
+        let cmp = |lhs: Expr, rhs: Expr| -> Result<Expr> {
+            let (lhs, rhs) = if signed {
+                (self.signed_view(lhs)?, self.signed_view(rhs)?)
+            } else {
+                (lhs, rhs)
+            };
+            let int = |v: i64| Expr::int_constant(v, Type::c_int());
+            Ok(lhs
+                .clone()
+                .lt(rhs.clone())
+                .ternary(int(-1), lhs.gt(rhs).ternary(int(1), int(0))))
+        };
+        let value = match result_type.base_type() {
+            Some(lane) if result_type.is_vector() => self.map_lanes(&result_type, |i| {
+                Ok(cmp(
+                    self.aggregate_component(lhs.clone(), i)?,
+                    self.aggregate_component(rhs.clone(), i)?,
+                )?
+                .cast_to(lane.clone()))
+            })?,
+            _ => cmp(lhs, rhs)?,
+        };
         self.assign_result(instruction, body, value)
     }
 
