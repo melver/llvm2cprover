@@ -120,51 +120,6 @@ fn text_diagnostics_remain_the_default() {
 }
 
 #[test]
-fn rename_prefix_rejects_contract_manifests() {
-    let input = input_file(
-        r#"
-define i1 @requires_f() {
-entry:
-  ret i1 true
-}
-define void @f() {
-entry:
-  ret void
-}
-"#,
-    );
-    let manifest = input.with_extension("toml");
-    fs::write(
-        &manifest,
-        r#"
-[functions.f]
-requires = "requires_f"
-"#,
-    )
-    .expect("failed to write contract manifest");
-
-    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
-        .arg("--input-format")
-        .arg("ll")
-        .arg("--rename-prefix")
-        .arg("old_")
-        .arg("--contracts")
-        .arg(&manifest)
-        .arg(&input)
-        .output()
-        .expect("failed to run llvm2cprover");
-    fs::remove_file(input).expect("failed to remove test input");
-    fs::remove_file(manifest).expect("failed to remove contract manifest");
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("stderr was not UTF-8");
-    assert!(
-        stderr.contains("--rename-prefix cannot currently be combined with --contracts"),
-        "{stderr}"
-    );
-}
-
-#[test]
 fn granular_unsound_report_inventories_translation_assumptions() {
     let input = input_file(
         r#"

@@ -162,7 +162,7 @@ impl Translator {
         let context = Context::create();
         let module = parse_module(&context, &input, self.config.input_format, &bytes)?;
         reject_module_inline_asm(&module)?;
-        let contracts = contracts::load_contracts(&self.config.contracts)?;
+        let mut contracts = contracts::load_contracts(&self.config.contracts)?;
         if self.config.enforce_contract.len() > 1 {
             bail!("exactly one --enforce-contract target may be selected per translation");
         }
@@ -172,12 +172,8 @@ impl Translator {
         if let Some(prefix) = self.config.rename_prefix.as_deref()
             && !prefix.is_empty()
         {
-            if !contracts.is_empty() {
-                bail!(
-                    "--rename-prefix cannot currently be combined with --contracts; contract manifests name original LLVM symbols"
-                );
-            }
-            rename::rename_module_symbols(&module, &machine_model, prefix)?;
+            let renames = rename::rename_module_symbols(&module, &machine_model, prefix)?;
+            contracts = contracts.renamed(&renames);
         }
         let cone = (!self.config.entry.is_empty())
             .then(|| {

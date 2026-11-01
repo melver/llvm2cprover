@@ -233,6 +233,55 @@ impl ContractMap {
         !self.inline_asm.is_empty()
     }
 
+    /// Map symbol names through a `--rename-prefix` mapping. Manifests name original LLVM symbols;
+    /// names outside the mapping (external declarations, reserved symbols) are shared and kept.
+    pub(crate) fn renamed(self, renames: &BTreeMap<String, String>) -> Self {
+        let name = |s: String| renames.get(&s).cloned().unwrap_or(s);
+        let functions = self
+            .functions
+            .into_iter()
+            .map(|(target, c)| {
+                let contract = FunctionContract {
+                    requires: c.requires.map(name),
+                    ensures: c.ensures.map(name),
+                    snapshot: c.snapshot.map(name),
+                    model: c.model.map(name),
+                    assigns: c.assigns.map(|a| a.into_iter().map(name).collect()),
+                };
+                (name(target), contract)
+            })
+            .collect();
+        let inline_asm = self
+            .inline_asm
+            .into_iter()
+            .map(
+                |InlineAsmModel {
+                     asm,
+                     constraints,
+                     dialect,
+                     side_effects,
+                     align_stack,
+                     function,
+                     model,
+                 }| InlineAsmModel {
+                    asm,
+                    constraints,
+                    dialect,
+                    side_effects,
+                    align_stack,
+                    function: function.map(name),
+                    model: name(model),
+                },
+            )
+            .collect();
+        let helpers = self.helpers.into_iter().map(name).collect();
+        Self {
+            functions,
+            inline_asm,
+            helpers,
+        }
+    }
+
     /// Restrict contracts and inline-assembly rules to the reachable cone of influence.
     ///
     /// Explicitly selected replacement and enforcement targets are retained so missing or
@@ -376,6 +425,57 @@ mod tests {
         assert!(contracts.is_helper("__contract_requires_abs"));
         assert!(contracts.is_helper("__contract_snapshot_abs"));
         assert!(contracts.is_helper("__contract_assigns_abs"));
+    }
+
+    #[test]
+    fn renamed_maps_every_symbol_field_and_keeps_external_names() {
+        let contracts = super::parse_contracts(
+            r#"
+            [functions.abs]
+            requires = "req"
+            ensures = "ens"
+            snapshot = "snap"
+            model = "model"
+            assigns = ["frame", "ext_frame"]
+
+            [[inline_asm]]
+            asm = "nop"
+            constraints = ""
+            dialect = "att"
+            side_effects = true
+            align_stack = false
+            function = "abs"
+            model = "asm_model"
+            "#,
+        )
+        .expect("failed to parse contracts");
+        let renames = ["abs", "req", "ens", "snap", "model", "frame", "asm_model"]
+            .map(|s| (s.to_owned(), format!("p_{s}")))
+            .into();
+
+        let contracts = contracts.renamed(&renames);
+
+        assert!(contracts.function("abs").is_none());
+        let abs = contracts
+            .function("p_abs")
+            .expect("missing renamed contract");
+        assert_eq!(abs.requires.as_deref(), Some("p_req"));
+        assert_eq!(abs.ensures.as_deref(), Some("p_ens"));
+        assert_eq!(abs.snapshot.as_deref(), Some("p_snap"));
+        assert_eq!(abs.model.as_deref(), Some("p_model"));
+        // `ext_frame` is outside the mapping (e.g. an external declaration) and stays shared.
+        assert_eq!(
+            abs.assigns,
+            Some(vec!["p_frame".into(), "ext_frame".into()])
+        );
+        assert!(contracts.is_helper("p_req") && !contracts.is_helper("req"));
+        assert!(contracts.is_helper("ext_frame"));
+        let asm = contracts
+            .inline_asm_models()
+            .next()
+            .expect("missing asm model");
+        assert_eq!(asm.function.as_deref(), Some("p_abs"));
+        assert_eq!(asm.model, "p_asm_model");
     }
 
     #[test]

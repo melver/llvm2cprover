@@ -49,7 +49,8 @@ struct Rename<'ctx> {
     output: String,
 }
 
-/// Prefix every non-reserved LLVM function and global definition in `module`.
+/// Prefix every non-reserved LLVM function and global definition in `module`, returning the
+/// applied `original -> renamed` mapping.
 ///
 /// The operation validates the complete mapping first and uses temporary names while applying it,
 /// so an existing symbol whose name already begins with the requested prefix cannot perturb LLVM's
@@ -58,9 +59,9 @@ pub(super) fn rename_module_symbols(
     module: &Module<'_>,
     machine_model: &MachineModel,
     prefix: &str,
-) -> Result<()> {
+) -> Result<BTreeMap<String, String>> {
     if prefix.is_empty() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
     if prefix.contains('\0') {
         bail!("rename prefix contains a NUL byte");
@@ -107,10 +108,13 @@ pub(super) fn rename_module_symbols(
         temporary_names.insert(temporary.clone());
         rename.value.set_name(&temporary);
     }
-    for rename in renames {
+    for rename in &renames {
         rename.value.set_name(&rename.output);
     }
-    Ok(())
+    Ok(renames
+        .into_iter()
+        .map(|r| (r.original, r.output))
+        .collect())
 }
 
 fn validate_mapping(
@@ -183,7 +187,7 @@ mod tests {
     fn rename(module: &Module<'_>, prefix: &str) -> Result<()> {
         let machine_model = crate::util::resolve_machine_model(module, crate::MachineModel::Auto)
             .expect("failed to resolve test machine model");
-        rename_module_symbols(module, &machine_model, prefix)
+        rename_module_symbols(module, &machine_model, prefix).map(|_| ())
     }
 
     #[test]

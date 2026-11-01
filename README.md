@@ -97,9 +97,11 @@ cbmc old.goto --function old_main
 ```
 
 External declarations, LLVM intrinsics, `__CPROVER_*` builtins, and
-llvm2cprover runtime symbols remain shared. A nonempty prefix cannot currently
-be combined with contract manifests because manifests refer to original LLVM
-symbol names.
+llvm2cprover runtime symbols remain shared. Contract manifests keep naming the
+original LLVM symbols, so one manifest serves every variant; `--entry`,
+`--replace-with-contract` and `--enforce-contract` name the prefixed symbols.
+A manifest name that is not an original symbol is used as written, so a
+manifest may also name the prefixed symbols of one specific variant.
 
 ## Soundness and limitations
 
