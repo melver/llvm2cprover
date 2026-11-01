@@ -100,6 +100,17 @@ External declarations, LLVM intrinsics, `__CPROVER_*` builtins, and
 llvm2cprover runtime symbols remain shared. Contract manifests keep naming the
 original LLVM symbols, so one manifest serves every variant; `--entry`,
 `--replace-with-contract` and `--enforce-contract` name the prefixed symbols.
+
+### Emitting LLVM IR
+
+`--emit-llvm` writes the module after llvm2cprover's LLVM IR transformations
+(currently `--rename-prefix`) as bitcode to the required `-o` instead of
+lowering it to GOTO, like other LLVM tools. GOTO-only options (`--entry`,
+`--contracts`, `--report`, ...) are rejected with it:
+
+```sh
+llvm2cprover --rename-prefix c_ --emit-llvm c.bc -o c_prefixed.bc
+```
 A manifest name that is not an original symbol is used as written, so a
 manifest may also name the prefixed symbols of one specific variant.
 

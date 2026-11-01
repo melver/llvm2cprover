@@ -104,6 +104,22 @@ struct Cli {
     #[arg(long)]
     rename_prefix: Option<String>,
 
+    /// Write the transformed LLVM module as bitcode to -o instead of GOTO.
+    #[arg(
+        long,
+        requires = "output",
+        conflicts_with_all = [
+            "contracts",
+            "entry",
+            "replace_with_contract",
+            "enforce_contract",
+            "unsound",
+            "report",
+            "emit_asm_manifest"
+        ]
+    )]
+    emit_llvm: bool,
+
     #[arg(long, value_enum, default_value_t = CliMachineModel::Auto)]
     machine_model: CliMachineModel,
 
@@ -177,6 +193,7 @@ fn main() -> std::process::ExitCode {
         replace_with_contract: cli.replace_with_contract.into_iter().collect(),
         enforce_contract: cli.enforce_contract.into_iter().collect(),
         rename_prefix: cli.rename_prefix,
+        emit_llvm: cli.emit_llvm,
         machine_model: cli.machine_model.into(),
         input_format: cli.input_format.into(),
         unsound,

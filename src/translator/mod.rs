@@ -156,12 +156,12 @@ impl Translator {
         Self { config }
     }
 
-    /// Parse, lower, and emit a GOTO binary for one input module.
+    /// Parse, lower, and emit a GOTO binary for one input module (or, with `emit_llvm`, the
+    /// transformed LLVM module as bitcode).
     pub fn translate(&self, input: TranslationInput) -> Result<()> {
         let bytes = read_input(&input)?;
         let context = Context::create();
         let module = parse_module(&context, &input, self.config.input_format, &bytes)?;
-        reject_module_inline_asm(&module)?;
         let mut contracts = contracts::load_contracts(&self.config.contracts)?;
         if self.config.enforce_contract.len() > 1 {
             bail!("exactly one --enforce-contract target may be selected per translation");
@@ -175,6 +175,18 @@ impl Translator {
             let renames = rename::rename_module_symbols(&module, &machine_model, prefix)?;
             contracts = contracts.renamed(&renames);
         }
+        if self.config.emit_llvm {
+            let output = self
+                .config
+                .output
+                .as_ref()
+                .context("--emit-llvm requires an explicit output path")?;
+            if !module.write_bitcode_to_path(output) {
+                bail!("failed to write LLVM bitcode to {}", output.display());
+            }
+            return Ok(());
+        }
+        reject_module_inline_asm(&module)?;
         let cone = (!self.config.entry.is_empty())
             .then(|| {
                 symbols::ConeOfInfluence::compute(

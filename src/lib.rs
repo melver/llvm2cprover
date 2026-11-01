@@ -137,9 +137,11 @@ pub struct Config {
     /// Prefix applied to translated LLVM function and global definitions.
     ///
     /// External declarations, LLVM intrinsics, and verifier/runtime symbols remain unprefixed.
-    /// Manifests cannot currently be combined with renaming because their symbol bindings use
-    /// original LLVM names.
+    /// Manifests keep naming original LLVM symbols and are mapped along with the module.
     pub rename_prefix: Option<String>,
+    /// Write the module after the LLVM IR transformations (`rename_prefix`) as bitcode to
+    /// `output`, which is then required, instead of lowering it to GOTO.
+    pub emit_llvm: bool,
     /// Machine model used for emitted GOTO types and builtins. `Auto` infers from the module.
     pub machine_model: MachineModel,
     /// LLVM input format override. `Auto` detects bitcode vs textual IR.

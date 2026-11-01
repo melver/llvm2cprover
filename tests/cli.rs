@@ -821,3 +821,81 @@ requires = "missing_other_requires"
         ])
     );
 }
+
+#[test]
+fn emit_llvm_writes_transformed_bitcode() {
+    let input = input_file(
+        r#"
+define void @f() {
+entry:
+  ret void
+}
+"#,
+    );
+    let bitcode = input.with_extension("bc");
+    let emit = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .args([
+            "--input-format",
+            "ll",
+            "--rename-prefix",
+            "p_",
+            "--emit-llvm",
+            "-o",
+        ])
+        .arg(&bitcode)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    assert!(
+        emit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let bytes = fs::read(&bitcode).expect("--emit-llvm must write the -o path");
+    assert!(bytes.starts_with(b"BC\xc0\xde"), "not LLVM bitcode");
+
+    // The emitted module carries the renamed definition: it is a valid entry, the old name is not.
+    let goto = input.with_extension("goto");
+    let entry = |name: &str| {
+        Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+            .args(["--entry", name, "-o"])
+            .arg(&goto)
+            .arg(&bitcode)
+            .output()
+            .expect("failed to run llvm2cprover")
+            .status
+            .success()
+    };
+    assert!(entry("p_f"));
+    assert!(!entry("f"));
+    for path in [input, bitcode, goto] {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[test]
+fn emit_llvm_requires_output() {
+    // Without -o there is no safe default: for a `.bc` input it would be the input itself.
+    let input = input_file("define void @f() {\nentry:\n  ret void\n}\n");
+    let before = fs::read(&input).expect("failed to read test input");
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .args(["--rename-prefix", "p_", "--emit-llvm"])
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    let after = fs::read(&input).expect("failed to read test input");
+    let _ = fs::remove_file(&input);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--output"));
+    assert_eq!(before, after);
+}
+
+#[test]
+fn emit_llvm_rejects_goto_only_options() {
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .args(["--emit-llvm", "--entry", "f", "in.ll"])
+        .output()
+        .expect("failed to run llvm2cprover");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+}
