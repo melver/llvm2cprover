@@ -44,6 +44,7 @@ use inkwell::values::{
 };
 use num::bigint::BigInt;
 
+use super::fp_dispatch::FpDispatch;
 use super::globals::GlobalLowerer;
 use super::report::ReportCollector;
 use super::types::TypeLowerer;
@@ -62,6 +63,7 @@ pub struct InstructionLowerer<'a> {
     contracts: &'a ContractMap,
     replacements: &'a ReplacementMap,
     unsound: &'a UnsoundOptions,
+    fp_dispatch: Option<&'a FpDispatch>,
     report: &'a mut ReportCollector,
 }
 
@@ -71,12 +73,14 @@ impl<'a> InstructionLowerer<'a> {
         contracts: &'a ContractMap,
         replacements: &'a ReplacementMap,
         unsound: &'a UnsoundOptions,
+        fp_dispatch: Option<&'a FpDispatch>,
         report: &'a mut ReportCollector,
     ) -> Self {
         Self {
             contracts,
             replacements,
             unsound,
+            fp_dispatch,
             report,
         }
     }
@@ -97,6 +101,7 @@ impl<'a> InstructionLowerer<'a> {
             self.contracts,
             self.replacements,
             self.unsound,
+            self.fp_dispatch,
             self.report,
         )
         .lower()
@@ -113,6 +118,7 @@ struct FunctionLowerer<'a, 'ctx, 'c> {
     contracts: &'c ContractMap,
     replacements: &'c ReplacementMap,
     unsound: &'c UnsoundOptions,
+    fp_dispatch: Option<&'c FpDispatch>,
     report: &'c mut ReportCollector,
     suppress_contracts: bool,
     block_labels: HashMap<BasicBlock<'ctx>, String>,
@@ -136,6 +142,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         contracts: &'c ContractMap,
         replacements: &'c ReplacementMap,
         unsound: &'c UnsoundOptions,
+        fp_dispatch: Option<&'c FpDispatch>,
         report: &'c mut ReportCollector,
     ) -> Self {
         let function_name = function.get_name().to_string_lossy().into_owned();
@@ -151,6 +158,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             contracts,
             replacements,
             unsound,
+            fp_dispatch,
             report,
             block_labels: HashMap::new(),
             current_block: None,
@@ -1437,6 +1445,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let args = (0..call.count_arguments())
             .map(|index| self.lower_operand(instruction, index))
             .collect::<Result<Vec<_>>>()?;
+        if let Some(dispatch) = self.fp_dispatch {
+            return self.lower_indirect_dispatch(instruction, args, dispatch, body, loc);
+        }
         let function_expr = self.indirect_callee_expr(call, loc)?;
         let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
             &function_expr,
@@ -1445,6 +1456,86 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         );
         self.emit_call_result(instruction, function_expr, arguments, body, loc)?;
         Ok(())
+    }
+
+    /// `--fp-groups`: an indirect `call` or `invoke` as
+    /// `if (fp == &f1) f1(..) else if .. else assert(false)` over [`FpDispatch::candidates`], so
+    /// CBMC never offers out-of-group targets.
+    fn lower_indirect_dispatch(
+        &mut self,
+        instruction: InstructionValue<'ctx>,
+        args: Vec<Expr>,
+        dispatch: &FpDispatch,
+        body: &mut Vec<Stmt>,
+        loc: Location,
+    ) -> Result<()> {
+        if !instruction.get_type().is_void_type() {
+            // Declare the result even if no candidate exists, so later uses still resolve.
+            self.declare_instruction_result(instruction)?;
+        }
+        let raw = unsafe { LLVMGetCalledValue(instruction.as_value_ref()) };
+        let target = self
+            .lower_value(unsafe { BasicValueEnum::new(raw) })?
+            .cast_to(Type::void_pointer());
+        let typ = unsafe { LLVMGetCalledFunctionType(instruction.as_value_ref()) } as usize;
+        let candidates = dispatch.candidates(&self.function_name, typ);
+        let message = format!(
+            "indirect call target is one of the --fp-groups candidates [{}]",
+            candidates.join(", ")
+        );
+        let mut otherwise = vec![
+            Stmt::assert_false("function_pointer", &message, loc),
+            Stmt::assume(Expr::bool_false(), loc),
+        ];
+        for name in candidates.iter().rev() {
+            let effective = self.indirect_candidate_callee(name, loc)?;
+            let function_expr = self.function_expr(&effective, loc)?;
+            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
+                &function_expr,
+                args.clone(),
+                self.symbols.machine_model(),
+            );
+            let mut then = vec![];
+            self.emit_call_result(instruction, function_expr, arguments, &mut then, loc)?;
+            let address = self
+                .function_expr(name, loc)?
+                .address_of()
+                .cast_to(Type::void_pointer());
+            otherwise = vec![Stmt::if_then_else(
+                target.clone().eq(address),
+                Stmt::block(then, loc),
+                Some(Stmt::block(otherwise, loc)),
+                loc,
+            )];
+        }
+        body.extend(otherwise);
+        Ok(())
+    }
+
+    /// The function a dispatched call to `name` runs: its replacement or plain `model`, as for
+    /// direct calls. Other call-site contracts (`requires`/`ensures`) are not supported here.
+    fn indirect_candidate_callee(&self, name: &str, loc: Location) -> Result<String> {
+        if let Some(replacement) = self.replacement_symbol(name) {
+            return Ok(replacement.to_owned());
+        }
+        let Some(contract) = self
+            .contracts
+            .function(name)
+            .filter(|_| !self.suppress_contracts)
+        else {
+            return Ok(name.to_owned());
+        };
+        if contract.requires.is_some() || contract.ensures.is_some() || contract.snapshot.is_some()
+        {
+            return Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!("--fp-groups: indirect-call candidate `{name}` has a call-site contract"),
+            )
+            .with_symbol(self.function_name.clone())
+            .with_location(loc)
+            .into());
+        }
+        Ok(contract.model.as_deref().unwrap_or(name).to_owned())
     }
 
     fn lower_invoke(
@@ -1560,14 +1651,18 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(());
         }
 
-        let function_expr =
-            self.indirect_callee_expr_from_instruction(instruction, raw_callee, loc)?;
-        let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-            &function_expr,
-            args,
-            self.symbols.machine_model(),
-        );
-        self.emit_call_result(instruction, function_expr, arguments, body, loc)?;
+        if let Some(dispatch) = self.fp_dispatch {
+            self.lower_indirect_dispatch(instruction, args, dispatch, body, loc)?;
+        } else {
+            let function_expr =
+                self.indirect_callee_expr_from_instruction(instruction, raw_callee, loc)?;
+            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
+                &function_expr,
+                args,
+                self.symbols.machine_model(),
+            );
+            self.emit_call_result(instruction, function_expr, arguments, body, loc)?;
+        }
         body.push(self.branch_on_exception(predecessor, normal_dest, unwind_dest)?);
         Ok(())
     }

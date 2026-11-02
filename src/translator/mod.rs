@@ -46,6 +46,7 @@ use crate::util;
 use crate::{Config, InputFormat};
 
 mod asm_manifest;
+mod fp_dispatch;
 pub mod globals;
 pub mod instructions;
 mod rename;
@@ -224,6 +225,17 @@ impl Translator {
         if self.config.report.as_deref() == Some(output.as_path()) {
             bail!("--report must not overwrite the GOTO output");
         }
+        let fp_dispatch = match self.config.fp_groups.as_deref() {
+            Some(path) => {
+                let cone = cone.as_ref().context("--fp-groups requires --entry")?;
+                Some(fp_dispatch::FpDispatch::new(
+                    fp_dispatch::FpGroups::load(path)?,
+                    &module,
+                    &cone.address_taken_functions,
+                )?)
+            }
+            None => None,
+        };
         let mut report = report::ReportCollector::new(self.config.report.is_some());
         let mut symbols = SymbolBuilder::default().build_reporting(
             &module,
@@ -233,6 +245,7 @@ impl Translator {
             &self.config.replace_with_contract,
             &self.config.enforce_contract,
             &self.config.unsound,
+            fp_dispatch.as_ref(),
             &mut report,
         )?;
         contracts::inject::inject_contracts_with_replacements(

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 The llvm2cprover Authors
+# --fp-groups file for fp_groups_unknown.c: names a_aply, which is not in the module.
+
+[groups]
+a = ["a_one", "a_aply"]
+b = ["b_one"]

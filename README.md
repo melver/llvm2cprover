@@ -114,6 +114,28 @@ lowering it to GOTO, like other LLVM tools. GOTO-only options (`--entry`,
 llvm2cprover --rename-prefix c_ --emit-llvm c.bc -o c_prefixed.bc
 ```
 
+### Indirect-call groups
+
+By default, CBMC resolves an indirect call to every address-taken function with
+a compatible type. This can result in formula blow-up whenever symex cannot
+fold the pointer; e.g. when multiple equivalent implementations are linked for
+the purpose of equivalence checking. `--fp-groups FILE` (requires `--entry`)
+has llvm2cprover emit the dispatch instead:
+
+```toml
+[groups]
+c = ["c_apply", "c_hash"]
+rust = ["rust_apply", "rust_hash"]
+```
+
+Each indirect `call` or `invoke` tries the address-taken functions in the cone
+whose LLVM function type matches exactly, restricted to the caller's group plus
+ungrouped functions; an ungrouped caller sees all of them. Any other target
+fails an assertion and ends the path. Candidates keep their replacement or
+plain `model`; candidates with `requires`/`ensures` contracts are rejected.
+Group members are module function names after `--rename-prefix`, and a name
+that is not a function in the module is an error.
+
 ## Soundness and limitations
 
 Translation fails when llvm2cprover cannot preserve the semantics of an LLVM

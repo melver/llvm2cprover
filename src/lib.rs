@@ -153,6 +153,14 @@ pub struct Config {
     pub unsound: UnsoundOptions,
     /// Optional path for a deterministic JSON assumption and stub inventory.
     pub report: Option<PathBuf>,
+    /// Optional TOML file of function groups (`[groups] name = ["fn", ...]`) for indirect calls.
+    ///
+    /// When set (requires `entry`), each indirect call or invoke is lowered to an explicit
+    /// dispatch over the address-taken functions in the cone with the call's exact LLVM function
+    /// type, keeping only those in the caller's group or in no group; any other target value
+    /// fails an assertion and ends the path. Ungrouped callers see every type-compatible
+    /// candidate. Groups name module functions after `rename_prefix`; unknown names are errors.
+    pub fp_groups: Option<PathBuf>,
 }
 
 /// Translate one LLVM module into a `.goto` binary.

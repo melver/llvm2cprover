@@ -72,6 +72,7 @@ impl SymbolBuilder {
             &replacements,
             &enforcements,
             unsound,
+            None,
             &mut ReportCollector::default(),
         )
     }
@@ -87,6 +88,7 @@ impl SymbolBuilder {
         replacements: &BTreeSet<String>,
         enforcements: &BTreeSet<String>,
         unsound: &UnsoundOptions,
+        fp_dispatch: Option<&super::fp_dispatch::FpDispatch>,
         report: &mut ReportCollector,
     ) -> Result<SymbolTable> {
         // Provide the LLVM data layout so the type lowerer can insert explicit
@@ -202,7 +204,7 @@ impl SymbolBuilder {
             replacements,
         )?;
         let mut instructions =
-            InstructionLowerer::new(contracts, &replacement_map, unsound, report);
+            InstructionLowerer::new(contracts, &replacement_map, unsound, fp_dispatch, report);
         for function in module.get_functions() {
             let should_lower = match cone {
                 Some(cone) => cone
@@ -2274,6 +2276,7 @@ mod tests {
             &empty,
             &empty,
             &UnsoundOptions::default(),
+            None,
             &mut ReportCollector::default(),
         )
     }

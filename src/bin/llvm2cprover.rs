@@ -104,6 +104,10 @@ struct Cli {
     #[arg(long)]
     rename_prefix: Option<String>,
 
+    /// Lower indirect calls to a dispatch restricted by these function groups (TOML, `[groups]`).
+    #[arg(long, requires = "entry")]
+    fp_groups: Option<PathBuf>,
+
     /// Write the transformed LLVM module as bitcode to -o instead of GOTO.
     #[arg(
         long,
@@ -198,6 +202,7 @@ fn main() -> std::process::ExitCode {
         input_format: cli.input_format.into(),
         unsound,
         report: cli.report,
+        fp_groups: cli.fp_groups,
     };
 
     match translate(input_from_cli(cli.input), config) {
