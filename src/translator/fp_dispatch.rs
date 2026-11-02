@@ -25,14 +25,21 @@ struct GroupsFile {
     groups: BTreeMap<String, Vec<String>>,
 }
 
-/// Function name -> group name.
-#[derive(Debug, Default)]
-pub(crate) struct FpGroups {
+/// Per-type candidate lists plus the grouping, built once per translation.
+#[derive(Debug)]
+pub(crate) struct FpDispatch {
+    /// Function name -> group name.
     group_of: HashMap<String, String>,
+    /// LLVM function type (uniqued `LLVMTypeRef`) -> address-taken functions of that type.
+    by_type: HashMap<usize, Vec<String>>,
 }
 
-impl FpGroups {
-    pub(crate) fn load(path: &Path) -> Result<Self> {
+impl FpDispatch {
+    pub(crate) fn load(
+        path: &Path,
+        module: &Module<'_>,
+        address_taken: &BTreeSet<String>,
+    ) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading --fp-groups file {}", path.display()))?;
         let file: GroupsFile = toml::from_str(&text)
@@ -40,61 +47,42 @@ impl FpGroups {
         let mut group_of = HashMap::new();
         for (group, functions) in file.groups {
             for function in functions {
+                // A misspelled (or un-prefixed, under `--rename-prefix`) name would silently leave
+                // the function ungrouped, which offers it to every caller: exactly what the groups
+                // exclude.
+                if function.contains('\0') || module.get_function(&function).is_none() {
+                    bail!("--fp-groups: `{function}` is not a function in the module");
+                }
                 if let Some(previous) = group_of.insert(function.clone(), group.clone()) {
                     bail!("--fp-groups: `{function}` is in both `{previous}` and `{group}`");
                 }
             }
         }
-        Ok(Self { group_of })
-    }
-}
-
-/// Per-type candidate lists plus the grouping, built once per translation.
-#[derive(Debug)]
-pub(crate) struct FpDispatch {
-    groups: FpGroups,
-    /// LLVM function type (uniqued `LLVMTypeRef`) -> address-taken functions of that type.
-    by_type: HashMap<usize, Vec<String>>,
-}
-
-impl FpDispatch {
-    pub(crate) fn new(
-        groups: FpGroups,
-        module: &Module<'_>,
-        address_taken: &BTreeSet<String>,
-    ) -> Result<Self> {
         let mut by_type: HashMap<usize, Vec<String>> = HashMap::new();
-        let mut defined = BTreeSet::new();
         for function in module.get_functions() {
-            let name = function.get_name().to_string_lossy().into_owned();
-            if address_taken.contains(&name) {
+            let name = function.get_name().to_string_lossy();
+            if address_taken.contains(name.as_ref()) {
                 by_type
                     .entry(function.get_type().as_type_ref() as usize)
                     .or_default()
-                    .push(name.clone());
+                    .push(name.into_owned());
             }
-            defined.insert(name);
-        }
-        // A misspelled (or un-prefixed, under `--rename-prefix`) name would silently leave the
-        // function ungrouped, which offers it to every caller: exactly what the groups exclude.
-        if let Some(unknown) = groups.group_of.keys().find(|f| !defined.contains(*f)) {
-            bail!("--fp-groups: `{unknown}` is not a function in the module");
         }
         for candidates in by_type.values_mut() {
             candidates.sort();
         }
-        Ok(Self { groups, by_type })
+        Ok(Self { group_of, by_type })
     }
 
     /// Candidates for an indirect call of LLVM function type `typ` inside `caller`.
     pub(crate) fn candidates(&self, caller: &str, typ: usize) -> Vec<&str> {
-        let caller_group = self.groups.group_of.get(caller);
+        let caller_group = self.group_of.get(caller);
         self.by_type
             .get(&typ)
             .into_iter()
             .flatten()
             .filter(
-                |candidate| match (caller_group, self.groups.group_of.get(*candidate)) {
+                |candidate| match (caller_group, self.group_of.get(*candidate)) {
                     (Some(caller_group), Some(group)) => caller_group == group,
                     _ => true,
                 },

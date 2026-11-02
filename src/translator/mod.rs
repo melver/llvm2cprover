@@ -242,8 +242,8 @@ impl Translator {
         let fp_dispatch = match self.config.fp_groups.as_deref() {
             Some(path) => {
                 let cone = cone.as_ref().context("--fp-groups requires --entry")?;
-                Some(fp_dispatch::FpDispatch::new(
-                    fp_dispatch::FpGroups::load(path)?,
+                Some(fp_dispatch::FpDispatch::load(
+                    path,
                     &module,
                     &cone.address_taken_functions,
                 )?)
