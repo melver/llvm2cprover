@@ -2121,38 +2121,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
-        if callee_name == "__CPROVER_assume" || callee_name.starts_with("llvm.assume") {
-            let cond = args
-                .first()
-                .cloned()
-                .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing assume argument"))?
-                .cast_to(Type::bool());
-            body.push(Stmt::assume(cond, loc));
+        if callee_name.starts_with("llvm.assume") {
+            self.lower_assume(callee_name, args, body, loc)?;
             return Ok(true);
         }
 
-        if callee_name == "__CPROVER_assert" {
-            let cond = args
-                .first()
-                .cloned()
-                .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing assert argument"))?
-                .cast_to(Type::bool());
-            // Preserve the user's description so CBMC property reports stay meaningful; fall
-            // back to the callee name when the message is not a constant string literal.
-            let message = self
-                .constant_string_operand(instruction, 1)
-                .unwrap_or_else(|| callee_name.to_owned());
-            body.push(Stmt::assert(cond, "assert", &message, loc));
-            return Ok(true);
-        }
-
-        if callee_name.starts_with("__CPROVER_nondet_") {
-            let lhs = self.declare_instruction_result(instruction)?;
-            body.push(Stmt::assign(
-                lhs.clone(),
-                util::nondet_expr(lhs.typ().clone()),
-                loc,
-            ));
+        if self.try_lower_cprover_builtin(instruction, callee_name, args, body, loc)? {
             return Ok(true);
         }
 
@@ -2671,6 +2645,88 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let is_min = callee_name.starts_with("llvm.umin") || callee_name.starts_with("llvm.smin");
         let value = self.minmax_value(is_signed, is_min, lhs, rhs)?;
         self.assign_result(instruction, body, value)
+    }
+
+    /// `__CPROVER_assume` / `llvm.assume`: assume the first argument, as a bool.
+    fn lower_assume(
+        &self,
+        callee_name: &str,
+        args: &[Expr],
+        body: &mut Vec<Stmt>,
+        loc: Location,
+    ) -> Result<()> {
+        let cond = args
+            .first()
+            .cloned()
+            .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing assume argument"))?
+            .cast_to(Type::bool());
+        body.push(Stmt::assume(cond, loc));
+        Ok(())
+    }
+
+    /// CBMC builtins that are not ordinary functions. CBMC's C typechecker resolves these to
+    /// expressions (`do_special_functions` in `c_typecheck_expr.cpp`); our GOTO bypasses that
+    /// typechecker, so an unlowered call would reach CBMC as a bodiless function returning
+    /// nondet. Lower the ones the bindings express and reject the rest. Other `__CPROVER_*`
+    /// functions (havoc_object, havoc_slice, array_set, the threading runtime) are implemented
+    /// by CBMC itself or its library and stay ordinary calls.
+    fn try_lower_cprover_builtin(
+        &mut self,
+        instruction: InstructionValue<'ctx>,
+        callee_name: &str,
+        args: &[Expr],
+        body: &mut Vec<Stmt>,
+        loc: Location,
+    ) -> Result<bool> {
+        let Some(builtin) = callee_name.strip_prefix("__CPROVER_") else {
+            return Ok(false);
+        };
+        let arg = |index: usize| {
+            args.get(index).cloned().ok_or_else(|| {
+                self.unsupported_intrinsic(callee_name, format!("missing argument {index}"))
+            })
+        };
+        let ptr = |index: usize| arg(index).map(|p| p.cast_to(Type::void_pointer()));
+        let value = match builtin {
+            "assume" => {
+                self.lower_assume(callee_name, args, body, loc)?;
+                return Ok(true);
+            }
+            "assert" => {
+                let cond = arg(0)?.cast_to(Type::bool());
+                // Preserve the user's description so CBMC property reports stay meaningful; fall
+                // back to the callee name when the message is not a constant string literal.
+                let message = self
+                    .constant_string_operand(instruction, 1)
+                    .unwrap_or_else(|| callee_name.to_owned());
+                body.push(Stmt::assert(cond, "assert", &message, loc));
+                return Ok(true);
+            }
+            _ if builtin.starts_with("nondet_") => {
+                let lhs = self.declare_instruction_result(instruction)?;
+                body.push(Stmt::assign(
+                    lhs.clone(),
+                    util::nondet_expr(lhs.typ().clone()),
+                    loc,
+                ));
+                return Ok(true);
+            }
+            "same_object" => ptr(0)?.same_object(ptr(1)?),
+            "r_ok" => ptr(0)?.r_ok(arg(1)?.cast_to(Type::size_t())),
+            "OBJECT_SIZE" => ptr(0)?.object_size(),
+            "POINTER_OBJECT" => ptr(0)?.pointer_object(),
+            "POINTER_OFFSET" => ptr(0)?.pointer_offset(),
+            "DYNAMIC_OBJECT" => ptr(0)?.dynamic_object(),
+            _ if UNLOWERED_EXPRESSION_BUILTINS.contains(&builtin) => {
+                return Err(self
+                    .unsupported_intrinsic(callee_name, "unsupported CBMC builtin")
+                    .with_location(loc)
+                    .into());
+            }
+            _ => return Ok(false),
+        };
+        self.assign_result(instruction, body, value)?;
+        Ok(true)
     }
 
     /// `llvm.{u,s}cmp`: three-way comparison, `-1`/`0`/`1` in the result type; vector overloads
@@ -4311,6 +4367,33 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         }
     }
 }
+
+/// CBMC builtins that its C typechecker resolves to expressions (`do_special_functions` and the
+/// `r_ok`/`w_ok`/`rw_ok` handling in `c_typecheck_expr.cpp`) and that have no lowering in
+/// `try_lower_cprover_builtin`, so calls to them fail closed. Names without the `__CPROVER_`
+/// prefix.
+#[rustfmt::skip]
+const UNLOWERED_EXPRESSION_BUILTINS: &[&str] = &[
+    // Pointers and memory.
+    "w_ok", "rw_ok", "is_invalid_pointer", "LIVE_OBJECT", "WRITEABLE_OBJECT", "is_fresh",
+    "pointer_equals", "pointer_in_range", "pointer_in_range_dfcc", "separate", "allocate",
+    "buffer_size", "get_may", "get_must",
+    // Contracts.
+    "obeys_contract", "old", "loop_entry",
+    // Strings and lists.
+    "is_cstring", "cstrlen", "is_zero_string", "zero_string_length", "is_list", "is_dll",
+    "is_cyclic_dll", "is_sentinel_dll",
+    // Arithmetic and floating point.
+    "abs", "labs", "llabs", "imaxabs", "fabs", "fabsf", "fabsl", "fma", "fmaf", "fmal", "fmod",
+    "fmodf", "fmodl", "remainder", "remainderf", "remainderl", "isnanf", "isnand", "isnanld",
+    "isinff", "isinfd", "isinfld", "isfinitef", "isfinited", "isfiniteld", "isnormalf",
+    "isnormald", "isnormalld", "signf", "signd", "signld", "inf", "inff", "infl", "fpclassify",
+    "round_to_integralf", "round_to_integrald", "round_to_integralld", "overflow_plus",
+    "overflow_minus", "overflow_mult", "overflow_shl", "overflow_unary_minus",
+    "saturating_plus", "saturating_minus",
+    // Other.
+    "enum_is_in_range", "equal", "typed_target",
+];
 
 /// Calls that are assertion failures, as `(property, message)`: each lowers to `ASSERT false`.
 /// The list is explicit; there is no heuristic such as `noreturn`, which also covers `exit`.

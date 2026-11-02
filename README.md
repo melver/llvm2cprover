@@ -129,6 +129,10 @@ construct. In particular:
   and `invoke`-called targets
 - contract enforcement currently rejects input uses or definitions of `free`
 - void enforcement targets currently require `assigns = []`
+- CBMC builtins that CBMC's C frontend turns into expressions fail closed unless
+  lowered (`__CPROVER_same_object`, `r_ok`, `OBJECT_SIZE`, `POINTER_OBJECT`,
+  `POINTER_OFFSET` and `DYNAMIC_OBJECT` are); CBMC runtime functions such as
+  `__CPROVER_havoc_object` or the threading primitives stay ordinary calls
 - contract manifests cannot currently be combined with a nonempty symbol prefix
 
 Unsupported approximations are opt-in by feature. The only current selector is
