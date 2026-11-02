@@ -915,29 +915,17 @@ fn insert_eh_runtime_symbol(symbols: &mut SymbolTable, name: &str, typ: Type, in
 /// signature (e.g. goto-instrument's flow-insensitive value sets) look those names up, so give
 /// them symbols, as goto-cc does for declarations.
 pub(super) fn add_missing_parameter_symbols(symbols: &mut SymbolTable) {
-    let missing: Vec<_> = symbols
+    let functions: Vec<_> = symbols
         .iter()
-        .filter_map(|(name, symbol)| Some((*name, symbol.typ.parameters()?.clone())))
-        .flat_map(|(function, parameters)| {
-            parameters.into_iter().filter_map(move |parameter| {
-                Some((
-                    function,
-                    parameter.identifier()?,
-                    parameter.base_name()?,
-                    parameter.typ().clone(),
-                ))
-            })
+        .filter_map(|(name, symbol)| {
+            symbol
+                .typ
+                .parameters()
+                .map(|_| (name.to_owned(), symbol.typ.clone(), symbol.location))
         })
-        .filter(|(_, identifier, _, _)| !symbols.contains(*identifier))
         .collect();
-    for (function, identifier, base_name, typ) in missing {
-        symbols.insert(
-            Symbol::variable(identifier, base_name, typ, Location::none())
-                .with_is_parameter(true)
-                .with_is_state_var(false)
-                .with_is_static_lifetime(false),
-        );
-        symbols.insert_parameter(function, identifier);
+    for (function, typ, location) in functions {
+        util::ensure_function_parameters(symbols, function, &typ, location);
     }
 }
 
@@ -2573,6 +2561,8 @@ mod tests {
     fn adds_parameter_symbols_for_bodiless_functions() {
         let mut symbols = build_symbols_from_ir(
             br#"
+            source_filename = "/tmp/ext_decl.c"
+
             declare i32 @ext(i32)
 
             define i32 @f(i32 %x) {
@@ -2582,14 +2572,49 @@ mod tests {
             }
         "#,
         );
+        let nameless_param = cprover_bindings::goto_program::Parameter::new(
+            None::<cprover_bindings::InternedString>,
+            Some("anon::arg0".into()),
+            Type::signed_int(32),
+        );
+        let ext_loc = symbols.lookup("ext").expect("ext declaration").location;
+        symbols.insert(
+            Symbol::function(
+                "anon",
+                Type::code(vec![nameless_param], Type::empty()),
+                None,
+                "anon",
+                ext_loc,
+            )
+            .with_is_extern(true),
+        );
+
         assert!(symbols.lookup("ext::arg0").is_none());
+        assert!(symbols.lookup("anon::arg0").is_none());
         add_missing_parameter_symbols(&mut symbols);
         let param = symbols
             .lookup("ext::arg0")
             .expect("parameter symbol for declaration");
         assert!(param.is_parameter);
+        assert!(!param.is_thread_local);
+        assert_eq!(
+            param.location.filename().as_deref(),
+            Some("/tmp/ext_decl.c")
+        );
         assert_eq!(symbols.lookup_parameters("ext").map(Vec::len), Some(1));
         assert_eq!(symbols.lookup_parameters("f").map(Vec::len), Some(1));
+
+        let anon_param = symbols
+            .lookup("anon::arg0")
+            .expect("parameter symbol without base_name");
+        assert!(anon_param.is_parameter);
+        assert!(!anon_param.is_thread_local);
+        assert_eq!(anon_param.base_name, Some("anon::arg0".into()));
+        assert_eq!(
+            anon_param.location.filename().as_deref(),
+            Some("/tmp/ext_decl.c")
+        );
+        assert_eq!(symbols.lookup_parameters("anon").map(Vec::len), Some(1));
     }
 
     #[test]

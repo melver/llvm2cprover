@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::slice;
 
 use anyhow::{Result, bail};
-use cprover_bindings::goto_program::{Expr, Location, Type};
-use cprover_bindings::{MachineModel as GotoMachineModel, RoundingMode};
+use cprover_bindings::goto_program::{Expr, Location, Symbol, SymbolTable, Type};
+use cprover_bindings::{InternedString, MachineModel as GotoMachineModel, RoundingMode};
 use inkwell::llvm_sys::core::{
     LLVMGetDebugLocColumn, LLVMGetDebugLocDirectory, LLVMGetDebugLocFilename, LLVMGetDebugLocLine,
     LLVMGetGlobalParent, LLVMGetSourceFileName,
@@ -25,6 +25,36 @@ use inkwell::module::Module;
 use inkwell::values::{AsValueRef, FunctionValue, InstructionValue};
 
 use crate::{InputFormat, MachineModel, TranslationInput};
+
+/// Ensure parameter symbols exist and are registered in `parameters` for `function`.
+pub(crate) fn ensure_function_parameters(
+    symbols: &mut SymbolTable,
+    function: impl Into<InternedString>,
+    typ: &Type,
+    location: Location,
+) {
+    let function = function.into();
+    for parameter in typ.parameters().into_iter().flatten() {
+        let Some(identifier) = parameter.identifier() else {
+            continue;
+        };
+        let base_name = parameter.base_name().unwrap_or(identifier);
+        if !symbols.contains(identifier) {
+            let symbol = Symbol::variable(
+                identifier.to_string(),
+                base_name.to_string(),
+                parameter.typ().clone(),
+                location,
+            )
+            .with_is_parameter(true)
+            .with_is_thread_local(false)
+            .with_is_state_var(false)
+            .with_is_static_lifetime(false);
+            symbols.insert(symbol);
+            symbols.insert_parameter(function, identifier.to_string());
+        }
+    }
+}
 
 /// Resolve the effective machine model for one module, honoring explicit overrides.
 pub fn resolve_machine_model(

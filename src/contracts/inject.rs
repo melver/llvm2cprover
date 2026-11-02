@@ -137,7 +137,7 @@ fn attach_enforcement_contract(
             .cloned()
             .expect("validated function type"),
     );
-    ensure_function_parameters(symbols, &contract_name, &contract_type, &target.location);
+    util::ensure_function_parameters(symbols, &contract_name, &contract_type, target.location);
     let symbol = Symbol::function(
         contract_name.clone(),
         contract_type,
@@ -654,7 +654,7 @@ fn synthesize_assigns_stub(
     }
 
     let loc = target.location;
-    ensure_function_parameters(symbols, name, &target.typ, &loc);
+    util::ensure_function_parameters(symbols, name, &target.typ, loc);
     let params = parameter_exprs(&target.typ, loc);
     let mut body = assigns_helper_calls(symbols, name, contract, &params, loc)?;
     let return_type = target
@@ -699,7 +699,7 @@ fn synthesize_replacement(
         Type::code(params, return_type.clone())
     };
 
-    ensure_function_parameters(symbols, &replacement, &replacement_type, &loc);
+    util::ensure_function_parameters(symbols, &replacement, &replacement_type, loc);
     let args = parameter_exprs(&replacement_type, loc);
     let mut body = Vec::new();
     if let Some(helper) = contract.requires.as_deref() {
@@ -770,7 +770,7 @@ fn synthesize_enforcement_harness(
     reject_symbol_collision(symbols, &harness, "contract enforcement harness")?;
     let loc = target.location;
     let harness_type = Type::code(indexed_parameters(&target.typ, &harness), Type::empty());
-    ensure_function_parameters(symbols, &harness, &harness_type, &loc);
+    util::ensure_function_parameters(symbols, &harness, &harness_type, loc);
     let args = parameter_exprs(&harness_type, loc);
     let mut body = Vec::new();
 
@@ -950,37 +950,6 @@ fn insert_local(
         .with_is_static_lifetime(false);
     symbols.insert(symbol);
     Expr::symbol_expression(identifier, typ).with_location(loc)
-}
-
-fn ensure_function_parameters(
-    symbols: &mut SymbolTable,
-    function: &str,
-    typ: &Type,
-    location: &Location,
-) {
-    typ.parameters()
-        .into_iter()
-        .flatten()
-        .for_each(|parameter| {
-            let identifier = parameter
-                .identifier()
-                .expect("function parameters are expected to have identifiers");
-            let base_name = parameter.base_name().unwrap_or(identifier);
-            if symbols.lookup(identifier).is_none() {
-                let symbol = Symbol::variable(
-                    identifier.to_string(),
-                    base_name.to_string(),
-                    parameter.typ().clone(),
-                    *location,
-                )
-                .with_is_parameter(true)
-                .with_is_thread_local(false)
-                .with_is_state_var(false)
-                .with_is_static_lifetime(false);
-                symbols.insert(symbol);
-                symbols.insert_parameter(function.to_owned(), identifier.to_string());
-            }
-        });
 }
 
 fn parameter_exprs(typ: &Type, location: Location) -> Vec<Expr> {
