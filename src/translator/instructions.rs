@@ -753,20 +753,24 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(())
     }
 
-    fn normalize_icmp_operands(&self, lhs: Expr, rhs: Expr) -> (Expr, Expr) {
-        if lhs.typ().is_pointer() && rhs.typ().is_pointer() && lhs.typ() != rhs.typ() {
-            // LLVM opaque pointers allow address comparisons across differently recovered pointees.
-            // CBMC requires one concrete pointer type, so compare the raw addresses as `void *`.
-            return (
-                lhs.cast_to(Type::void_pointer()),
-                rhs.cast_to(Type::void_pointer()),
-            );
-        }
-        (lhs, rhs)
-    }
-
     fn lower_scalar_icmp_value(&self, pred: IntPredicate, lhs: Expr, rhs: Expr) -> Result<Expr> {
-        let (lhs, rhs) = self.normalize_icmp_operands(lhs, rhs);
+        let (lhs, rhs) = if lhs.typ().is_pointer() && rhs.typ().is_pointer() {
+            match pred {
+                // Keep equality in pointer sort so symex value-set tracking, null checks, and
+                // function-pointer removal stay symbolic without forcing integer bit-blasting.
+                // Differently recovered opaque-pointer pointees compare as `void *`.
+                IntPredicate::EQ | IntPredicate::NE if lhs.typ() != rhs.typ() => (
+                    lhs.cast_to(Type::void_pointer()),
+                    rhs.cast_to(Type::void_pointer()),
+                ),
+                IntPredicate::EQ | IntPredicate::NE => (lhs, rhs),
+                // CBMC pointer `<`/`<=`/`>`/`>=` asserts `__CPROVER_same_object` and compares only
+                // `POINTER_OFFSET`. LLVM `icmp` compares pointer values as integers.
+                _ => (lhs.cast_to(Type::size_t()), rhs.cast_to(Type::size_t())),
+            }
+        } else {
+            (lhs, rhs)
+        };
         let value = match pred {
             IntPredicate::EQ => lhs.eq(rhs),
             IntPredicate::NE => lhs.neq(rhs),
@@ -2428,15 +2432,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                     .with_location(loc)
                     .into());
             };
-            let (dst, src) = self.normalize_icmp_operands(dst.clone(), src.clone());
+            let neq = self.lower_scalar_icmp_value(IntPredicate::NE, dst.clone(), src.clone())?;
             let mut call = vec![];
             self.lower_builtin_call(BuiltinFn::Memcpy, &args[..3], instruction, &mut call)?;
-            body.push(Stmt::if_then_else(
-                dst.neq(src),
-                Stmt::block(call, loc),
-                None,
-                loc,
-            ));
+            body.push(Stmt::if_then_else(neq, Stmt::block(call, loc), None, loc));
             return Ok(true);
         }
 
@@ -2746,14 +2745,17 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .get(1)
             .cloned()
             .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing min/max rhs"))?;
-        let (lhs, rhs) = self.normalize_icmp_operands(lhs, rhs);
-
         if lhs.typ().is_vector() || rhs.typ().is_vector() {
             return self.assign_result(
                 instruction,
                 body,
                 self.lower_vector_minmax_value(callee_name, lhs.clone(), rhs, lhs.typ().clone())?,
             );
+        }
+        if !lhs.typ().is_integer() || lhs.typ() != rhs.typ() {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "min/max expects matching integer operands")
+                .into());
         }
 
         let is_signed = callee_name.starts_with("llvm.s");
@@ -2858,11 +2860,15 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .unsupported_intrinsic(callee_name, "expects two operands")
                 .into());
         };
-        let (lhs, rhs) = self.normalize_icmp_operands(lhs.clone(), rhs.clone());
         let result_type = self.declare_instruction_result(instruction)?.typ().clone();
         let signed = callee_name.starts_with("llvm.scmp.");
         // The `c_int` constants are cast to the result type: -1 wraps to all-ones in iN.
         let cmp = |lhs: Expr, rhs: Expr| -> Result<Expr> {
+            if !lhs.typ().is_integer() || lhs.typ() != rhs.typ() {
+                return Err(self
+                    .unsupported_intrinsic(callee_name, "expects matching integer operands")
+                    .into());
+            }
             let (lhs, rhs) = if signed {
                 (self.signed_view(lhs)?, self.signed_view(rhs)?)
             } else {
@@ -2882,7 +2888,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 )?
                 .cast_to(lane.clone()))
             })?,
-            _ => cmp(lhs, rhs)?,
+            _ => cmp(lhs.clone(), rhs.clone())?,
         };
         self.assign_result(instruction, body, value)
     }

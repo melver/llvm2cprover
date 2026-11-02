@@ -1478,6 +1478,64 @@ mod tests {
     }
 
     #[test]
+    fn lowers_relational_pointer_comparisons_via_size_t() {
+        let symbols = build_symbols_from_ir(
+            br#"
+            define i1 @eq_only(ptr %a, ptr %b) {
+            entry:
+              %cmp = icmp eq ptr %a, %b
+              ret i1 %cmp
+            }
+
+            define i1 @rel(ptr %a, ptr %b) {
+            entry:
+              %u = icmp ult ptr %a, %b
+              %s = icmp slt ptr %a, %b
+              %r = and i1 %u, %s
+              ret i1 %r
+            }
+        "#,
+        );
+
+        let eq_debug = stmt_debug(&symbols, "eq_only");
+        assert!(!eq_debug.contains("SizeT"));
+
+        let rel_debug = stmt_debug(&symbols, "rel");
+        assert!(rel_debug.contains("SizeT"));
+        assert!(rel_debug.contains("SSizeT"));
+    }
+
+    #[test]
+    fn rejects_non_integer_minmax_and_three_way_cmp_intrinsics() {
+        for ir in [
+            &br#"
+                declare ptr @llvm.umin.p0(ptr, ptr)
+                define ptr @f(ptr %a, ptr %b) {
+                  %r = call ptr @llvm.umin.p0(ptr %a, ptr %b)
+                  ret ptr %r
+                }
+            "#[..],
+            &br#"
+                declare i8 @llvm.ucmp.i8.p0(ptr, ptr)
+                define i8 @f(ptr %a, ptr %b) {
+                  %r = call i8 @llvm.ucmp.i8.p0(ptr %a, ptr %b)
+                  ret i8 %r
+                }
+            "#[..],
+        ] {
+            let error = build_symbols_result_from_ir(ir)
+                .expect_err("pointer min/max or three-way cmp must fail closed");
+            let diagnostic = error
+                .downcast_ref::<Diagnostic>()
+                .expect("expected structured diagnostic");
+            assert_eq!(
+                diagnostic.kind,
+                DiagnosticKind::UnsupportedFeature(UnsupportedFeature::Intrinsic)
+            );
+        }
+    }
+
+    #[test]
     fn lowers_llvm_assume_call() {
         let symbols = build_symbols_from_ir(
             br#"
