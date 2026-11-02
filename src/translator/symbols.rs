@@ -914,6 +914,37 @@ fn insert_eh_runtime_symbol(symbols: &mut SymbolTable, name: &str, typ: Type, in
     symbols.insert(symbol);
 }
 
+/// Functions without a lowered body (declarations, callees cut by a model or pruned from the
+/// cone) still name their parameters in their code type. CBMC passes that walk every function
+/// signature (e.g. goto-instrument's flow-insensitive value sets) look those names up, so give
+/// them symbols, as goto-cc does for declarations.
+pub(super) fn add_missing_parameter_symbols(symbols: &mut SymbolTable) {
+    let missing: Vec<_> = symbols
+        .iter()
+        .filter_map(|(name, symbol)| Some((*name, symbol.typ.parameters()?.clone())))
+        .flat_map(|(function, parameters)| {
+            parameters.into_iter().filter_map(move |parameter| {
+                Some((
+                    function,
+                    parameter.identifier()?,
+                    parameter.base_name()?,
+                    parameter.typ().clone(),
+                ))
+            })
+        })
+        .filter(|(_, identifier, _, _)| !symbols.contains(*identifier))
+        .collect();
+    for (function, identifier, base_name, typ) in missing {
+        symbols.insert(
+            Symbol::variable(identifier, base_name, typ, Location::none())
+                .with_is_parameter(true)
+                .with_is_state_var(false)
+                .with_is_static_lifetime(false),
+        );
+        symbols.insert_parameter(function, identifier);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2481,5 +2512,28 @@ mod tests {
         assert!(vector_debug.contains("Lshr"));
         assert!(vector_debug.contains("Ashr"));
         assert!(vector_debug.contains("Nondet"));
+    }
+
+    #[test]
+    fn adds_parameter_symbols_for_bodiless_functions() {
+        let mut symbols = build_symbols_from_ir(
+            br#"
+            declare i32 @ext(i32)
+
+            define i32 @f(i32 %x) {
+            entry:
+              %r = call i32 @ext(i32 %x)
+              ret i32 %r
+            }
+        "#,
+        );
+        assert!(symbols.lookup("ext::arg0").is_none());
+        add_missing_parameter_symbols(&mut symbols);
+        let param = symbols
+            .lookup("ext::arg0")
+            .expect("parameter symbol for declaration");
+        assert!(param.is_parameter);
+        assert_eq!(symbols.lookup_parameters("ext").map(Vec::len), Some(1));
+        assert_eq!(symbols.lookup_parameters("f").map(Vec::len), Some(1));
     }
 }

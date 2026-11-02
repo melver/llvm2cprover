@@ -253,6 +253,7 @@ impl Translator {
             }
             symbols.lookup_mut("free").expect("builtin free").name = UNUSED_FREE.into();
         }
+        symbols::add_missing_parameter_symbols(&mut symbols);
         write_goto_binary_file(output.as_path(), &symbols);
         if let Some(path) = self.config.report.as_deref() {
             report::write_report(
