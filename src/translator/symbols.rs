@@ -1548,6 +1548,8 @@ mod tests {
             br#"
             @.str = private unnamed_addr constant [14 x i8] c"direct string\00"
             @.str.1 = private unnamed_addr constant [11 x i8] c"gep string\00"
+            @.alias = private alias [14 x i8], ptr @.str
+            @.gep_alias = private alias i8, ptr getelementptr inbounds ([11 x i8], ptr @.str.1, i64 0, i64 0)
 
             declare void @__CPROVER_assert(i1, ptr)
 
@@ -1555,6 +1557,8 @@ mod tests {
             entry:
               call void @__CPROVER_assert(i1 %cond, ptr @.str)
               call void @__CPROVER_assert(i1 %cond, ptr getelementptr inbounds ([11 x i8], ptr @.str.1, i64 0, i64 0))
+              call void @__CPROVER_assert(i1 %cond, ptr @.alias)
+              call void @__CPROVER_assert(i1 %cond, ptr @.gep_alias)
               call void @__CPROVER_assert(i1 %cond, ptr %dynamic)
               ret void
             }
@@ -1562,8 +1566,8 @@ mod tests {
         );
 
         let debug = stmt_debug(&symbols, "f");
-        assert!(debug.contains("msg: \"direct string\""));
-        assert!(debug.contains("msg: \"gep string\""));
+        assert_eq!(debug.matches("msg: \"direct string\"").count(), 2);
+        assert_eq!(debug.matches("msg: \"gep string\"").count(), 2);
         assert!(debug.contains("msg: \"__CPROVER_assert\""));
     }
 

@@ -4223,9 +4223,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         index: u32,
     ) -> Option<String> {
         let mut raw = instruction.get_operand(index)?.value()?.as_value_ref();
-        // Clang spells string arguments as `@.str` or `getelementptr (@.str, 0, 0)`; peel
-        // constant expressions down to the underlying global.
-        while unsafe { !LLVMIsAConstantExpr(raw).is_null() } {
+        // Clang spells string arguments as `@.str`, `getelementptr (@.str, 0, 0)`, or through a
+        // `GlobalAlias`; peel constant expressions and alias wrappers down to the global.
+        loop {
+            raw = super::unwrap_global_alias(raw);
+            if unsafe { LLVMIsAConstantExpr(raw).is_null() } {
+                break;
+            }
             raw = unsafe { LLVMGetOperand(raw, 0) };
         }
         if unsafe { LLVMIsAGlobalVariable(raw).is_null() } {
