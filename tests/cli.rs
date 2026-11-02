@@ -901,6 +901,16 @@ fn emit_llvm_rejects_goto_only_options() {
 }
 
 #[test]
+fn asm_manifest_rejects_fp_groups() {
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .args(["--emit-asm-manifest", "--fp-groups", "g.groups", "in.ll"])
+        .output()
+        .expect("failed to run llvm2cprover");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+}
+
+#[test]
 fn report_records_fp_groups_indirect_candidate_contracts() {
     let input = input_file(
         r#"

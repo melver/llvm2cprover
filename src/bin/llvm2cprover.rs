@@ -78,6 +78,7 @@ struct Cli {
         conflicts_with_all = [
             "output",
             "entry",
+            "fp_groups",
             "replace_with_contract",
             "enforce_contract",
             "rename_prefix",
