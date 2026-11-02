@@ -16,8 +16,8 @@ use cprover_bindings::goto_program::{
     Expr, Location, Parameter, Symbol, SymbolTable, SymbolValues, Type,
 };
 use inkwell::llvm_sys::core::{
-    LLVMAliasGetAliasee, LLVMGetCalledValue, LLVMGetNumArgOperands, LLVMGetNumOperands,
-    LLVMGetOperand, LLVMIsAConstant, LLVMIsAGlobalAlias, LLVMIsAGlobalVariable, LLVMIsAInlineAsm,
+    LLVMGetCalledValue, LLVMGetNumArgOperands, LLVMGetNumOperands, LLVMGetOperand, LLVMIsAConstant,
+    LLVMIsAGlobalVariable, LLVMIsAInlineAsm,
 };
 use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::module::Module;
@@ -463,24 +463,23 @@ impl SymbolBuilder {
         function: FunctionValue<'ctx>,
         instruction: InstructionValue<'ctx>,
     ) -> Result<bool> {
-        let function_name = function.get_name().to_string_lossy().into_owned();
         let call = CallSiteValue::try_from(instruction).map_err(|_| {
+            let function_name = function.get_name().to_string_lossy().into_owned();
             Diagnostic::unsupported_feature(
                 UnsupportedFeature::Instruction,
                 format!("invalid call wrapper in {function_name}"),
             )
-            .with_symbol(function_name.clone())
+            .with_symbol(function_name)
         })?;
-        let Some(callee) = call
-            .get_called_fn_value()
-            .filter(|callee| callee.count_basic_blocks() != 0)
+        let Some(callee) =
+            super::direct_callee(instruction).filter(|callee| callee.count_basic_blocks() != 0)
         else {
             return Ok(false);
         };
 
         let mut changed = false;
         for index in 0..call.count_arguments() {
-            let Some(arg) = self.operand_value(instruction, index) else {
+            let Some(arg) = self.pointer_operand(instruction, index) else {
                 continue;
             };
             let Some(param) = callee.get_nth_param(index) else {
@@ -747,15 +746,13 @@ impl<'ctx> ConeBuilder<'_, 'ctx> {
         }
     }
 
-    fn visit_constant_value(&mut self, mut raw: LLVMValueRef) {
+    fn visit_constant_value(&mut self, raw: LLVMValueRef) {
         if raw.is_null() || unsafe { LLVMIsAConstant(raw) }.is_null() {
             return;
         }
-        while unsafe { !LLVMIsAGlobalAlias(raw).is_null() } {
-            raw = unsafe { LLVMAliasGetAliasee(raw) };
-            if raw.is_null() {
-                return;
-            }
+        let raw = super::unwrap_global_alias(raw);
+        if raw.is_null() {
+            return;
         }
         if let Some(function) = unsafe { FunctionValue::new(raw) } {
             let name = function.get_name().to_string_lossy().into_owned();
@@ -785,14 +782,6 @@ impl<'ctx> ConeBuilder<'_, 'ctx> {
                     InstructionOpcode::Call | InstructionOpcode::Invoke | InstructionOpcode::CallBr
                 ) {
                     let raw_callee = unsafe { LLVMGetCalledValue(raw_inst) };
-                    if opcode == InstructionOpcode::Call
-                        && let Some(callee) = unsafe { FunctionValue::new(raw_callee) }
-                    {
-                        let callee_name = callee.get_name().to_string_lossy();
-                        if super::is_metadata_noop_intrinsic(callee_name.as_ref()) {
-                            continue;
-                        }
-                    }
                     let arg_count = unsafe { LLVMGetNumArgOperands(raw_inst) };
                     if unsafe { !LLVMIsAInlineAsm(raw_callee).is_null() } {
                         if self.contracts.has_inline_asm_models()
@@ -817,9 +806,14 @@ impl<'ctx> ConeBuilder<'_, 'ctx> {
                             }
                         }
                     } else if matches!(opcode, InstructionOpcode::Call | InstructionOpcode::Invoke)
-                        && let Some(callee) = unsafe { FunctionValue::new(raw_callee) }
+                        && let Some(callee) = super::direct_callee(instruction)
                     {
-                        let callee_name = callee.get_name().to_string_lossy().into_owned();
+                        let callee_name = callee.get_name().to_string_lossy();
+                        if opcode == InstructionOpcode::Call
+                            && super::is_metadata_noop_intrinsic(&callee_name)
+                        {
+                            continue;
+                        }
                         self.mark_function_reachable(&callee_name);
                     } else {
                         self.visit_constant_value(raw_callee);
@@ -2538,5 +2532,59 @@ mod tests {
         assert!(param.is_parameter);
         assert_eq!(symbols.lookup_parameters("ext").map(Vec::len), Some(1));
         assert_eq!(symbols.lookup_parameters("f").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn rejects_incompatible_cross_type_alias_call_signatures() {
+        for ir in [
+            &br#"
+                @as_i64 = alias i64 (), ptr @returns_double
+                define double @returns_double() {
+                entry:
+                  ret double 1.5
+                }
+                define i64 @f() {
+                entry:
+                  %r = call i64 @as_i64()
+                  ret i64 %r
+                }
+            "#[..],
+            &br#"
+                %struct.A = type { i64 }
+                %struct.B = type { ptr }
+                @as_a = alias %struct.A (%struct.A), ptr @id_b
+                define %struct.B @id_b(%struct.B %x) {
+                entry:
+                  ret %struct.B %x
+                }
+                define %struct.A @f(%struct.A %x) {
+                entry:
+                  %r = call %struct.A @as_a(%struct.A %x)
+                  ret %struct.A %r
+                }
+            "#[..],
+            &br#"
+                @one_arg = alias void (i32), ptr @two_args
+                define void @two_args(i32 %a, i32 %b) {
+                entry:
+                  ret void
+                }
+                define void @f() {
+                entry:
+                  call void @one_arg(i32 1)
+                  ret void
+                }
+            "#[..],
+        ] {
+            let err =
+                build_symbols_result_from_ir(ir).expect_err("incompatible alias call must fail");
+            let diag = err
+                .downcast_ref::<Diagnostic>()
+                .expect("structured diagnostic");
+            assert_eq!(
+                diag.kind,
+                super::super::DiagnosticKind::UnsupportedFeature(UnsupportedFeature::Instruction)
+            );
+        }
     }
 }

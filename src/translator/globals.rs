@@ -12,9 +12,9 @@ use cprover_bindings::goto_program::{Expr, Location, SymbolTable, Type};
 use inkwell::llvm_sys::LLVMOpcode;
 use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
-    LLVMAliasGetAliasee, LLVMGetAggregateElement, LLVMGetConstOpcode, LLVMGetGEPSourceElementType,
-    LLVMGetIntTypeWidth, LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind,
-    LLVMIsAConstantDataSequential, LLVMIsAConstantExpr, LLVMIsAGlobalAlias, LLVMIsAGlobalVariable,
+    LLVMGetAggregateElement, LLVMGetConstOpcode, LLVMGetGEPSourceElementType, LLVMGetIntTypeWidth,
+    LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind, LLVMIsAConstantDataSequential,
+    LLVMIsAConstantExpr, LLVMIsAGlobalVariable,
 };
 use inkwell::values::{
     AnyValue, ArrayValue, AsValueRef, BasicValueEnum, FloatValue, FunctionValue, GlobalValue,
@@ -401,12 +401,9 @@ impl GlobalLowerer {
         symbols: &SymbolTable,
         location: &Location,
     ) -> std::result::Result<Option<Expr>, Diagnostic> {
-        let mut raw = value.as_value_ref();
-        while unsafe { !LLVMIsAGlobalAlias(raw).is_null() } {
-            // Clang emits common C++ entry-point aliases like `D1 -> D2`. Follow aliases to their
-            // aliasee so the rest of constant-pointer lowering can stay in terms of real symbols.
-            raw = unsafe { LLVMAliasGetAliasee(raw) };
-        }
+        // Clang emits common C++ entry-point aliases like `D1 -> D2`. Follow aliases to their
+        // aliasee so the rest of constant-pointer lowering can stay in terms of real symbols.
+        let raw = super::unwrap_global_alias(value.as_value_ref());
 
         let symbol_expr = if let Some(function) = unsafe { FunctionValue::new(raw) } {
             let name = function.get_name().to_string_lossy();

@@ -1370,7 +1370,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         if self.try_lower_inline_asm_call(instruction, raw_callee, body)? {
             return Ok(());
         }
-        if let Some(callee) = unsafe { FunctionValue::new(raw_callee) } {
+        if let Some(callee) = super::direct_callee(instruction) {
             let callee_name = callee.get_name().to_string_lossy().into_owned();
             if super::is_metadata_noop_intrinsic(&callee_name) {
                 // LLVM debug and alias-scope intrinsics carry metadata-only bookkeeping. Drop
@@ -1378,9 +1378,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 // the semantic translation path.
                 return Ok(());
             }
-        }
-        if let Some(callee) = call.get_called_fn_value() {
-            let callee_name = callee.get_name().to_string_lossy().into_owned();
             let args = (0..call.count_arguments())
                 .map(|index| self.lower_operand(instruction, index))
                 .collect::<Result<Vec<_>>>()?;
@@ -1420,12 +1417,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                     .unwrap_or(callee_name.as_str())
             });
             let function_expr = self.function_expr(effective_callee, loc)?;
-            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-                &function_expr,
-                args.clone(),
-                self.symbols.machine_model(),
-            );
-            self.emit_call_result(instruction, function_expr, arguments, body, loc)?;
+            self.emit_call_result(instruction, function_expr, args.clone(), body, loc)?;
             if let Some(contract) = &contract
                 && replacement.is_none()
             {
@@ -1449,12 +1441,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return self.lower_indirect_dispatch(instruction, args, dispatch, body, loc);
         }
         let function_expr = self.indirect_callee_expr(call, loc)?;
-        let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-            &function_expr,
-            args,
-            self.symbols.machine_model(),
-        );
-        self.emit_call_result(instruction, function_expr, arguments, body, loc)?;
+        self.emit_call_result(instruction, function_expr, args, body, loc)?;
         Ok(())
     }
 
@@ -1490,13 +1477,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         for name in candidates.iter().rev() {
             let effective = self.indirect_candidate_callee(name, loc)?;
             let function_expr = self.function_expr(&effective, loc)?;
-            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-                &function_expr,
-                args.clone(),
-                self.symbols.machine_model(),
-            );
             let mut then = vec![];
-            self.emit_call_result(instruction, function_expr, arguments, &mut then, loc)?;
+            self.emit_call_result(instruction, function_expr, args.clone(), &mut then, loc)?;
             let address = self
                 .function_expr(name, loc)?
                 .address_of()
@@ -1580,7 +1562,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(());
         }
 
-        if let Some(callee) = unsafe { FunctionValue::new(raw_callee) } {
+        if let Some(callee) = super::direct_callee(instruction) {
             let callee_name = callee.get_name().to_string_lossy().into_owned();
             let replacement = self.replacement_symbol(&callee_name);
             if replacement.is_none()
@@ -1623,12 +1605,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .and_then(|contract| contract.model.as_deref())
                 .unwrap_or(callee_name.as_str());
             let function_expr = self.function_expr(effective_callee, loc)?;
-            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-                &function_expr,
-                args.clone(),
-                self.symbols.machine_model(),
-            );
-            self.emit_call_result(instruction, function_expr, arguments, body, loc)?;
+            self.emit_call_result(instruction, function_expr, args.clone(), body, loc)?;
 
             let mut normal_stmts = Vec::new();
             if let Some(contract) = &contract {
@@ -1656,12 +1633,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         } else {
             let function_expr =
                 self.indirect_callee_expr_from_instruction(instruction, raw_callee, loc)?;
-            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-                &function_expr,
-                args,
-                self.symbols.machine_model(),
-            );
-            self.emit_call_result(instruction, function_expr, arguments, body, loc)?;
+            self.emit_call_result(instruction, function_expr, args, body, loc)?;
         }
         body.push(self.branch_on_exception(predecessor, normal_dest, unwind_dest)?);
         Ok(())
@@ -1879,11 +1851,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 &function,
                 &arguments,
             )?;
-            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-                &function,
-                arguments,
-                self.symbols.machine_model(),
-            );
             self.emit_call_result(instruction, function, arguments, body, loc)?;
             self.report.inline_asm_model(site, &mapping.model);
             return Ok(());
@@ -1918,6 +1885,46 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(branch)
     }
 
+    fn cast_call_arguments(
+        &self,
+        function: &Expr,
+        args: Vec<Expr>,
+        loc: Location,
+    ) -> Result<Vec<Expr>> {
+        let typ = function.typ();
+        let parameters = typ.parameters().ok_or_else(|| {
+            Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!("callee in {} is not a function", self.function_name),
+            )
+            .with_symbol(self.function_name.clone())
+            .with_location(loc)
+        })?;
+        let arity_ok = if typ.is_variadic_code() {
+            args.len() >= parameters.len()
+        } else {
+            args.len() == parameters.len()
+        };
+        let mm = self.symbols.machine_model();
+        if !arity_ok
+            || !parameters.iter().zip(&args).all(|(param, arg)| {
+                crate::contracts::inject::types_are_call_compatible(arg.typ(), param.typ(), mm)
+            })
+        {
+            return Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!(
+                    "incompatible call argument signature in {}",
+                    self.function_name
+                ),
+            )
+            .with_symbol(self.function_name.clone())
+            .with_location(loc)
+            .into());
+        }
+        Ok(Expr::cast_arguments_to_target_equivalent_function_parameter_types(function, args, mm))
+    }
+
     fn emit_call_result(
         &mut self,
         instruction: InstructionValue<'ctx>,
@@ -1926,6 +1933,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         body: &mut Vec<Stmt>,
         loc: Location,
     ) -> Result<()> {
+        let arguments = self.cast_call_arguments(&function, arguments, loc)?;
         if instruction.get_type().is_void_type() {
             body.push(Stmt::function_call(None, function, arguments, loc));
             return Ok(());
@@ -1946,6 +1954,22 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         if result.typ() == &return_type {
             body.push(Stmt::function_call(Some(result), function, arguments, loc));
             return Ok(());
+        }
+        if !crate::contracts::inject::return_types_are_call_compatible(
+            &return_type,
+            result.typ(),
+            self.symbols.machine_model(),
+        ) {
+            return Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!(
+                    "incompatible call return signature in {}",
+                    self.function_name
+                ),
+            )
+            .with_symbol(self.function_name.clone())
+            .with_location(loc)
+            .into());
         }
 
         // Preseeded CBMC/library symbols often use C types like `c_int`, while LLVM SSA results
@@ -2132,11 +2156,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             result_type,
             loc,
         );
-        let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
-            &function_expr,
-            args,
-            self.symbols.machine_model(),
-        );
+        let arguments = self.cast_call_arguments(&function_expr, args, loc)?;
         body.push(Stmt::function_call(
             Some(result.clone()),
             function_expr,

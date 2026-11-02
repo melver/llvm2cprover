@@ -506,15 +506,31 @@ fn validate_helper_parameters(
 }
 
 /// Match the target-equivalent casts used when helper calls are emitted, without treating two
-/// unrelated aggregate types as equivalent merely because neither has a scalar machine width.
-fn types_are_call_compatible(
+/// unrelated non-scalar or float types as equivalent merely because neither has an integer/pointer
+/// machine width.
+pub(crate) fn types_are_call_compatible(
     source: &Type,
     target: &Type,
     machine_model: &cprover_bindings::MachineModel,
 ) -> bool {
     source == target
-        || (source.is_equal_on_machine(target, machine_model)
-            && Expr::nondet(source.clone()).can_cast_to(target))
+        || (source.native_width(machine_model).is_some()
+            && source.is_equal_on_machine(target, machine_model)
+            && Expr::can_cast_from(source, target))
+}
+
+/// Match return-value casts used by call lowering: target-equivalent scalar/pointer types, or
+/// same-width integers differing only in signedness (such as `i32` vs preseeded `c_int`, or `i1`
+/// lowered as `c_bool`).
+pub(crate) fn return_types_are_call_compatible(
+    actual: &Type,
+    expected: &Type,
+    machine_model: &cprover_bindings::MachineModel,
+) -> bool {
+    let same_width_integers = actual.is_integer()
+        && expected.is_integer()
+        && actual.native_width(machine_model) == expected.native_width(machine_model);
+    same_width_integers || types_are_call_compatible(actual, expected, machine_model)
 }
 
 fn attach_assigns_contract(
@@ -593,14 +609,11 @@ fn validate_helper<'a>(
             // model may stand in for a libc symbol preseeded as `c_int` (e.g. `pthread_join`).
             // Arguments are passed with `cast_to_target_equivalent_type`, which requires matching
             // signedness, so parameters keep the stricter `types_are_call_compatible` check.
-            // `c_bool` counts as an 8-bit integer here; the cast maps nonzero results to true.
-            let mm = symbols.machine_model();
-            let same_width_integers = actual_return.is_integer()
-                && expected_return.is_integer()
-                && actual_return.native_width(mm) == expected_return.native_width(mm);
-            if !same_width_integers
-                && !types_are_call_compatible(&actual_return, &expected_return, mm)
-            {
+            if !return_types_are_call_compatible(
+                &actual_return,
+                &expected_return,
+                symbols.machine_model(),
+            ) {
                 bail!(
                     "{kind} helper `{helper_name}` for `{target_name}` returns {:?}, expected {:?}",
                     actual_return,

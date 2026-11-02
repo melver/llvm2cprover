@@ -28,9 +28,9 @@ use cprover_bindings::irep::goto_binary_serde::write_goto_binary_file;
 use inkwell::context::Context;
 use inkwell::llvm_sys::LLVMAtomicOrdering;
 use inkwell::llvm_sys::core::{
-    LLVMGetBasicBlockParent, LLVMGetCalledValue, LLVMGetFirstUse, LLVMGetInstructionParent,
-    LLVMGetNextUse, LLVMGetNumOperands, LLVMGetOperand, LLVMGetOrdering, LLVMGetUser,
-    LLVMIsACallInst, LLVMIsAInstruction, LLVMIsAInvokeInst,
+    LLVMAliasGetAliasee, LLVMGetBasicBlockParent, LLVMGetCalledValue, LLVMGetFirstUse,
+    LLVMGetInstructionParent, LLVMGetNextUse, LLVMGetNumOperands, LLVMGetOperand, LLVMGetOrdering,
+    LLVMGetUser, LLVMIsACallInst, LLVMIsAGlobalAlias, LLVMIsAInstruction, LLVMIsAInvokeInst,
 };
 use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::memory_buffer::MemoryBuffer;
@@ -60,6 +60,20 @@ pub(crate) const EH_SELECTOR_SYMBOL: &str = "__llvm2cprover_eh_selector";
 
 pub(crate) fn is_metadata_noop_intrinsic(name: &str) -> bool {
     name.starts_with("llvm.dbg.") || name.starts_with("llvm.experimental.noalias.scope.decl")
+}
+
+/// Peel `GlobalAlias` wrappers (`@a = alias ..., ptr @target`) to their aliasee.
+pub(super) fn unwrap_global_alias(mut raw: LLVMValueRef) -> LLVMValueRef {
+    while !raw.is_null() && unsafe { !LLVMIsAGlobalAlias(raw).is_null() } {
+        raw = unsafe { LLVMAliasGetAliasee(raw) };
+    }
+    raw
+}
+
+/// Direct `Function` callee of a call site, following `GlobalAlias` wrappers.
+pub(super) fn direct_callee(instruction: InstructionValue<'_>) -> Option<FunctionValue<'_>> {
+    let raw = unwrap_global_alias(unsafe { LLVMGetCalledValue(instruction.as_value_ref()) });
+    unsafe { FunctionValue::new(raw) }
 }
 
 pub use self::asm_manifest::AsmManifest;
@@ -366,8 +380,7 @@ fn validate_assigns_instruction(
             bail!("assigns helper `{helper}` for `{target}` contains an atomic fence");
         }
         InstructionOpcode::Call | InstructionOpcode::Invoke | InstructionOpcode::CallBr => {
-            let called = unsafe { LLVMGetCalledValue(instruction.as_value_ref()) };
-            let called_name = unsafe { FunctionValue::new(called) }
+            let called_name = direct_callee(instruction)
                 .map(|function| function.get_name().to_string_lossy().into_owned());
             let harmless = called_name.as_deref().is_some_and(|name| {
                 is_metadata_noop_intrinsic(name) || name.starts_with("llvm.lifetime.")
@@ -442,7 +455,7 @@ fn validate_contract_enforcement_uses(
             continue;
         };
         // Direct self-recursion is the degenerate call cycle, so the cycle walk below reports it.
-        for_each_direct_call_use(
+        validate_direct_call_uses(
             function.as_value_ref(),
             name,
             cone,
@@ -452,7 +465,6 @@ fn validate_contract_enforcement_uses(
                     "contract enforcement for `{name}` requires direct calls only; its address is used indirectly"
                 )
             },
-            |_| Ok(()),
         )?;
         validate_contract_enforcement_call_cycle(function.as_value_ref(), name, cone)?;
     }
@@ -467,10 +479,8 @@ fn validate_contract_enforcement_call_cycle(
     let mut visited = BTreeSet::from([target as usize]);
     let mut pending = vec![target];
     while let Some(callee) = pending.pop() {
-        let mut usage = unsafe { LLVMGetFirstUse(callee) };
-        while !usage.is_null() {
-            let user = unsafe { LLVMGetUser(usage) };
-            if is_direct_call_to(user, callee) {
+        for_each_non_alias_use(callee, |user, callee_or_alias| {
+            if is_direct_call_to(user, callee_or_alias) {
                 let caller = unsafe { LLVMGetBasicBlockParent(LLVMGetInstructionParent(user)) };
                 if cone.is_some_and(|cone| {
                     unsafe { FunctionValue::new(caller) }.is_none_or(|function| {
@@ -479,8 +489,7 @@ fn validate_contract_enforcement_call_cycle(
                             .contains(function.get_name().to_string_lossy().as_ref())
                     })
                 }) {
-                    usage = unsafe { LLVMGetNextUse(usage) };
-                    continue;
+                    return Ok(());
                 }
                 if caller == target {
                     bail!(
@@ -491,8 +500,8 @@ fn validate_contract_enforcement_call_cycle(
                     pending.push(caller);
                 }
             }
-            usage = unsafe { LLVMGetNextUse(usage) };
-        }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -524,7 +533,7 @@ fn validate_contract_replacement_uses(
         let Some(function) = module.get_function(name) else {
             continue;
         };
-        for_each_direct_call_use(
+        validate_direct_call_uses(
             function.as_value_ref(),
             name,
             cone,
@@ -534,7 +543,6 @@ fn validate_contract_replacement_uses(
                     "contract replacement for `{name}` requires direct calls only; its address is used indirectly"
                 )
             },
-            |_| Ok(()),
         )?;
     }
     Ok(())
@@ -552,42 +560,58 @@ fn is_direct_call_to(user: LLVMValueRef, callee: LLVMValueRef) -> bool {
     }
 }
 
-/// Visit every use of `function`, rejecting any that is not a direct call.
+/// Check that every use of `function` (including through `GlobalAlias` wrappers) is a direct call.
 ///
-/// Shared by the replacement and enforcement pre-passes, which differ only in wording and in
-/// the extra per-use check they apply.
-fn for_each_direct_call_use(
+/// Shared by the replacement and enforcement pre-passes, which differ only in wording.
+fn validate_direct_call_uses(
     function: LLVMValueRef,
     name: &str,
     cone: Option<&symbols::ConeOfInfluence>,
     invoke_message: impl Fn() -> String,
     indirect_message: impl Fn() -> String,
-    mut visit: impl FnMut(LLVMValueRef) -> Result<()>,
 ) -> Result<()> {
     if cone.is_some_and(|cone| cone.address_taken_functions.contains(name)) {
         bail!("{}", indirect_message());
     }
-    let mut usage = unsafe { LLVMGetFirstUse(function) };
-    while !usage.is_null() {
-        let user = unsafe { LLVMGetUser(usage) };
+    for_each_non_alias_use(function, |user, callee_or_alias| {
         if let Some(cone) = cone {
             let Some(caller) = enclosing_function_name(user) else {
-                usage = unsafe { LLVMGetNextUse(usage) };
-                continue;
+                return Ok(());
             };
             if !cone.lowered_functions.contains(&caller) {
-                usage = unsafe { LLVMGetNextUse(usage) };
-                continue;
+                return Ok(());
             }
         }
         if unsafe { !LLVMIsAInvokeInst(user).is_null() } {
             bail!("{}", invoke_message());
         }
-        if !is_direct_call_to(user, function) {
+        if !is_direct_call_to(user, callee_or_alias) {
             bail!("{}", indirect_message());
         }
-        visit(user)?;
-        usage = unsafe { LLVMGetNextUse(usage) };
+        Ok(())
+    })
+}
+
+/// Visit every non-alias user of `root`, peeling `GlobalAlias` wrappers that refer to it.
+fn for_each_non_alias_use(
+    root: LLVMValueRef,
+    mut visit: impl FnMut(LLVMValueRef, LLVMValueRef) -> Result<()>,
+) -> Result<()> {
+    let mut seen = BTreeSet::from([root as usize]);
+    let mut worklist = vec![root];
+    while let Some(value) = worklist.pop() {
+        let mut usage = unsafe { LLVMGetFirstUse(value) };
+        while !usage.is_null() {
+            let user = unsafe { LLVMGetUser(usage) };
+            if unsafe { !LLVMIsAGlobalAlias(user).is_null() } {
+                if seen.insert(user as usize) {
+                    worklist.push(user);
+                }
+            } else {
+                visit(user, value)?;
+            }
+            usage = unsafe { LLVMGetNextUse(usage) };
+        }
     }
     Ok(())
 }
@@ -1021,5 +1045,104 @@ mod tests {
 
         assert_eq!(op1_name, "yes", "C API operand 1 is the true destination");
         assert_eq!(op2_name, "no", "C API operand 2 is the false destination");
+    }
+
+    #[test]
+    fn contract_use_validation_peels_global_aliases() {
+        let context = Context::create();
+        let direct_ir = br#"
+            @unused_alias = alias i32 (i32), ptr @target
+            @call_alias = alias i32 (i32), ptr @target
+
+            define i32 @target(i32 %x) {
+            entry:
+              ret i32 %x
+            }
+
+            define i32 @main() {
+            entry:
+              %r = call i32 @call_alias(i32 1)
+              ret i32 %r
+            }
+        "#;
+        let module = parse_module(
+            &context,
+            &TranslationInput::Stdin,
+            InputFormat::LlvmIr,
+            direct_ir,
+        )
+        .expect("parse direct alias IR");
+        let target = BTreeSet::from([String::from("target")]);
+        validate_contract_replacement_uses(&module, &target, None)
+            .expect("direct alias calls should allow replacement");
+        validate_contract_enforcement_uses(&module, &target, None)
+            .expect("direct alias calls should allow enforcement");
+
+        let invoke_ir = br#"
+            @alias_target = alias void (), ptr @target
+            declare i32 @__gxx_personality_v0(...)
+
+            define void @target() {
+            entry:
+              ret void
+            }
+
+            define void @main() personality ptr @__gxx_personality_v0 {
+            entry:
+              invoke void @alias_target() to label %ok unwind label %lpad
+            ok:
+              ret void
+            lpad:
+              %lp = landingpad { ptr, i32 } cleanup
+              ret void
+            }
+        "#;
+        let module = parse_module(
+            &context,
+            &TranslationInput::Stdin,
+            InputFormat::LlvmIr,
+            invoke_ir,
+        )
+        .expect("parse invoke alias IR");
+        let entry = BTreeSet::from([String::from("main")]);
+        let cone = symbols::ConeOfInfluence::compute(
+            &module,
+            &contracts::ContractMap::default(),
+            &entry,
+            &BTreeSet::new(),
+            &target,
+        )
+        .expect("compute cone");
+        let err = validate_contract_enforcement_uses(&module, &target, Some(&cone))
+            .expect_err("invoke through alias must fail closed");
+        assert!(err.to_string().contains("invoke"));
+
+        let rec_ir = br#"
+            @rec_alias = alias i32 (i32), ptr @target
+
+            define i32 @target(i32 %x) {
+            entry:
+              %r = call i32 @rec_alias(i32 %x)
+              ret i32 %r
+            }
+        "#;
+        let module = parse_module(
+            &context,
+            &TranslationInput::Stdin,
+            InputFormat::LlvmIr,
+            rec_ir,
+        )
+        .expect("parse recursive alias IR");
+        let cone = symbols::ConeOfInfluence::compute(
+            &module,
+            &contracts::ContractMap::default(),
+            &target,
+            &BTreeSet::new(),
+            &target,
+        )
+        .expect("compute cone");
+        let err = validate_contract_enforcement_uses(&module, &target, Some(&cone))
+            .expect_err("recursion through alias must fail closed");
+        assert!(err.to_string().contains("recursive call cycles"));
     }
 }
