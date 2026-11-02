@@ -1441,12 +1441,29 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let args = (0..call.count_arguments())
             .map(|index| self.lower_operand(instruction, index))
             .collect::<Result<Vec<_>>>()?;
+        self.lower_indirect_call(instruction, raw_callee, args, body, loc)
+    }
+
+    fn lower_indirect_call(
+        &mut self,
+        instruction: InstructionValue<'ctx>,
+        raw_callee: LLVMValueRef,
+        args: Vec<Expr>,
+        body: &mut Vec<Stmt>,
+        loc: Location,
+    ) -> Result<()> {
         if let Some(dispatch) = self.fp_dispatch {
-            return self.lower_indirect_dispatch(instruction, args, dispatch, body, loc);
+            return self.lower_indirect_dispatch(
+                instruction,
+                raw_callee,
+                args,
+                dispatch,
+                body,
+                loc,
+            );
         }
-        let function_expr = self.indirect_callee_expr(call, loc)?;
-        self.emit_call_result(instruction, function_expr, args, body, loc)?;
-        Ok(())
+        let function_expr = self.indirect_callee_expr(instruction, raw_callee, loc)?;
+        self.emit_call_result(instruction, function_expr, args, body, loc)
     }
 
     /// `--fp-groups`: an indirect `call` or `invoke` as
@@ -1455,6 +1472,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     fn lower_indirect_dispatch(
         &mut self,
         instruction: InstructionValue<'ctx>,
+        raw_callee: LLVMValueRef,
         args: Vec<Expr>,
         dispatch: &FpDispatch,
         body: &mut Vec<Stmt>,
@@ -1464,9 +1482,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             // Declare the result even if no candidate exists, so later uses still resolve.
             self.declare_instruction_result(instruction)?;
         }
-        let raw = unsafe { LLVMGetCalledValue(instruction.as_value_ref()) };
         let target = self
-            .lower_value(unsafe { BasicValueEnum::new(raw) })?
+            .lower_value(unsafe { BasicValueEnum::new(raw_callee) })?
             .cast_to(Type::void_pointer());
         let typ = unsafe { LLVMGetCalledFunctionType(instruction.as_value_ref()) } as usize;
         let candidates = dispatch.candidates(&self.function_name, typ);
@@ -1634,13 +1651,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(());
         }
 
-        if let Some(dispatch) = self.fp_dispatch {
-            self.lower_indirect_dispatch(instruction, args, dispatch, body, loc)?;
-        } else {
-            let function_expr =
-                self.indirect_callee_expr_from_instruction(instruction, raw_callee, loc)?;
-            self.emit_call_result(instruction, function_expr, args, body, loc)?;
-        }
+        self.lower_indirect_call(instruction, raw_callee, args, body, loc)?;
         body.push(self.branch_on_exception(predecessor, normal_dest, unwind_dest)?);
         Ok(())
     }
@@ -2003,30 +2014,16 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
     fn indirect_callee_expr(
         &mut self,
-        call: CallSiteValue<'ctx>,
-        location: Location,
-    ) -> Result<Expr> {
-        let raw = unsafe { LLVMGetCalledValue(call.as_value_ref()) };
-        let callee = self.lower_value(unsafe { BasicValueEnum::new(raw) })?;
-        let function_type = self.types.lower_function(call.get_called_fn_type())?;
-        // LLVM spells indirect callees as pointers to functions; CBMC wants the callee expression
-        // itself to have code type, so we cast to the recovered code-pointer type and dereference.
-        Ok(callee
-            .cast_to(function_type.clone().to_pointer())
-            .dereference()
-            .with_location(location))
-    }
-
-    fn indirect_callee_expr_from_instruction(
-        &mut self,
         instruction: InstructionValue<'ctx>,
-        raw: LLVMValueRef,
+        raw_callee: LLVMValueRef,
         location: Location,
     ) -> Result<Expr> {
-        let callee = self.lower_value(unsafe { BasicValueEnum::new(raw) })?;
+        let callee = self.lower_value(unsafe { BasicValueEnum::new(raw_callee) })?;
         let function_type = self.types.lower_function(unsafe {
             FunctionType::new(LLVMGetCalledFunctionType(instruction.as_value_ref()))
         })?;
+        // LLVM spells indirect callees as pointers to functions; CBMC wants the callee expression
+        // itself to have code type, so we cast to the recovered code-pointer type and dereference.
         Ok(callee
             .cast_to(function_type.to_pointer())
             .dereference()
