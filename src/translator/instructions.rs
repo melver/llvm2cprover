@@ -1500,8 +1500,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
     /// The function a dispatched call to `name` runs: its replacement or plain `model`, as for
     /// direct calls. Other call-site contracts (`requires`/`ensures`) are not supported here.
-    fn indirect_candidate_callee(&self, name: &str, loc: Location) -> Result<String> {
+    fn indirect_candidate_callee(&mut self, name: &str, loc: Location) -> Result<String> {
         if let Some(replacement) = self.replacement_symbol(name) {
+            self.report.relied_contract(name, true);
             return Ok(replacement.to_owned());
         }
         let Some(contract) = self
@@ -1521,6 +1522,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .with_location(loc)
             .into());
         }
+        self.report.relied_contract(name, false);
         Ok(contract.model.as_deref().unwrap_or(name).to_owned())
     }
 

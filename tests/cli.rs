@@ -899,3 +899,100 @@ fn emit_llvm_rejects_goto_only_options() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
 }
+
+#[test]
+fn report_records_fp_groups_indirect_candidate_contracts() {
+    let input = input_file(
+        r#"
+declare i32 @modeled_candidate(i32)
+
+define i32 @candidate_model(i32 %x) {
+entry:
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+
+define i32 @plain_candidate(i32 %x) {
+entry:
+  ret i32 %x
+}
+
+define i32 @dispatch(i32 (i32)* %fp, i32 %x) {
+entry:
+  %r = call i32 %fp(i32 %x)
+  ret i32 %r
+}
+
+define i32 @main(i32 %sel, i32 %x) {
+entry:
+  %cond = icmp eq i32 %sel, 0
+  %fp = select i1 %cond, i32 (i32)* @modeled_candidate, i32 (i32)* @plain_candidate
+  %r = call i32 @dispatch(i32 (i32)* %fp, i32 %x)
+  ret i32 %r
+}
+"#,
+    );
+    let manifest = input.with_extension("toml");
+    let groups = input.with_extension("groups");
+    let goto = input.with_extension("goto");
+    let report = input.with_extension("report.json");
+    fs::write(
+        &manifest,
+        r#"
+[functions.modeled_candidate]
+model = "candidate_model"
+"#,
+    )
+    .expect("failed to write contract manifest");
+    fs::write(
+        &groups,
+        r#"
+[groups]
+g = ["dispatch", "modeled_candidate", "plain_candidate"]
+"#,
+    )
+    .expect("failed to write fp-groups manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"))
+        .arg("--input-format=ll")
+        .arg("--entry")
+        .arg("main")
+        .arg("--fp-groups")
+        .arg(&groups)
+        .arg("--contracts")
+        .arg(&manifest)
+        .arg("--report")
+        .arg(&report)
+        .arg("-o")
+        .arg(&goto)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    fs::remove_file(&input).expect("failed to remove test input");
+    fs::remove_file(&manifest).expect("failed to remove contract manifest");
+    fs::remove_file(&groups).expect("failed to remove fp-groups manifest");
+    let _ = fs::remove_file(&goto);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("missing report"))
+            .expect("report was not valid JSON");
+    fs::remove_file(&report).expect("failed to remove report");
+
+    assert_eq!(report_json["undefined_functions"], serde_json::json!([]));
+    assert_eq!(
+        report_json["contracts"],
+        serde_json::json!([
+            {
+                "function": "modeled_candidate",
+                "reliance": "instrumentation",
+                "model": "candidate_model",
+                "discharged": false,
+            }
+        ])
+    );
+}
