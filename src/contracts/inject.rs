@@ -589,7 +589,18 @@ fn validate_helper<'a>(
             }
         }
         HelperReturn::Exact(expected_return) => {
-            if actual_return != expected_return {
+            // Call sites cast the helper's result to the LLVM result type, so a signless `i32`
+            // model may stand in for a libc symbol preseeded as `c_int` (e.g. `pthread_join`).
+            // Arguments are passed with `cast_to_target_equivalent_type`, which requires matching
+            // signedness, so parameters keep the stricter `types_are_call_compatible` check.
+            // `c_bool` counts as an 8-bit integer here; the cast maps nonzero results to true.
+            let mm = symbols.machine_model();
+            let same_width_integers = actual_return.is_integer()
+                && expected_return.is_integer()
+                && actual_return.native_width(mm) == expected_return.native_width(mm);
+            if !same_width_integers
+                && !types_are_call_compatible(&actual_return, &expected_return, mm)
+            {
                 bail!(
                     "{kind} helper `{helper_name}` for `{target_name}` returns {:?}, expected {:?}",
                     actual_return,
