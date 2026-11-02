@@ -100,6 +100,8 @@ External declarations, LLVM intrinsics, `__CPROVER_*` builtins, and
 llvm2cprover runtime symbols remain shared. Contract manifests keep naming the
 original LLVM symbols, so one manifest serves every variant; `--entry`,
 `--replace-with-contract` and `--enforce-contract` name the prefixed symbols.
+A manifest name that is not an original symbol is used as written, so a
+manifest may also name the prefixed symbols of one specific variant.
 
 ### Emitting LLVM IR
 
@@ -111,8 +113,6 @@ lowering it to GOTO, like other LLVM tools. GOTO-only options (`--entry`,
 ```sh
 llvm2cprover --rename-prefix c_ --emit-llvm c.bc -o c_prefixed.bc
 ```
-A manifest name that is not an original symbol is used as written, so a
-manifest may also name the prefixed symbols of one specific variant.
 
 ## Soundness and limitations
 
@@ -133,7 +133,6 @@ construct. In particular:
   lowered (`__CPROVER_same_object`, `r_ok`, `OBJECT_SIZE`, `POINTER_OBJECT`,
   `POINTER_OFFSET` and `DYNAMIC_OBJECT` are); CBMC runtime functions such as
   `__CPROVER_havoc_object` or the threading primitives stay ordinary calls
-- contract manifests cannot currently be combined with a nonempty symbol prefix
 
 Unsupported approximations are opt-in by feature. The only current selector is
 `--unsound=varargs`, which ignores `va_start`, `va_end`, and `va_copy`. Bare
