@@ -2766,7 +2766,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         self.assign_result(instruction, body, value)
     }
 
-    /// `__CPROVER_assume` / `llvm.assume`: assume the first argument, as a bool.
+    /// `__CPROVER_assume` / `llvm.assume`: assume the sole condition argument, as a bool.
     fn lower_assume(
         &self,
         callee_name: &str,
@@ -2774,12 +2774,19 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         body: &mut Vec<Stmt>,
         loc: Location,
     ) -> Result<()> {
-        let cond = args
-            .first()
-            .cloned()
-            .ok_or_else(|| self.unsupported_intrinsic(callee_name, "missing assume argument"))?
-            .cast_to(Type::bool());
-        body.push(Stmt::assume(cond, loc));
+        let [cond] = args else {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "expects one argument")
+                .with_location(loc)
+                .into());
+        };
+        if !cond.can_cast_to(&Type::bool()) {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "non-boolean condition")
+                .with_location(loc)
+                .into());
+        }
+        body.push(Stmt::assume(cond.clone().cast_to(Type::bool()), loc));
         Ok(())
     }
 
@@ -2800,28 +2807,68 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let Some(builtin) = callee_name.strip_prefix("__CPROVER_") else {
             return Ok(false);
         };
-        let arg = |index: usize| {
-            args.get(index).cloned().ok_or_else(|| {
-                self.unsupported_intrinsic(callee_name, format!("missing argument {index}"))
-            })
+        let as_void_ptr = |expr: &Expr| -> Result<Expr> {
+            if !expr.typ().is_pointer() {
+                return Err(self
+                    .unsupported_intrinsic(callee_name, "expects a pointer argument")
+                    .with_location(loc)
+                    .into());
+            }
+            Ok(expr.clone().cast_to(Type::void_pointer()))
         };
-        let ptr = |index: usize| arg(index).map(|p| p.cast_to(Type::void_pointer()));
+        let unary_ptr = || -> Result<Expr> {
+            let [ptr] = args else {
+                return Err(self
+                    .unsupported_intrinsic(callee_name, "expects one argument")
+                    .with_location(loc)
+                    .into());
+            };
+            as_void_ptr(ptr)
+        };
         let value = match builtin {
             "assume" => {
                 self.lower_assume(callee_name, args, body, loc)?;
                 return Ok(true);
             }
             "assert" => {
-                let cond = arg(0)?.cast_to(Type::bool());
+                let [cond, desc] = args else {
+                    return Err(self
+                        .unsupported_intrinsic(callee_name, "expects two arguments")
+                        .with_location(loc)
+                        .into());
+                };
+                if !cond.can_cast_to(&Type::bool()) {
+                    return Err(self
+                        .unsupported_intrinsic(callee_name, "non-boolean condition")
+                        .with_location(loc)
+                        .into());
+                }
+                if !desc.typ().is_pointer() {
+                    return Err(self
+                        .unsupported_intrinsic(callee_name, "expects a pointer message argument")
+                        .with_location(loc)
+                        .into());
+                }
                 // Preserve the user's description so CBMC property reports stay meaningful; fall
                 // back to the callee name when the message is not a constant string literal.
                 let message = self
                     .constant_string_operand(instruction, 1)
                     .unwrap_or_else(|| callee_name.to_owned());
-                body.push(Stmt::assert(cond, "assert", &message, loc));
+                body.push(Stmt::assert(
+                    cond.clone().cast_to(Type::bool()),
+                    "assert",
+                    &message,
+                    loc,
+                ));
                 return Ok(true);
             }
             _ if builtin.starts_with("nondet_") => {
+                if !args.is_empty() {
+                    return Err(self
+                        .unsupported_intrinsic(callee_name, "expects no arguments")
+                        .with_location(loc)
+                        .into());
+                }
                 let lhs = self.declare_instruction_result(instruction)?;
                 body.push(Stmt::assign(
                     lhs.clone(),
@@ -2830,12 +2877,34 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 ));
                 return Ok(true);
             }
-            "same_object" => ptr(0)?.same_object(ptr(1)?),
-            "r_ok" => ptr(0)?.r_ok(arg(1)?.cast_to(Type::size_t())),
-            "OBJECT_SIZE" => ptr(0)?.object_size(),
-            "POINTER_OBJECT" => ptr(0)?.pointer_object(),
-            "POINTER_OFFSET" => ptr(0)?.pointer_offset(),
-            "DYNAMIC_OBJECT" => ptr(0)?.dynamic_object(),
+            "same_object" => {
+                let [lhs, rhs] = args else {
+                    return Err(self
+                        .unsupported_intrinsic(callee_name, "expects two arguments")
+                        .with_location(loc)
+                        .into());
+                };
+                as_void_ptr(lhs)?.same_object(as_void_ptr(rhs)?)
+            }
+            "r_ok" => {
+                let [ptr, size] = args else {
+                    return Err(self
+                        .unsupported_intrinsic(callee_name, "expects two arguments")
+                        .with_location(loc)
+                        .into());
+                };
+                if !(size.typ().is_integer() || size.typ().is_c_bool() || size.typ().is_bool()) {
+                    return Err(self
+                        .unsupported_intrinsic(callee_name, "expects an integer size argument")
+                        .with_location(loc)
+                        .into());
+                }
+                as_void_ptr(ptr)?.r_ok(size.clone().cast_to(Type::size_t()))
+            }
+            "OBJECT_SIZE" => unary_ptr()?.object_size(),
+            "POINTER_OBJECT" => unary_ptr()?.pointer_object(),
+            "POINTER_OFFSET" => unary_ptr()?.pointer_offset(),
+            "DYNAMIC_OBJECT" => unary_ptr()?.dynamic_object(),
             _ if UNLOWERED_EXPRESSION_BUILTINS.contains(&builtin) => {
                 return Err(self
                     .unsupported_intrinsic(callee_name, "unsupported CBMC builtin")

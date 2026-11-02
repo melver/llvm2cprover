@@ -2670,4 +2670,84 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn rejects_invalid_arity_and_operand_types_in_cprover_and_assume_builtins() {
+        for ir in [
+            &br#"
+                declare void @__CPROVER_assume(i1, i32)
+                define void @f() {
+                entry:
+                  call void @__CPROVER_assume(i1 true, i32 0)
+                  ret void
+                }
+            "#[..],
+            &br#"
+                declare void @__CPROVER_assert(i1, ptr, i32)
+                define void @f() {
+                entry:
+                  call void @__CPROVER_assert(i1 true, ptr null, i32 0)
+                  ret void
+                }
+            "#[..],
+            &br#"
+                declare void @__CPROVER_assert(i1, i32)
+                define void @f() {
+                entry:
+                  call void @__CPROVER_assert(i1 true, i32 0)
+                  ret void
+                }
+            "#[..],
+            &br#"
+                declare void @__CPROVER_assume(double)
+                define void @f() {
+                entry:
+                  call void @__CPROVER_assume(double 1.0)
+                  ret void
+                }
+            "#[..],
+            &br#"
+                declare i32 @__CPROVER_nondet_int(i32)
+                define i32 @f() {
+                entry:
+                  %r = call i32 @__CPROVER_nondet_int(i32 0)
+                  ret i32 %r
+                }
+            "#[..],
+            &br#"
+                declare i64 @__CPROVER_OBJECT_SIZE(ptr, i64)
+                define i64 @f(ptr %p) {
+                entry:
+                  %r = call i64 @__CPROVER_OBJECT_SIZE(ptr %p, i64 8)
+                  ret i64 %r
+                }
+            "#[..],
+            &br#"
+                declare i64 @__CPROVER_OBJECT_SIZE(i64)
+                define i64 @f(i64 %x) {
+                entry:
+                  %r = call i64 @__CPROVER_OBJECT_SIZE(i64 %x)
+                  ret i64 %r
+                }
+            "#[..],
+            &br#"
+                declare i1 @__CPROVER_r_ok(ptr, double)
+                define i1 @f(ptr %p) {
+                entry:
+                  %r = call i1 @__CPROVER_r_ok(ptr %p, double 4.0)
+                  ret i1 %r
+                }
+            "#[..],
+        ] {
+            let err =
+                build_symbols_result_from_ir(ir).expect_err("malformed builtin call must fail");
+            let diag = err
+                .downcast_ref::<Diagnostic>()
+                .expect("structured diagnostic");
+            assert_eq!(
+                diag.kind,
+                super::super::DiagnosticKind::UnsupportedFeature(UnsupportedFeature::Intrinsic)
+            );
+        }
+    }
 }
