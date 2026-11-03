@@ -1180,87 +1180,58 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         value: Expr,
         result_type: Type,
     ) -> Result<Expr> {
-        if value.typ().is_vector() && result_type.is_integer() {
-            // Bitcast width is defined by the original LLVM types, not the lowered GOTO types.
-            // In particular, LLVM `i1` currently lowers to `c_bool`, which would otherwise hide
-            // the single-bit lane width needed for `<N x i1> -> iN` masks.
-            let source_value = self.operand_value(
+        let (src_vector, dst_vector) = (value.typ().is_vector(), result_type.is_vector());
+        if !src_vector && !dst_vector {
+            return Ok(value.cast_to(result_type));
+        }
+        // A vector bitcast repacks bits through an integer of the total width. Widths come from
+        // the LLVM types, not the lowered GOTO types: LLVM `i1` lowers to 8-bit `c_bool`, which
+        // would hide the single-bit lanes of `<N x i1>` masks. Non-integer lanes or scalars are
+        // rejected by the width queries (fail closed).
+        let source_type = self
+            .operand_value(
                 instruction,
                 0,
                 UnsupportedFeature::Instruction,
                 "malformed bitcast source",
-            )?;
-            let (lane_count, lane_bits) = self.llvm_fixed_vector_layout(source_value.get_type())?;
-            let result_bits = self.llvm_scalar_bit_width(instruction.get_type())?;
-            return self.lower_vector_to_scalar_bitcast(
-                value,
-                result_type,
-                lane_count,
-                lane_bits,
-                result_bits,
-            );
-        }
-        Ok(value.cast_to(result_type))
+            )?
+            .get_type()
+            .as_any_type_enum();
+        // LLVM's verifier guarantees equal source and result widths.
+        let packed = if src_vector {
+            let (lane_count, lane_bits) = self.llvm_fixed_vector_layout(source_type)?;
+            self.pack_vector_lanes(value, lane_count, lane_bits)?
+        } else {
+            value.cast_to(Type::unsigned_int(self.llvm_scalar_bit_width(source_type)?))
+        };
+        let Some(lane) = result_type.base_type().filter(|_| dst_vector) else {
+            return Ok(packed.cast_to(result_type));
+        };
+        let (_, lane_bits) = self.llvm_fixed_vector_layout(instruction.get_type())?;
+        // Little endian: lane `i` holds bits `[i * lane_bits, (i + 1) * lane_bits)`.
+        self.map_lanes(&result_type, |i| {
+            let shift = Expr::int_constant(i as u64 * lane_bits, packed.typ().clone());
+            self.scalar_cast(InstructionOpcode::Trunc, packed.clone().lshr(shift), lane)
+        })
     }
 
-    fn lower_vector_to_scalar_bitcast(
-        &self,
-        value: Expr,
-        result_type: Type,
-        lane_count: u64,
-        lane_bits: u64,
-        result_bits: u64,
-    ) -> Result<Expr> {
-        let lowered_lane_count = value.typ().len().ok_or_else(|| {
-            Diagnostic::unsupported_feature(
-                UnsupportedFeature::Instruction,
-                format!(
-                    "vector bitcast expects a vector source in {}",
-                    self.function_name
-                ),
-            )
-            .with_symbol(self.function_name.clone())
-        })?;
-        let total_bits = lane_count.checked_mul(lane_bits).ok_or_else(|| {
-            Diagnostic::unsupported_feature(
-                UnsupportedFeature::Instruction,
-                format!("vector bitcast width overflow in {}", self.function_name),
-            )
-            .with_symbol(self.function_name.clone())
-        })?;
-        debug_assert_eq!(lowered_lane_count, lane_count);
-        if total_bits != result_bits {
-            return Err(Diagnostic::unsupported_feature(
-                UnsupportedFeature::Instruction,
-                format!(
-                    "vector bitcast requires equal source/result bit widths in {}",
-                    self.function_name
-                ),
-            )
-            .with_symbol(self.function_name.clone())
-            .into());
-        }
-
-        // LLVM bitcast preserves lane bit patterns. For the little-endian machine models we
-        // currently target, lane 0 occupies the least-significant bits of the scalar mask.
-        let mut packed = Expr::int_constant(0, result_type.clone());
+    /// Pack `lane_count` lanes of `lane_bits` (LLVM widths) into one unsigned integer, lane 0 in
+    /// the least-significant bits, as a little-endian bitcast lays them out.
+    fn pack_vector_lanes(&self, value: Expr, lane_count: u64, lane_bits: u64) -> Result<Expr> {
+        let packed_type = Type::unsigned_int(lane_count * lane_bits);
+        let mut packed = Expr::int_constant(0, packed_type.clone());
         for lane in 0..lane_count {
-            let shift = lane * lane_bits;
+            let shift = Expr::int_constant(lane * lane_bits, packed_type.clone());
             let lane_expr = self
                 .aggregate_component(value.clone(), lane as usize)?
-                .cast_to(result_type.clone());
-            let shifted = if shift == 0 {
-                lane_expr
-            } else {
-                lane_expr.shl(Expr::int_constant(shift, result_type.clone()))
-            };
-            packed = packed.bitor(shifted);
+                .cast_to(packed_type.clone());
+            packed = packed.bitor(lane_expr.shl(shift));
         }
         Ok(packed)
     }
 
-    fn llvm_fixed_vector_layout(&self, typ: BasicTypeEnum<'ctx>) -> Result<(u64, u64)> {
-        let AnyTypeEnum::VectorType(vector) = typ.as_any_type_enum() else {
+    fn llvm_fixed_vector_layout(&self, typ: AnyTypeEnum<'ctx>) -> Result<(u64, u64)> {
+        let AnyTypeEnum::VectorType(vector) = typ else {
             return Err(Diagnostic::unsupported_feature(
                 UnsupportedFeature::Instruction,
                 format!("expected fixed vector type in {}", self.function_name),
