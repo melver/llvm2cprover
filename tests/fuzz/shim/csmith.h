@@ -30,9 +30,10 @@ static void crc32_mix(uint64_t v) {
     crc32_context ^= crc32_context >> 15;
 }
 static void transparent_crc(uint64_t val, char *vname, int flag) { (void)vname; (void)flag; crc32_mix(val); }
-static void transparent_crc_bytes(char *ptr, int nbytes, char *vname, int flag) {
+// `void *`, not csmith's `char *`: `--float` passes `float *`, which clang rejects for `char *`.
+static void transparent_crc_bytes(void *ptr, int nbytes, char *vname, int flag) {
     (void)vname; (void)flag;
-    for (int i = 0; i < nbytes; i++) crc32_mix((unsigned char)ptr[i]);
+    for (int i = 0; i < nbytes; i++) crc32_mix(((unsigned char *)ptr)[i]);
 }
 
 #ifdef FUZZ_NATIVE
