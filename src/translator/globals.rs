@@ -84,8 +84,20 @@ impl GlobalLowerer {
         let operands = self.value_operands(raw);
 
         match unsafe { LLVMGetConstOpcode(raw) } {
-            LLVMOpcode::LLVMBitCast
-            | LLVMOpcode::LLVMAddrSpaceCast
+            LLVMOpcode::LLVMBitCast => {
+                let operand =
+                    self.lower_const_operand(symbol, &operands, 0, lowerer, symbols, location)?;
+                // Like the instruction: reinterpret floating-point bits rather than convert the
+                // value (LLVM guarantees equal widths); other bitcasts are same-type or rejected.
+                if operand.typ().is_floating_point() || typ.is_floating_point() {
+                    return Ok(operand.transmute_to(typ.clone(), symbols));
+                }
+                if !operand.can_cast_to(typ) {
+                    return Err(self.unsupported(symbol, "unsupported constant vector bitcast"));
+                }
+                Ok(operand.cast_to(typ.clone()))
+            }
+            LLVMOpcode::LLVMAddrSpaceCast
             | LLVMOpcode::LLVMPtrToInt
             | LLVMOpcode::LLVMIntToPtr
             | LLVMOpcode::LLVMTrunc => Ok(self
