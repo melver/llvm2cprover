@@ -442,30 +442,39 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             | InstructionOpcode::Sub
             | InstructionOpcode::Mul
             | InstructionOpcode::UDiv
-            | InstructionOpcode::URem => {
+            | InstructionOpcode::URem
+            | InstructionOpcode::SDiv
+            | InstructionOpcode::SRem => {
                 let (lhs, rhs) = (lhs.cast_to(target.clone()), rhs.cast_to(target.clone()));
-                match target.base_type() {
-                    // `<N x i1>` cannot be cast as a whole to a 1-bit vector, so go lane by lane.
-                    Some(lane) if target.is_vector() && lane.is_c_bool() => {
-                        self.map_lanes(&target, |i| {
-                            Ok(Self::int_arith(
-                                opcode,
-                                self.aggregate_component(lhs.clone(), i)?,
-                                self.aggregate_component(rhs.clone(), i)?,
-                            ))
-                        })?
+                let arith = |lhs: Expr, rhs: Expr| -> Result<Expr> {
+                    if !matches!(opcode, InstructionOpcode::SDiv | InstructionOpcode::SRem) {
+                        return Ok(Self::int_arith(opcode, lhs, rhs));
                     }
-                    _ => Self::int_arith(opcode, lhs, rhs),
+                    let typ = lhs.typ().clone();
+                    let (lhs, rhs) = (self.signed_view(lhs)?, self.signed_view(rhs)?);
+                    Ok(if opcode == InstructionOpcode::SDiv {
+                        lhs.div(rhs)
+                    } else {
+                        lhs.rem(rhs)
+                    }
+                    .cast_to(typ))
+                };
+                let signed = matches!(opcode, InstructionOpcode::SDiv | InstructionOpcode::SRem);
+                // GOTO cannot cast a vector as a whole to a 1-bit (`<N x i1>`) or signed lane
+                // type, so go lane by lane.
+                if let Some(lane) = target.base_type().filter(|_| target.is_vector())
+                    && (signed || lane.is_c_bool())
+                {
+                    self.map_lanes(&target, |i| {
+                        arith(
+                            self.aggregate_component(lhs.clone(), i)?,
+                            self.aggregate_component(rhs.clone(), i)?,
+                        )
+                    })?
+                } else {
+                    arith(lhs, rhs)?
                 }
             }
-            InstructionOpcode::SDiv => self
-                .signed_view(lhs)?
-                .div(self.signed_view(rhs)?)
-                .cast_to(target.clone()),
-            InstructionOpcode::SRem => self
-                .signed_view(lhs)?
-                .rem(self.signed_view(rhs)?)
-                .cast_to(target.clone()),
             InstructionOpcode::FAdd => lhs
                 .cast_to(target.clone())
                 .plus(rhs.cast_to(target.clone())),
