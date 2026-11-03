@@ -1180,14 +1180,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         value: Expr,
         result_type: Type,
     ) -> Result<Expr> {
-        let (src_vector, dst_vector) = (value.typ().is_vector(), result_type.is_vector());
-        if !src_vector && !dst_vector {
-            return Ok(value.cast_to(result_type));
+        if *value.typ() == result_type {
+            return Ok(value);
         }
-        // A vector bitcast repacks bits through an integer of the total width. Widths come from
-        // the LLVM types, not the lowered GOTO types: LLVM `i1` lowers to 8-bit `c_bool`, which
-        // would hide the single-bit lanes of `<N x i1>` masks. Non-integer lanes or scalars are
-        // rejected by the width queries (fail closed).
         let source_type = self
             .operand_value(
                 instruction,
@@ -1197,17 +1192,37 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             )?
             .get_type()
             .as_any_type_enum();
-        // LLVM's verifier guarantees equal source and result widths.
+        let target_type = instruction.get_type();
+        let (src_vector, dst_vector) = (source_type.is_vector_type(), target_type.is_vector_type());
+        if !src_vector && !dst_vector {
+            return Ok(value.cast_to(result_type));
+        }
+        // A vector bitcast repacks bits through an integer of the total width, which LLVM's
+        // verifier guarantees is the same for source and result. Widths come from the LLVM types,
+        // not the lowered GOTO types: LLVM `i1` lowers to 8-bit `c_bool`, which would hide the
+        // single-bit lanes of `<N x i1>` masks. Non-integer lanes or scalars are rejected by the
+        // width queries (fail closed).
         let packed = if src_vector {
             let (lane_count, lane_bits) = self.llvm_fixed_vector_layout(source_type)?;
             self.pack_vector_lanes(value, lane_count, lane_bits)?
         } else {
             value.cast_to(Type::unsigned_int(self.llvm_scalar_bit_width(source_type)?))
         };
-        let Some(lane) = result_type.base_type().filter(|_| dst_vector) else {
+        if !dst_vector {
             return Ok(packed.cast_to(result_type));
+        }
+        let (_, lane_bits) = self.llvm_fixed_vector_layout(target_type)?;
+        let Some(lane) = result_type.base_type() else {
+            return Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!(
+                    "vector bitcast to a non-vector type in {}",
+                    self.function_name
+                ),
+            )
+            .with_symbol(self.function_name.clone())
+            .into());
         };
-        let (_, lane_bits) = self.llvm_fixed_vector_layout(instruction.get_type())?;
         // Little endian: lane `i` holds bits `[i * lane_bits, (i + 1) * lane_bits)`.
         self.map_lanes(&result_type, |i| {
             let shift = Expr::int_constant(i as u64 * lane_bits, packed.typ().clone());

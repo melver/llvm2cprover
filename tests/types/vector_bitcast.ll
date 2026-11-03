@@ -14,6 +14,7 @@ declare void @__CPROVER_assert(i1, ptr)
 declare i16 @__CPROVER_nondet_ushort()
 
 @.bits = private unnamed_addr constant [5 x i8] c"bits\00"
+@.packed_bits = private unnamed_addr constant [12 x i8] c"packed_bits\00"
 @.bytes = private unnamed_addr constant [6 x i8] c"bytes\00"
 @.halves = private unnamed_addr constant [7 x i8] c"halves\00"
 
@@ -30,6 +31,16 @@ entry:
   %ok.bits.2 = xor i1 %b0, true
   %ok.bits = and i1 %ok.bits.1, %ok.bits.2
   call void @__CPROVER_assert(i1 %ok.bits, ptr @.bits)
+
+  ; <32 x i1> -> <4 x i8>: pack 1-bit c_bool lanes into bytes little-endian.
+  %mask = icmp eq <32 x i8> <i8 1, i8 0, i8 0, i8 1, i8 0, i8 0, i8 0, i8 1, i8 0, i8 1, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0, i8 0>, <i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1>
+  %mask.bytes = bitcast <32 x i1> %mask to <4 x i8>
+  %mb0 = extractelement <4 x i8> %mask.bytes, i64 0
+  %mb1 = extractelement <4 x i8> %mask.bytes, i64 1
+  %ok.packed.0 = icmp eq i8 %mb0, 137         ; 0b10001001
+  %ok.packed.1 = icmp eq i8 %mb1, 2           ; 0b00000010
+  %ok.packed = and i1 %ok.packed.0, %ok.packed.1
+  call void @__CPROVER_assert(i1 %ok.packed, ptr @.packed_bits)
 
   ; i32 -> <4 x i8>: lane 0 is the low byte.
   %w = bitcast i32 305419896 to <4 x i8>   ; 0x12345678

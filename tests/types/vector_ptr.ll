@@ -53,10 +53,11 @@ entry:
   %q2 = load ptr, ptr %raw, align 8
   %c3 = icmp eq ptr %q2, @a
   %fr = freeze <2 x ptr> %s
+  %bc = bitcast <2 x ptr> %fr to <2 x ptr>
   br i1 %c3, label %then, label %join
 
 then:
-  %sel = select i1 %c3, <2 x ptr> %fr, <2 x ptr> zeroinitializer
+  %sel = select i1 %c3, <2 x ptr> %bc, <2 x ptr> zeroinitializer
   br label %join
 
 join:
