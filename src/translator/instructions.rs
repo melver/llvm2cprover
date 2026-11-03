@@ -1200,6 +1200,17 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             }
             return Ok(value.cast_to(result_type));
         }
+        if self.symbols.machine_model().is_big_endian {
+            return Err(Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!(
+                    "big-endian vector bitcast is unsupported in {}",
+                    self.function_name
+                ),
+            )
+            .with_symbol(self.function_name.clone())
+            .into());
+        }
         // A vector bitcast repacks bits through an integer of the total width, which LLVM's
         // verifier guarantees is the same for source and result. Widths come from the LLVM types,
         // not the lowered GOTO types: LLVM `i1` lowers to 8-bit `c_bool`, which would hide the
