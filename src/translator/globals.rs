@@ -16,6 +16,7 @@ use inkwell::llvm_sys::core::{
     LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind, LLVMIsAConstantExpr,
     LLVMIsAGlobalVariable,
 };
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::{
     AnyValue, ArrayValue, AsValueRef, BasicValueEnum, FloatValue, FunctionValue, GlobalValue,
     IntValue, PointerValue, StructValue, VectorValue,
@@ -291,16 +292,8 @@ impl GlobalLowerer {
             return Ok(typ.zero_initializer(symbols));
         }
 
-        let elem_type = lowerer.lower_basic(value.get_type().get_element_type())?;
-        // `LLVMGetAggregateElement` handles `ConstantDataArray` and `ConstantArray` (lanes that
-        // are `undef`, `poison` or constant expressions) alike, unlike `as_const_string`
-        // (`LLVMGetAsString`), an unchecked `ConstantDataSequential` cast in LLVM's C API.
-        let elems = (0..value.get_type().len())
-            .map(|index| {
-                let elem = self.aggregate_element(symbol, value.as_value_ref(), index)?;
-                self.lower_initializer(symbol, elem, &elem_type, lowerer, symbols, location)
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let elems =
+            self.lower_aggregate_elements(symbol, value.into(), lowerer, symbols, location)?;
         Ok(Expr::array_expr(typ.clone(), elems))
     }
 
@@ -341,15 +334,8 @@ impl GlobalLowerer {
             return Ok(typ.zero_initializer(symbols));
         }
 
-        let elem_type = lowerer.lower_basic(value.get_type().get_element_type())?;
-        // `get_element_as_constant` is only valid on ConstantDataVector; `i1` and other
-        // non-simple lanes form a ConstantVector, so go through `LLVMGetAggregateElement`.
-        let elems = (0..value.get_type().get_size())
-            .map(|index| {
-                let elem = self.aggregate_element(symbol, value.as_value_ref(), index)?;
-                self.lower_initializer(symbol, elem, &elem_type, lowerer, symbols, location)
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let elems =
+            self.lower_aggregate_elements(symbol, value.into(), lowerer, symbols, location)?;
 
         // `<N x ptr>` lowers to an array; see `TypeLowerer::lower_any`.
         Ok(if typ.is_array() {
@@ -357,6 +343,32 @@ impl GlobalLowerer {
         } else {
             Expr::vector_expr(typ.clone(), elems)
         })
+    }
+
+    fn lower_aggregate_elements<'ctx>(
+        &mut self,
+        symbol: &str,
+        value: BasicValueEnum<'ctx>,
+        lowerer: &mut TypeLowerer,
+        symbols: &SymbolTable,
+        location: &Location,
+    ) -> std::result::Result<Vec<Expr>, Diagnostic> {
+        let (len, element_type) = match value.get_type() {
+            BasicTypeEnum::ArrayType(t) => (t.len(), t.get_element_type()),
+            BasicTypeEnum::VectorType(t) => (t.get_size(), t.get_element_type()),
+            _ => return Err(self.unsupported(symbol, "expected an array or vector constant")),
+        };
+        let elem_type = lowerer.lower_basic(element_type)?;
+        // `LLVMGetAggregateElement` handles `ConstantDataSequential` and `ConstantArray` /
+        // `ConstantVector` (lanes that are `undef`, `poison`, `i1`, or constant expressions)
+        // alike, without calling `as_const_string` (`LLVMGetAsString`) or
+        // `get_element_as_constant`.
+        (0..len)
+            .map(|index| {
+                let elem = self.aggregate_element(symbol, value.as_value_ref(), index)?;
+                self.lower_initializer(symbol, elem, &elem_type, lowerer, symbols, location)
+            })
+            .collect()
     }
 
     fn unsupported(&self, symbol: &str, message: impl Into<String>) -> Diagnostic {
