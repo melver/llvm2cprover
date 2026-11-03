@@ -241,16 +241,11 @@ impl SymbolBuilder {
             return Ok(typ);
         }
         let mut parameters = Vec::with_capacity(function.count_params() as usize);
-        for (index, param) in function.get_params().into_iter().enumerate() {
+        let names = util::parameter_base_names(function);
+        for ((index, param), base) in function.get_params().into_iter().enumerate().zip(names) {
             let typ = match self.lowerer.lower_param_byval(function, index as u32)? {
                 Some(pointee) => pointee.to_pointer(),
                 None => self.lowerer.lower_parameter(param)?,
-            };
-            let llvm_name = param.get_name().to_string_lossy();
-            let base = if llvm_name.is_empty() {
-                format!("arg{index}")
-            } else {
-                util::sanitize_name(llvm_name.as_ref())
             };
             parameters.push(Parameter::new(
                 Some(base.clone()),

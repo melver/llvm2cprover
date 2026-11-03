@@ -310,7 +310,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
     fn declare_parameters(&mut self) -> Result<()> {
         let loc = self.function_location();
-        for (index, param) in self.function.get_params().into_iter().enumerate() {
+        let names = util::parameter_base_names(self.function);
+        for ((index, param), base) in self
+            .function
+            .get_params()
+            .into_iter()
+            .enumerate()
+            .zip(names)
+        {
             let byval_type = self
                 .types
                 .lower_param_byval(self.function, index as u32)
@@ -320,9 +327,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 None => self.types.lower_parameter(param)?,
             };
             self.insert_pending_aggregate_symbols();
-            let base =
-                self.value_base_name(index, "arg", param.get_name().to_string_lossy().as_ref());
-            let expr = self.insert_local_symbol(&base, typ, true, false, loc);
+            let (expr, _) = self.insert_local_symbol(&base, typ, true, false, loc);
             if let Some(byval_type) = byval_type {
                 // LLVM `byval(T)` passes a callee-owned copy of `*param` while keeping the formal
                 // parameter pointer in the function signature.
@@ -4226,7 +4231,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         );
         self.next_tmp += 1;
         let location = self.instruction_location(instruction);
-        let expr = self.insert_local_symbol(&base, typ, false, true, location);
+        let (expr, _) = self.insert_local_symbol(&base, typ, false, true, location);
         // LLVM SSA values can cross basic-block boundaries, so their storage must
         // outlive the block-local scopes we use to attach labels.
         self.prologue.push(Stmt::decl(expr.clone(), None, location));
@@ -4262,15 +4267,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     ) -> (Expr, InternedString) {
         let base = format!("{stem}{}", self.next_tmp);
         self.next_tmp += 1;
-        let identifier = self.make_local_identifier(&base);
-        let expr = self.insert_local_symbol(&base, typ, false, true, location);
-        (expr, identifier)
+        self.insert_local_symbol(&base, typ, false, true, location)
     }
 
     fn make_local_identifier(&self, base_name: &str) -> InternedString {
         format!("{}::{}", self.function_name, base_name).into()
     }
 
+    /// Insert a local named `base_name`, or a [`util::unique_name`] variant if that is taken.
     fn insert_local_symbol(
         &mut self,
         base_name: &str,
@@ -4278,9 +4282,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         is_parameter: bool,
         hidden: bool,
         location: Location,
-    ) -> Expr {
-        let name = self.make_local_identifier(base_name);
-        let symbol = Symbol::variable(name, base_name.to_owned(), typ.clone(), location)
+    ) -> (Expr, InternedString) {
+        let base_name = util::unique_name(base_name, |base| {
+            self.symbols.contains(self.make_local_identifier(base))
+        });
+        let name = self.make_local_identifier(&base_name);
+        let symbol = Symbol::variable(name, base_name, typ.clone(), location)
             .with_is_parameter(is_parameter)
             .with_is_hidden(hidden)
             .with_is_state_var(false)
@@ -4290,7 +4297,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             self.symbols
                 .insert_parameter(self.function_name.clone(), name);
         }
-        Expr::symbol_expression(name, typ).with_location(location)
+        (
+            Expr::symbol_expression(name, typ).with_location(location),
+            name,
+        )
     }
 
     fn value_base_name(&self, index: usize, fallback: &str, llvm_name: &str) -> String {

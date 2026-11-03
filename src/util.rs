@@ -290,6 +290,36 @@ pub fn sanitize_name(name: &str) -> String {
     }
 }
 
+/// `base`, or `base$N` for the smallest `N >= 1` that is not `taken`.
+///
+/// [`sanitize_name`] is not injective (`%.3.i` and `%_3.i` both become `_3_i`), and generated
+/// names such as `tmp3` can match an LLVM name, so local identifiers must be made unique.
+pub fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_owned();
+    }
+    (1..)
+        .map(|n| format!("{base}${n}"))
+        .find(|name| !taken(name))
+        .expect("unbounded suffixes")
+}
+
+/// GOTO base names of `function`'s parameters: sanitized LLVM names (or `argN`), made unique.
+pub fn parameter_base_names(function: FunctionValue<'_>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (index, param) in function.get_params().into_iter().enumerate() {
+        let llvm_name = param.get_name().to_string_lossy();
+        let base = if llvm_name.is_empty() {
+            format!("arg{index}")
+        } else {
+            sanitize_name(&llvm_name)
+        };
+        let name = unique_name(&base, |name| names.iter().any(|taken| taken == name));
+        names.push(name);
+    }
+    names
+}
+
 /// Build a nondeterministic expression of `typ`, constraining `c_bool` to `{0, 1}`.
 pub fn nondet_expr(typ: Type) -> Expr {
     if typ.is_c_bool() {
