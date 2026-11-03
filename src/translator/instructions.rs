@@ -28,6 +28,7 @@ use cprover_bindings::goto_program::{
 use inkwell::AtomicRMWBinOp;
 use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
+use inkwell::attributes::AttributeLoc;
 use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
@@ -2355,6 +2356,16 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.fmuladd.")
+            && !self.fuses_fmuladd()
+            && let [a, b, c] = args
+            && (a.typ().is_float() || a.typ().is_double())
+        {
+            let value = a.clone().mul(b.clone()).plus(c.clone());
+            self.assign_result(instruction, body, value)?;
+            return Ok(true);
+        }
+
         if let Some((double_fn, float_fn)) = self.float_builtin(callee_name) {
             self.lower_float_builtin_call(
                 callee_name,
@@ -2624,6 +2635,28 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .unsupported_intrinsic(callee_name, "non-constant poison flag")
                 .into()),
         }
+    }
+
+    /// Whether `llvm.fmuladd` rounds once (`fma`) rather than after both the multiply and the add.
+    ///
+    /// LangRef leaves the choice to the code generator, so match it: x86 fuses only when the
+    /// function has the FMA target feature; AArch64 always does, and other targets are assumed to.
+    fn fuses_fmuladd(&self) -> bool {
+        if !matches!(
+            self.symbols.machine_model().architecture.as_str(),
+            "x86_64" | "i386" | "i686"
+        ) {
+            return true;
+        }
+        self.function
+            .get_string_attribute(AttributeLoc::Function, "target-features")
+            .is_some_and(|features| {
+                features
+                    .get_string_value()
+                    .to_bytes()
+                    .split(|&b| b == b',')
+                    .any(|feature| feature == b"+fma")
+            })
     }
 
     fn float_builtin(&self, callee_name: &str) -> Option<(BuiltinFn, BuiltinFn)> {
