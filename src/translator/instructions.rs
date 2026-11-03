@@ -1195,6 +1195,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let target_type = instruction.get_type();
         let (src_vector, dst_vector) = (source_type.is_vector_type(), target_type.is_vector_type());
         if !src_vector && !dst_vector {
+            if value.typ().is_floating_point() || result_type.is_floating_point() {
+                return Ok(value.transmute_to(result_type, self.symbols));
+            }
             return Ok(value.cast_to(result_type));
         }
         // A vector bitcast repacks bits through an integer of the total width, which LLVM's
