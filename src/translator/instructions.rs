@@ -4237,9 +4237,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         else {
             return None;
         };
-        // `as_const_string` (`LLVMGetAsString`) is an unchecked `ConstantDataSequential` cast;
-        // a `ConstantArray` (e.g. with `poison` lanes) is not a string literal anyway.
-        if unsafe { LLVMIsAConstantDataSequential(array.as_value_ref()).is_null() } {
+        let BasicTypeEnum::IntType(elem) = array.get_type().get_element_type() else {
+            return None;
+        };
+        // `as_const_string` (`LLVMGetAsString`) performs an unchecked `ConstantDataSequential`
+        // downcast (as does `LLVMIsConstantString` in LLVM's C API) and reads raw element bytes.
+        if elem.get_bit_width() != 8
+            || unsafe { LLVMIsAConstantDataSequential(array.as_value_ref()).is_null() }
+        {
             return None;
         }
         let bytes = array.as_const_string()?;
