@@ -905,10 +905,26 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let lhs = self.lower_operand(instruction, 0)?;
         let rhs = self.lower_operand(instruction, 1)?;
         let result = self.declare_instruction_result(instruction)?;
+        let typ = result.typ().clone();
+        let value = match typ.base_type() {
+            // `isnan` and the float comparisons are scalar-only in GOTO.
+            Some(lane) if typ.is_vector() => self.map_lanes(&typ, |i| {
+                let lhs = self.aggregate_component(lhs.clone(), i)?;
+                let rhs = self.aggregate_component(rhs.clone(), i)?;
+                Ok(Self::fcmp_value(pred, lhs, rhs).cast_to(lane.clone()))
+            })?,
+            _ => Self::fcmp_value(pred, lhs, rhs).cast_to(typ),
+        };
+        body.push(Stmt::assign(result, value, loc));
+        Ok(())
+    }
+
+    /// Scalar LLVM `fcmp`.
+    fn fcmp_value(pred: FloatPredicate, lhs: Expr, rhs: Expr) -> Expr {
         let unordered = lhs.clone().is_nan().or(rhs.clone().is_nan());
         // LLVM `fcmp` predicates are defined in terms of IEEE ordered/unordered behavior, so NaN
         // handling must stay explicit instead of relying on plain relational operators alone.
-        let value = match pred {
+        match pred {
             FloatPredicate::PredicateFalse => Expr::bool_false(),
             FloatPredicate::PredicateTrue => Expr::bool_true(),
             FloatPredicate::ORD => unordered.clone().not(),
@@ -925,13 +941,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             FloatPredicate::ULE => unordered.clone().or(lhs.clone().le(rhs.clone())),
             FloatPredicate::ULT => unordered.clone().or(lhs.clone().lt(rhs.clone())),
             FloatPredicate::UNE => unordered.or(lhs.fneq(rhs)),
-        };
-        body.push(Stmt::assign(
-            result.clone(),
-            value.cast_to(result.typ().clone()),
-            loc,
-        ));
-        Ok(())
+        }
     }
 
     fn lower_fneg(
