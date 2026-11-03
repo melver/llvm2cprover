@@ -53,6 +53,7 @@ It needs `csmith`, `clang`, and `cbmc` on `PATH` plus a built
 
 ```sh
 tests/fuzz/csmith.py run --out /tmp/fuzz --seeds 1-500 -j 16   # exit 1 iff actionable
+tests/fuzz/csmith.py run --cpp --out /tmp/fuzz-cpp --seeds 1-500 -j 16   # C++ via clang++
 tests/fuzz/csmith.py reduce --out /tmp/fuzz --seed 18           # creduce a failing seed
 ```
 

@@ -18,6 +18,12 @@
 #undef transparent_crc
 #undef transparent_crc_bytes
 
+#ifdef __cplusplus
+// Csmith's C++ output uses `(expr, NULL)` as a pointer, which only `nullptr_t` converts from.
+#undef NULL
+#define NULL nullptr
+#endif
+
 static void crc32_gentab(void) {}
 static void crc32_mix(uint64_t v) {
     crc32_context = (crc32_context ^ (uint32_t)v ^ (uint32_t)(v >> 32)) * 0x9E3779B1u;
@@ -31,6 +37,8 @@ static void transparent_crc_bytes(char *ptr, int nbytes, char *vname, int flag) 
 
 #ifdef FUZZ_NATIVE
 static void __CPROVER_assert(int cond, const char *msg) { (void)cond; (void)msg; }
+#elif defined(__cplusplus)
+extern "C" void __CPROVER_assert(bool cond, const char *msg);
 #else
 extern void __CPROVER_assert(_Bool cond, const char *msg);
 #endif

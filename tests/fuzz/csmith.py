@@ -52,7 +52,13 @@ class Config:
     cbmc_timeout: int
     native_timeout: int
     csmith_args: tuple[str, ...]
+    cpp: bool = False
     keep_all: bool = False
+
+    def cc(self) -> list[str]:
+        """The compiler for t.c. Csmith's C++ output keeps the .c name and narrows in brace
+        initializers (valid C++03), hence `-x c++ -Wno-c++11-narrowing`."""
+        return ["clang++", "-x", "c++", "-Wno-c++11-narrowing"] if self.cpp else ["clang"]
 
 
 @dataclass(frozen=True)
@@ -105,7 +111,7 @@ def inject(seed: int, cfg: Config, d: Path) -> Outcome | None:
     """
     # Csmith guards arithmetic UB itself, but not `--builtins` misuse such as __builtin_ctz(0);
     # the sanitizer turns such seeds into invalid ones instead of bogus `semantic` failures.
-    clang = run(["clang", "-O0", "-w", "-DFUZZ_NATIVE", "-fsanitize=builtin",
+    clang = run([*cfg.cc(), "-O0", "-w", "-DFUZZ_NATIVE", "-fsanitize=builtin",
                  "-fno-sanitize-recover=builtin", *INCLUDES, "t.c", "-o", "native"], d)
     if clang.returncode:
         return Outcome(seed, "invalid-seed", detail=f"clang native: {last_line(clang.stderr)}")
@@ -157,7 +163,7 @@ def classify_cbmc(seed: int, opt: str, log: str) -> Outcome:
 def verify(seed: int, cfg: Config, d: Path, opt: str) -> Outcome:
     o = d / opt
     o.mkdir(exist_ok=True)
-    clang = run(["clang", f"-{opt}", "-w", "-g", "-Xclang", "-disable-O0-optnone", "-emit-llvm",
+    clang = run([*cfg.cc(), f"-{opt}", "-w", "-g", "-Xclang", "-disable-O0-optnone", "-emit-llvm",
                  "-S", *INCLUDES, "../t.c", "-o", "t.ll"], o)
     if clang.returncode:
         return Outcome(seed, "invalid-seed", opt, detail=f"clang: {last_line(clang.stderr)}")
@@ -242,7 +248,8 @@ def config(args: argparse.Namespace) -> Config:
         unwind=args.unwind,
         cbmc_timeout=args.cbmc_timeout,
         native_timeout=args.native_timeout,
-        csmith_args=(*CSMITH_ARGS, *args.csmith_arg),
+        csmith_args=(*CSMITH_ARGS, *(["--lang-cpp"] if args.cpp else []), *args.csmith_arg),
+        cpp=args.cpp,
         keep_all=args.keep_all,
     )
 
@@ -287,7 +294,7 @@ def cmd_reduce(args: argparse.Namespace) -> int:
     check = [str(Path(__file__).resolve()), "check", "--opt", args.opt or outcome.opt,
              "--expect", outcome.label, "--llvm2cprover", args.llvm2cprover,
              "--unwind", str(args.unwind), "--cbmc-timeout", str(args.cbmc_timeout),
-             "--native-timeout", str(args.native_timeout)]
+             "--native-timeout", str(args.native_timeout), *(["--cpp"] if args.cpp else [])]
     script = d / "interesting.sh"
     script.write_text("#!/bin/sh\nexec " + " ".join(check) + "\n")
     script.chmod(0o755)
@@ -302,6 +309,8 @@ def parse_args() -> argparse.Namespace:
     knobs.add_argument("--native-timeout", type=int, default=10)
     knobs.add_argument("--llvm2cprover", default=str(ROOT / "target" / "debug" / "llvm2cprover"))
     knobs.add_argument("--csmith-arg", action="append", default=[])
+    knobs.add_argument("--cpp", action="store_true",
+                       help="csmith --lang-cpp, compiled with clang++")
     knobs.set_defaults(keep_all=False)
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
