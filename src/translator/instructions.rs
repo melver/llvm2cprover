@@ -1168,9 +1168,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             // Integers are unsigned bitvectors (and `i1` is `c_bool`, which CBMC cannot convert a
             // float to), so convert through the signedness- and width-correct integer type.
             InstructionOpcode::SIToFP => self.signed_view(value)?.cast_to(target.clone()),
-            InstructionOpcode::FPToSI | InstructionOpcode::FPToUI => value
-                .cast_to(self.int_type(target, opcode == InstructionOpcode::FPToSI)?)
-                .cast_to(target.clone()),
+            InstructionOpcode::FPToSI | InstructionOpcode::FPToUI => {
+                self.fp_to_int(opcode == InstructionOpcode::FPToSI, value, target)?
+            }
             InstructionOpcode::ZExt
             | InstructionOpcode::Trunc
             | InstructionOpcode::PtrToInt
@@ -1181,6 +1181,54 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             | InstructionOpcode::UIToFP => value.cast_to(target.clone()),
             _ => unreachable!("cast opcode dispatched incorrectly"),
         })
+    }
+
+    /// Lower `fptosi` (`signed`) or `fptoui` of a scalar float to `target`.
+    ///
+    /// The result is `poison` unless the value truncated toward zero fits `target`, i.e. unless
+    /// `lo - 1 < value < hi`. Out-of-range values (and NaN) become nondet, as literal `poison`
+    /// does. `lo` and `hi` are powers of two, so exact in any float type; `lo - 1` is exact iff it
+    /// fits the significand, and otherwise no float lies strictly between it and `lo`.
+    fn fp_to_int(&self, signed: bool, value: Expr, target: &Type) -> Result<Expr> {
+        let int = self.int_type(target, signed)?;
+        let width = self.integer_width(&int)?;
+        let precision = match value.typ() {
+            Type::Float16 => 11,
+            Type::Float => 24,
+            Type::Double => 53,
+            Type::Float128 => 113,
+            typ => {
+                return Err(Diagnostic::unsupported_feature(
+                    UnsupportedFeature::Instruction,
+                    format!(
+                        "unsupported float-to-int source {typ:?} in {}",
+                        self.function_name
+                    ),
+                )
+                .with_symbol(self.function_name.clone())
+                .into());
+            }
+        };
+        let (lo, hi) = if signed {
+            let half = BigInt::from(1u8) << (width - 1);
+            (-half.clone(), half)
+        } else {
+            (BigInt::from(0u8), BigInt::from(1u8) << width)
+        };
+        let float = |v: BigInt| {
+            Expr::int_constant(v, Type::signed_int(width + 2)).cast_to(value.typ().clone())
+        };
+        let below_lo = &lo - 1u8;
+        let above_lo = if below_lo.magnitude().bits() <= precision {
+            value.clone().gt(float(below_lo))
+        } else {
+            value.clone().ge(float(lo))
+        };
+        let in_range = above_lo.and(value.clone().lt(float(hi)));
+        Ok(in_range.ternary(
+            value.cast_to(int).cast_to(target.clone()),
+            util::nondet_expr(target.clone()),
+        ))
     }
 
     fn lower_bitcast_value(
