@@ -2417,8 +2417,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         if callee_name.starts_with("llvm.fmuladd.")
             && !self.fuses_fmuladd()
             && let [a, b, c] = args
-            && (a.typ().is_float() || a.typ().is_double())
+            && {
+                let typ = a.typ();
+                let lane = typ.base_type().filter(|_| typ.is_vector()).unwrap_or(typ);
+                lane.is_float() || lane.is_double()
+            }
         {
+            // GOTO float arithmetic is lane-wise on vectors, as for `fmul`/`fadd`.
             let value = a.clone().mul(b.clone()).plus(c.clone());
             self.assign_result(instruction, body, value)?;
             return Ok(true);
@@ -2760,9 +2765,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .types
             .lower_instruction_result(instruction)
             .map_err(anyhow::Error::from)?;
-        let builtin = if result_type.is_float() {
+        let lane = result_type
+            .base_type()
+            .filter(|_| result_type.is_vector())
+            .cloned();
+        let scalar = lane.as_ref().unwrap_or(&result_type);
+        let builtin = if scalar.is_float() {
             float_builtin
-        } else if result_type.is_double() {
+        } else if scalar.is_double() {
             double_builtin
         } else {
             return Err(self
@@ -2776,7 +2786,34 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .with_location(self.instruction_location(instruction))
                 .into());
         };
-        self.lower_builtin_call(builtin, args, instruction, body)
+        let Some(lane) = lane else {
+            return self.lower_builtin_call(builtin, args, instruction, body);
+        };
+        // CBMC's libm builtins are scalar: call one per lane into a temp, then rebuild the vector.
+        let loc = self.instruction_location(instruction);
+        let mut lanes = Vec::new();
+        for i in 0..result_type.len().unwrap_or(0) as usize {
+            let lane_args = args
+                .iter()
+                .map(|arg| self.aggregate_component(arg.clone(), i))
+                .collect::<Result<Vec<_>>>()?;
+            let function = builtin.as_expr().with_location(loc);
+            let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
+                &function,
+                lane_args,
+                self.symbols.machine_model(),
+            );
+            let tmp = self.declare_hidden_local(&format!("{builtin}_lane"), lane.clone(), loc);
+            body.push(Stmt::function_call(
+                Some(tmp.clone()),
+                function,
+                arguments,
+                loc,
+            ));
+            lanes.push(tmp);
+        }
+        let value = self.rebuild_aggregate(result_type, lanes)?;
+        self.assign_result(instruction, body, value)
     }
 
     fn lower_builtin_call(
