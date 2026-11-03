@@ -13,8 +13,8 @@ use inkwell::llvm_sys::LLVMOpcode;
 use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
     LLVMGetAggregateElement, LLVMGetConstOpcode, LLVMGetGEPSourceElementType, LLVMGetIntTypeWidth,
-    LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind, LLVMIsAConstantDataSequential,
-    LLVMIsAConstantExpr, LLVMIsAGlobalVariable,
+    LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind, LLVMIsAConstantExpr,
+    LLVMIsAGlobalVariable,
 };
 use inkwell::values::{
     AnyValue, ArrayValue, AsValueRef, BasicValueEnum, FloatValue, FunctionValue, GlobalValue,
@@ -291,47 +291,17 @@ impl GlobalLowerer {
             return Ok(typ.zero_initializer(symbols));
         }
 
-        let elem_ll = value.get_type().get_element_type();
-        if elem_ll.is_int_type()
-            && elem_ll.into_int_type().get_bit_width() == 8
-            && let Some(bytes) = value.as_const_string()
-        {
-            let elem_type = lowerer.lower_basic(value.get_type().get_element_type())?;
-            let size = value.get_type().len() as usize;
-            let mut elems = Vec::with_capacity(size);
-
-            for &byte in bytes.iter().take(size) {
-                elems.push(Expr::int_constant(byte, elem_type.clone()));
-            }
-            while elems.len() < size {
-                elems.push(elem_type.zero());
-            }
-
-            return Ok(Expr::array_expr(typ.clone(), elems));
-        }
-
         let elem_type = lowerer.lower_basic(value.get_type().get_element_type())?;
-        let elems = if unsafe { !LLVMIsAConstantDataSequential(value.as_value_ref()).is_null() } {
-            (0..value.get_type().len())
-                .map(|index| {
-                    let elem = self.aggregate_element(symbol, value.as_value_ref(), index)?;
-                    self.lower_initializer(symbol, elem, &elem_type, lowerer, symbols, location)
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            self.value_operands(value.as_value_ref())
-                .into_iter()
-                .map(|elem| {
-                    self.lower_initializer(symbol, elem, &elem_type, lowerer, symbols, location)
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-
-        if elems.len() == value.get_type().len() as usize {
-            Ok(Expr::array_expr(typ.clone(), elems))
-        } else {
-            Err(self.unsupported(symbol, "unsupported non-string array initializer"))
-        }
+        // `LLVMGetAggregateElement` handles `ConstantDataArray` and `ConstantArray` (lanes that
+        // are `undef`, `poison` or constant expressions) alike, unlike `as_const_string`
+        // (`LLVMGetAsString`), an unchecked `ConstantDataSequential` cast in LLVM's C API.
+        let elems = (0..value.get_type().len())
+            .map(|index| {
+                let elem = self.aggregate_element(symbol, value.as_value_ref(), index)?;
+                self.lower_initializer(symbol, elem, &elem_type, lowerer, symbols, location)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Expr::array_expr(typ.clone(), elems))
     }
 
     fn lower_struct<'ctx>(

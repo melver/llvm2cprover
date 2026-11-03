@@ -33,8 +33,8 @@ use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
     LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands, LLVMGetNumClauses,
     LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetSuccessor,
-    LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantExpr, LLVMIsAGlobalVariable,
-    LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
+    LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantDataSequential, LLVMIsAConstantExpr,
+    LLVMIsAGlobalVariable, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
 };
 use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
@@ -4237,6 +4237,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         else {
             return None;
         };
+        // `as_const_string` (`LLVMGetAsString`) is an unchecked `ConstantDataSequential` cast;
+        // a `ConstantArray` (e.g. with `poison` lanes) is not a string literal anyway.
+        if unsafe { LLVMIsAConstantDataSequential(array.as_value_ref()).is_null() } {
+            return None;
+        }
         let bytes = array.as_const_string()?;
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
