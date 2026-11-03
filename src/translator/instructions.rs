@@ -2372,6 +2372,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             || callee_name.starts_with("llvm.uadd.with.overflow")
         {
             self.lower_overflow_intrinsic(
+                callee_name,
                 instruction,
                 args,
                 body,
@@ -2385,6 +2386,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             || callee_name.starts_with("llvm.usub.with.overflow")
         {
             self.lower_overflow_intrinsic(
+                callee_name,
                 instruction,
                 args,
                 body,
@@ -2398,6 +2400,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             || callee_name.starts_with("llvm.umul.with.overflow")
         {
             self.lower_overflow_intrinsic(
+                callee_name,
                 instruction,
                 args,
                 body,
@@ -3089,6 +3092,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
     fn lower_overflow_intrinsic(
         &mut self,
+        callee_name: &str,
         instruction: InstructionValue<'ctx>,
         args: &[Expr],
         body: &mut Vec<Stmt>,
@@ -3097,62 +3101,41 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     ) -> Result<()> {
         let loc = self.instruction_location(instruction);
         let result = self.declare_instruction_result(instruction)?;
-        let lhs = args.first().cloned().ok_or_else(|| {
-            Diagnostic::unsupported_feature(
-                UnsupportedFeature::Intrinsic,
-                format!("missing overflow intrinsic lhs in {}", self.function_name),
-            )
-            .with_symbol(self.function_name.clone())
-        })?;
-        let rhs = args.get(1).cloned().ok_or_else(|| {
-            Diagnostic::unsupported_feature(
-                UnsupportedFeature::Intrinsic,
-                format!("missing overflow intrinsic rhs in {}", self.function_name),
-            )
-            .with_symbol(self.function_name.clone())
-        })?;
-        let (lhs, rhs) = if signed {
-            (self.signed_view(lhs)?, self.signed_view(rhs)?)
-        } else {
-            (lhs, rhs)
+        let [lhs, rhs] = args else {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "expects two operands")
+                .into());
         };
-        // CBMC exposes overflow-with-result as its own struct type. Register that type so we can
-        // project `result` / `overflowed`, then rebuild the LLVM aggregate result shape explicitly.
-        self.ensure_overflow_result_symbol(lhs.typ().clone());
         let fields = result
             .typ()
             .lookup_components(self.symbols)
+            .filter(|fields| fields.len() >= 2 && fields[0].typ().len() == fields[1].typ().len())
             .ok_or_else(|| {
-                Diagnostic::unsupported_feature(
-                    UnsupportedFeature::Intrinsic,
-                    format!(
-                        "overflow intrinsic result is not a lowered aggregate in {}",
-                        self.function_name
-                    ),
-                )
-                .with_symbol(self.function_name.clone())
+                self.unsupported_intrinsic(callee_name, "unsupported overflow result shape")
             })?;
-        if fields.len() < 2 {
-            return Err(Diagnostic::unsupported_feature(
-                UnsupportedFeature::Intrinsic,
-                format!(
-                    "overflow intrinsic result shape is unsupported in {}",
-                    self.function_name
-                ),
-            )
-            .with_symbol(self.function_name.clone())
-            .into());
-        }
         let result_type = fields[0].typ();
         let overflow_type = fields[1].typ();
-        let overflow = op(lhs, rhs);
-        let value = overflow
-            .clone()
-            .member("result", self.symbols)
-            .cast_to(result_type);
-        let overflowed = overflow
-            .member("overflowed", self.symbols)
-            .cast_to(overflow_type);
+        if lhs.typ() != &result_type || rhs.typ() != &result_type {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "expects matching integer operands")
+                .into());
+        }
+        let scalar_type = result_type
+            .base_type()
+            .filter(|_| result_type.is_vector())
+            .unwrap_or(&result_type);
+        let op_type = self.int_type(scalar_type, signed)?;
+        // CBMC exposes overflow-with-result as its own struct type. Register that type so we can
+        // project `result` / `overflowed`, then rebuild the LLVM aggregate result shape explicitly.
+        self.ensure_overflow_result_symbol(op_type.clone());
+        let overflow =
+            |lhs: Expr, rhs: Expr| op(lhs.cast_to(op_type.clone()), rhs.cast_to(op_type.clone()));
+        let value = self.zip_lanes(&result_type, lhs, rhs, |lhs, rhs| {
+            overflow(lhs, rhs).member("result", self.symbols)
+        })?;
+        let overflowed = self.zip_lanes(&overflow_type, lhs, rhs, |lhs, rhs| {
+            overflow(lhs, rhs).member("overflowed", self.symbols)
+        })?;
         let result_expr = Expr::struct_expr_from_values(
             result.typ().clone(),
             vec![value.clone(), overflowed.clone()],
@@ -3172,92 +3155,62 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         args: &[Expr],
         body: &mut Vec<Stmt>,
     ) -> Result<()> {
-        debug_assert_eq!(args.len(), 2);
-        let lhs = args[0].clone();
-        let rhs = args[1].clone();
-
-        if lhs.typ().is_vector() || rhs.typ().is_vector() {
+        let [lhs, rhs] = args else {
             return Err(self
-                .unsupported_intrinsic(
-                    callee_name,
-                    "vector saturating arithmetic intrinsics are unsupported",
-                )
+                .unsupported_intrinsic(callee_name, "expects two operands")
                 .into());
-        }
-
-        let result_type = lhs.typ().clone();
-        if !result_type.is_integer() {
-            return Err(self
-                .unsupported_intrinsic(
-                    callee_name,
-                    "saturating arithmetic intrinsics expect integer operands",
-                )
-                .into());
-        }
-        let value = if callee_name.starts_with("llvm.uadd.sat") {
-            self.saturating_overflow_value(
-                lhs,
-                rhs,
-                result_type.clone(),
-                Expr::add_overflow_result,
-                self.integer_max_value(&result_type)?,
-            )?
-        } else if callee_name.starts_with("llvm.usub.sat") {
-            self.saturating_overflow_value(
-                lhs,
-                rhs,
-                result_type.clone(),
-                Expr::sub_overflow_result,
-                result_type.zero(),
-            )?
-        } else {
-            let lhs_signed = self.signed_view(lhs.clone())?;
-            let rhs_signed = self.signed_view(rhs)?;
-            let saturation = lhs_signed.clone().lt(lhs_signed.typ().zero()).ternary(
-                self.integer_signed_min_value(&result_type)?,
-                self.integer_signed_max_value(&result_type)?,
-            );
-            if callee_name.starts_with("llvm.sadd.sat") {
-                self.saturating_overflow_value(
-                    lhs_signed,
-                    rhs_signed,
-                    result_type,
-                    Expr::add_overflow_result,
-                    saturation,
-                )?
-            } else {
-                self.saturating_overflow_value(
-                    lhs_signed,
-                    rhs_signed,
-                    result_type,
-                    Expr::sub_overflow_result,
-                    saturation,
-                )?
-            }
         };
-
-        self.assign_result(instruction, body, value)?;
-        Ok(())
-    }
-
-    fn saturating_overflow_value(
-        &mut self,
-        lhs: Expr,
-        rhs: Expr,
-        result_type: Type,
-        op: fn(Expr, Expr) -> Expr,
-        on_overflow: Expr,
-    ) -> Result<Expr> {
-        self.ensure_overflow_result_symbol(lhs.typ().clone());
-        let overflow = op(lhs, rhs);
-        let value = overflow
-            .clone()
-            .member("result", self.symbols)
-            .cast_to(result_type);
-        let overflowed = overflow
-            .member("overflowed", self.symbols)
-            .cast_to(Type::bool());
-        Ok(overflowed.ternary(on_overflow, value))
+        if lhs.typ() != rhs.typ() {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "expects matching integer operands")
+                .into());
+        }
+        let typ = lhs.typ().clone();
+        let scalar_type = typ.base_type().filter(|_| typ.is_vector()).unwrap_or(&typ);
+        let signed = callee_name.starts_with("llvm.s");
+        let op_type = self.int_type(scalar_type, signed)?;
+        let op: fn(Expr, Expr) -> Expr = if callee_name.starts_with("llvm.uadd.sat")
+            || callee_name.starts_with("llvm.sadd.sat")
+        {
+            Expr::add_overflow_result
+        } else if callee_name.starts_with("llvm.usub.sat")
+            || callee_name.starts_with("llvm.ssub.sat")
+        {
+            Expr::sub_overflow_result
+        } else {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "unsupported saturating arithmetic intrinsic")
+                .into());
+        };
+        // On overflow, saturate to `on_neg` if `lhs < 0` (signed only), else to `on_pos`.
+        let (on_neg, on_pos) = if signed {
+            (
+                self.integer_signed_min_value(&op_type)?,
+                self.integer_signed_max_value(&op_type)?,
+            )
+        } else if callee_name.starts_with("llvm.uadd.sat") {
+            let max = self.integer_max_value(&op_type)?;
+            (max.clone(), max)
+        } else {
+            (op_type.zero(), op_type.zero())
+        };
+        self.ensure_overflow_result_symbol(op_type.clone());
+        let value = self.zip_lanes(&typ, lhs, rhs, |lhs, rhs| {
+            let lhs = lhs.cast_to(op_type.clone());
+            let overflow = op(lhs.clone(), rhs.cast_to(op_type.clone()));
+            let sat = if signed {
+                lhs.lt(op_type.zero())
+                    .ternary(on_neg.clone(), on_pos.clone())
+            } else {
+                on_pos.clone()
+            };
+            overflow
+                .clone()
+                .member("overflowed", self.symbols)
+                .cast_to(Type::bool())
+                .ternary(sat, overflow.member("result", self.symbols))
+        })?;
+        self.assign_result(instruction, body, value)
     }
 
     fn integer_max_value(&self, typ: &Type) -> Result<Expr> {
@@ -3278,8 +3231,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
     fn integer_signed_min_value(&self, typ: &Type) -> Result<Expr> {
         let width = self.integer_width(typ)?;
+        // Pass the unsigned two's-complement bit pattern (`1 << (width - 1)`) rather than a
+        // negative `BigInt`: `cprover_bindings`'s `two_complement` panics on `width == 1`
+        // because `|-1| < max_int(1, false)` is false.
         Ok(Expr::int_constant(
-            -(BigInt::from(1u8) << (width - 1)),
+            BigInt::from(1u8) << (width - 1),
             typ.clone(),
         ))
     }
@@ -3637,6 +3593,25 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         })?;
         let elems = (0..len as usize).map(lane).collect::<Result<Vec<_>>>()?;
         self.rebuild_aggregate(typ.clone(), elems)
+    }
+
+    /// Apply the scalar binary `op` to `lhs` and `rhs`, lane by lane when `typ` is a vector, and
+    /// cast each result to `typ` (or its lane type).
+    fn zip_lanes(
+        &self,
+        typ: &Type,
+        lhs: &Expr,
+        rhs: &Expr,
+        op: impl Fn(Expr, Expr) -> Expr,
+    ) -> Result<Expr> {
+        match typ.base_type() {
+            Some(lane) if typ.is_vector() => self.map_lanes(typ, |i| {
+                let lhs = self.aggregate_component(lhs.clone(), i)?;
+                let rhs = self.aggregate_component(rhs.clone(), i)?;
+                Ok(op(lhs, rhs).cast_to(lane.clone()))
+            }),
+            _ => Ok(op(lhs.clone(), rhs.clone()).cast_to(typ.clone())),
+        }
     }
 
     fn project_aggregate_value(&self, aggregate: Expr, indices: &[u32]) -> Result<Expr> {
@@ -4491,31 +4466,36 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .unwrap_or_else(|| self.function_location())
     }
 
+    fn int_type(&self, typ: &Type, signed: bool) -> Result<Type> {
+        // LLVM `i1` currently lowers to `c_bool` for general scalar use, but integer LLVM
+        // operations interpret that value as a 1-bit two's-complement or unsigned integer where
+        // `true` is `-1` (signed) or `1` (unsigned) and `false` is `0`. Keep `bool` here as a
+        // defensive fallback in case an earlier lowering step already normalized the value to CBMC's
+        // native boolean type.
+        if typ.is_c_bool() || typ.is_bool() {
+            return Ok(if signed {
+                Type::signed_int(1_u32)
+            } else {
+                Type::unsigned_int(1_u32)
+            });
+        }
+        let converted = if signed {
+            typ.to_signed()
+        } else {
+            typ.to_unsigned()
+        };
+        converted.ok_or_else(|| {
+            Diagnostic::unsupported_feature(
+                UnsupportedFeature::Instruction,
+                format!("expected integer type in {}", self.function_name),
+            )
+            .with_symbol(self.function_name.clone())
+            .into()
+        })
+    }
+
     fn signed_view(&self, expr: Expr) -> Result<Expr> {
-        // LLVM `i1` currently lowers to `c_bool` for general scalar use, but signed LLVM
-        // operations still interpret that value as a 1-bit two's-complement integer where
-        // `true` is `-1` and `false` is `0`. Keep `bool` here as a defensive fallback in case
-        // an earlier lowering step already normalized the value to CBMC's native boolean type.
-        let typ = expr
-            .typ()
-            .to_signed()
-            .or_else(|| {
-                if expr.typ().is_c_bool() || expr.typ().is_bool() {
-                    Some(Type::signed_int(1_u32))
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                Diagnostic::unsupported_feature(
-                    UnsupportedFeature::Instruction,
-                    format!(
-                        "expected signed-capable integer type in {}",
-                        self.function_name
-                    ),
-                )
-                .with_symbol(self.function_name.clone())
-            })?;
+        let typ = self.int_type(expr.typ(), true)?;
         Ok(expr.cast_to(typ))
     }
 
