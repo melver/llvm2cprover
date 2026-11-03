@@ -41,6 +41,15 @@ SHORT = {"check-failure": "check", "translate-crash": "crash", "cbmc-error": "cb
          "unsupported": "unsup", "invalid-seed": "invalid"}
 MAIN_END = "platform_main_end(crc32_context ^ 0xFFFFFFFFUL, print_hash_value);"
 INJECT_RE = re.compile(re.escape(MAIN_END) + r"( __CPROVER_assert\(.*\);)?")
+# `--virt` qemu user-mode arch -> clang flags to cross-compile for it (Debian cross sysroots).
+VIRT = {
+    "aarch64": ["--target=aarch64-linux-gnu"],
+    "arm": ["--target=arm-linux-gnueabi"],
+    "mips64el": ["--target=mips64el-linux-gnuabi64"],
+    "ppc64le": ["--target=powerpc64le-linux-gnu"],
+    "riscv64": ["--target=riscv64-linux-gnu"],
+    "s390x": ["--target=s390x-linux-gnu"],
+}
 FAILURE_RE = re.compile(r"^\[(\S+)\] (?:(?:file \S+ )?line \d+ )?(.*): FAILURE$", re.M)
 
 
@@ -53,12 +62,14 @@ class Config:
     native_timeout: int
     csmith_args: tuple[str, ...]
     cpp: bool = False
+    virt: str | None = None
     keep_all: bool = False
 
     def cc(self) -> list[str]:
         """The compiler for t.c. Csmith's C++ output keeps the .c name and narrows in brace
         initializers (valid C++03), hence `-x c++ -Wno-c++11-narrowing`."""
-        return ["clang++", "-x", "c++", "-Wno-c++11-narrowing"] if self.cpp else ["clang"]
+        cc = ["clang++", "-x", "c++", "-Wno-c++11-narrowing"] if self.cpp else ["clang"]
+        return cc + VIRT.get(self.virt, [])
 
 
 @dataclass(frozen=True)
@@ -113,11 +124,14 @@ def inject(seed: int, cfg: Config, d: Path) -> Outcome | None:
     # `--float` casts of out-of-range values to integers; the sanitizer turns such seeds into
     # invalid ones instead of bogus `semantic` failures.
     clang = run([*cfg.cc(), "-O0", "-w", "-DFUZZ_NATIVE", "-fsanitize=builtin,float-cast-overflow",
-                 "-fno-sanitize-recover=all", *INCLUDES, "t.c", "-o", "native"], d)
+                 "-fno-sanitize-recover=all", *INCLUDES, "t.c", "-o", "native",
+                 # Cross targets lack sanitizer runtimes: trap instead, which leaves no checksum.
+                 *(["-static", "-fsanitize-trap=all"] if cfg.virt else [])], d)
     if clang.returncode:
         return Outcome(seed, "invalid-seed", detail=f"clang native: {last_line(clang.stderr)}")
     try:
-        native = run(["./native"], d, timeout=cfg.native_timeout)
+        qemu = [f"qemu-{cfg.virt}"] if cfg.virt else []
+        native = run([*qemu, "./native"], d, timeout=cfg.native_timeout)
     except subprocess.TimeoutExpired:
         return Outcome(seed, "invalid-seed", opt="nat", detail="native timeout")
     ub = re.search(r"runtime error: (.*)", native.stderr)
@@ -214,7 +228,7 @@ def header(cfg: Config, jobs: int, cwd: Path) -> str:
     git = run(["git", "describe", "--always", "--dirty"], ROOT).stdout.strip()
     return (f"csmith {version(CSMITH, '--version')} | clang {version('clang', '--version')} | "
             f"cbmc {version('cbmc', '--version')} | llvm2cprover {git} | "
-            f"unwind {cfg.unwind} | -j{jobs}")
+            f"target {cfg.virt or 'host'} | unwind {cfg.unwind} | -j{jobs}")
 
 
 def progress(done: list[Outcome], total: int, elapsed: float) -> str:
@@ -243,6 +257,8 @@ def summary(done: list[Outcome]) -> str:
 
 
 def config(args: argparse.Namespace) -> Config:
+    if args.virt and not shutil.which(f"qemu-{args.virt}"):
+        raise SystemExit(f"qemu-{args.virt} not found on PATH")
     return Config(
         llvm2cprover=args.llvm2cprover,
         opts=tuple((args.opt or "O0,O2").split(",")),
@@ -251,6 +267,7 @@ def config(args: argparse.Namespace) -> Config:
         native_timeout=args.native_timeout,
         csmith_args=(*CSMITH_ARGS, *(["--lang-cpp"] if args.cpp else []), *args.csmith_arg),
         cpp=args.cpp,
+        virt=args.virt,
         keep_all=args.keep_all,
     )
 
@@ -295,7 +312,8 @@ def cmd_reduce(args: argparse.Namespace) -> int:
     check = [str(Path(__file__).resolve()), "check", "--opt", args.opt or outcome.opt,
              "--expect", outcome.label, "--llvm2cprover", args.llvm2cprover,
              "--unwind", str(args.unwind), "--cbmc-timeout", str(args.cbmc_timeout),
-             "--native-timeout", str(args.native_timeout), *(["--cpp"] if args.cpp else [])]
+             "--native-timeout", str(args.native_timeout), *(["--cpp"] if args.cpp else []),
+             *(["--virt", args.virt] if args.virt else [])]
     script = d / "interesting.sh"
     script.write_text("#!/bin/sh\nexec " + " ".join(check) + "\n")
     script.chmod(0o755)
@@ -312,6 +330,8 @@ def parse_args() -> argparse.Namespace:
     knobs.add_argument("--csmith-arg", action="append", default=[])
     knobs.add_argument("--cpp", action="store_true",
                        help="csmith --lang-cpp, compiled with clang++")
+    knobs.add_argument("--virt", choices=sorted(VIRT),
+                       help="cross-compile for ARCH and run the native oracle under qemu-ARCH")
     knobs.set_defaults(keep_all=False)
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
