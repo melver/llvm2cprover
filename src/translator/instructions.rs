@@ -2736,6 +2736,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             ("llvm.trunc", BuiltinFn::Trunc, BuiltinFn::Truncf),
             ("llvm.copysign", BuiltinFn::Copysign, BuiltinFn::Copysignf),
             ("llvm.sqrt", BuiltinFn::Sqrt, BuiltinFn::Sqrtf),
+            // The trailing dot keeps `llvm.powi` (integer exponent) out.
+            ("llvm.pow.", BuiltinFn::Pow, BuiltinFn::Powf),
             ("llvm.fma", BuiltinFn::Fma, BuiltinFn::Fmaf),
             ("llvm.fmuladd", BuiltinFn::Fma, BuiltinFn::Fmaf),
             (
