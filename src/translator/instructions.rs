@@ -2434,6 +2434,20 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if let Some(max) = callee_name
+            .strip_prefix("llvm.")
+            .and_then(|name| name.split('.').next())
+            .and_then(|name| match name {
+                "maximum" => Some(true),
+                "minimum" => Some(false),
+                _ => None,
+            })
+        {
+            let value = self.lower_fminimum_maximum(callee_name, max, args)?;
+            self.assign_result(instruction, body, value)?;
+            return Ok(true);
+        }
+
         if let Some((double_fn, float_fn)) = self.float_builtin(callee_name) {
             self.lower_float_builtin_call(
                 callee_name,
@@ -2727,6 +2741,46 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             })
     }
 
+    /// `llvm.maximum` (`max`) or `llvm.minimum`, lane-wise for vectors.
+    ///
+    /// Unlike `fmax`/`fmin` (`llvm.maxnum`/`llvm.minnum`), these return NaN if either operand is
+    /// NaN and order -0 below +0. Equal operands differ only in that sign, read from the sign bit.
+    fn lower_fminimum_maximum(&self, callee_name: &str, max: bool, args: &[Expr]) -> Result<Expr> {
+        let [lhs, rhs] = args else {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "expects two operands")
+                .into());
+        };
+        let typ = lhs.typ();
+        let bits = match typ.base_type().filter(|_| typ.is_vector()).unwrap_or(typ) {
+            Type::Float => 32_u64,
+            Type::Double => 64,
+            other => {
+                return Err(self
+                    .unsupported_intrinsic(callee_name, format!("unsupported operand {other:?}"))
+                    .into());
+            }
+        };
+        let int = Type::signed_int(bits);
+        let negative = |x: Expr| x.transmute_to(int.clone(), self.symbols).lt(int.zero());
+        self.zip_lanes(typ, lhs, rhs, |a, b| {
+            let tie = if max {
+                negative(a.clone()).ternary(b.clone(), a.clone())
+            } else {
+                negative(a.clone()).ternary(a.clone(), b.clone())
+            };
+            let ordered = if max {
+                a.clone().gt(b.clone())
+            } else {
+                a.clone().lt(b.clone())
+            };
+            let pick = ordered.ternary(a.clone(), b.clone());
+            let pick = a.clone().feq(b.clone()).ternary(tie, pick);
+            let pick = b.clone().is_nan().ternary(b.clone(), pick);
+            a.clone().is_nan().ternary(a, pick)
+        })
+    }
+
     fn float_builtin(&self, callee_name: &str) -> Option<(BuiltinFn, BuiltinFn)> {
         // Match through the `.` before the type suffix: bare prefixes would also catch
         // `llvm.roundeven` (as `round`) and `llvm.powi` (as `pow`).
@@ -2755,9 +2809,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             ),
             ("llvm.rint.", BuiltinFn::Rint, BuiltinFn::Rintf),
             ("llvm.maxnum.", BuiltinFn::Fmax, BuiltinFn::Fmaxf),
-            ("llvm.maximum.", BuiltinFn::Fmax, BuiltinFn::Fmaxf),
             ("llvm.minnum.", BuiltinFn::Fmin, BuiltinFn::Fminf),
-            ("llvm.minimum.", BuiltinFn::Fmin, BuiltinFn::Fminf),
         ]
         .into_iter()
         .find_map(|(prefix, double_builtin, float_builtin)| {
