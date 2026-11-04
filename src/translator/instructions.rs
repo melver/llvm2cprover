@@ -2728,28 +2728,36 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     }
 
     fn float_builtin(&self, callee_name: &str) -> Option<(BuiltinFn, BuiltinFn)> {
+        // Match through the `.` before the type suffix: bare prefixes would also catch
+        // `llvm.roundeven` (as `round`) and `llvm.powi` (as `pow`).
         [
-            ("llvm.fabs", BuiltinFn::Fabs, BuiltinFn::Fabsf),
-            ("llvm.floor", BuiltinFn::Floor, BuiltinFn::Floorf),
-            ("llvm.ceil", BuiltinFn::Ceil, BuiltinFn::Ceilf),
-            ("llvm.round", BuiltinFn::Round, BuiltinFn::Roundf),
-            ("llvm.trunc", BuiltinFn::Trunc, BuiltinFn::Truncf),
-            ("llvm.copysign", BuiltinFn::Copysign, BuiltinFn::Copysignf),
-            ("llvm.sqrt", BuiltinFn::Sqrt, BuiltinFn::Sqrtf),
-            // The trailing dot keeps `llvm.powi` (integer exponent) out.
-            ("llvm.pow.", BuiltinFn::Pow, BuiltinFn::Powf),
-            ("llvm.fma", BuiltinFn::Fma, BuiltinFn::Fmaf),
-            ("llvm.fmuladd", BuiltinFn::Fma, BuiltinFn::Fmaf),
+            ("llvm.fabs.", BuiltinFn::Fabs, BuiltinFn::Fabsf),
+            ("llvm.floor.", BuiltinFn::Floor, BuiltinFn::Floorf),
+            ("llvm.ceil.", BuiltinFn::Ceil, BuiltinFn::Ceilf),
+            ("llvm.round.", BuiltinFn::Round, BuiltinFn::Roundf),
+            // Non-`strictfp` LLVM assumes round-to-nearest-even, which `nearbyint` then uses.
             (
-                "llvm.nearbyint",
+                "llvm.roundeven.",
                 BuiltinFn::Nearbyint,
                 BuiltinFn::Nearbyintf,
             ),
-            ("llvm.rint", BuiltinFn::Rint, BuiltinFn::Rintf),
-            ("llvm.maxnum", BuiltinFn::Fmax, BuiltinFn::Fmaxf),
-            ("llvm.maximum", BuiltinFn::Fmax, BuiltinFn::Fmaxf),
-            ("llvm.minnum", BuiltinFn::Fmin, BuiltinFn::Fminf),
-            ("llvm.minimum", BuiltinFn::Fmin, BuiltinFn::Fminf),
+            ("llvm.trunc.", BuiltinFn::Trunc, BuiltinFn::Truncf),
+            ("llvm.copysign.", BuiltinFn::Copysign, BuiltinFn::Copysignf),
+            ("llvm.sqrt.", BuiltinFn::Sqrt, BuiltinFn::Sqrtf),
+            ("llvm.pow.", BuiltinFn::Pow, BuiltinFn::Powf),
+            ("llvm.powi.", BuiltinFn::Powi, BuiltinFn::Powif),
+            ("llvm.fma.", BuiltinFn::Fma, BuiltinFn::Fmaf),
+            ("llvm.fmuladd.", BuiltinFn::Fma, BuiltinFn::Fmaf),
+            (
+                "llvm.nearbyint.",
+                BuiltinFn::Nearbyint,
+                BuiltinFn::Nearbyintf,
+            ),
+            ("llvm.rint.", BuiltinFn::Rint, BuiltinFn::Rintf),
+            ("llvm.maxnum.", BuiltinFn::Fmax, BuiltinFn::Fmaxf),
+            ("llvm.maximum.", BuiltinFn::Fmax, BuiltinFn::Fmaxf),
+            ("llvm.minnum.", BuiltinFn::Fmin, BuiltinFn::Fminf),
+            ("llvm.minimum.", BuiltinFn::Fmin, BuiltinFn::Fminf),
         ]
         .into_iter()
         .find_map(|(prefix, double_builtin, float_builtin)| {
@@ -2800,14 +2808,21 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let loc = self.instruction_location(instruction);
         let mut lanes = Vec::new();
         for i in 0..result_type.len().unwrap_or(0) as usize {
+            // Scalar operands (the `powi` exponent) apply to every lane.
             let lane_args = args
                 .iter()
-                .map(|arg| self.aggregate_component(arg.clone(), i))
+                .map(|arg| {
+                    if arg.typ().is_vector() {
+                        self.aggregate_component(arg.clone(), i)
+                    } else {
+                        Ok(arg.clone())
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
             let function = builtin.as_expr().with_location(loc);
             let arguments = Expr::cast_arguments_to_target_equivalent_function_parameter_types(
                 &function,
-                lane_args,
+                self.normalize_builtin_args(builtin, &lane_args),
                 self.symbols.machine_model(),
             );
             let tmp = self.declare_hidden_local(&format!("{builtin}_lane"), lane.clone(), loc);
@@ -3410,6 +3425,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             // CBMC models `memset` with the C ABI shape `(void *, int, size_t)`, not LLVM's
             // narrower byte-typed fill argument.
             *value = value.clone().cast_to(Type::c_int());
+        }
+        if matches!(builtin, BuiltinFn::Powi | BuiltinFn::Powif)
+            && let Some(exponent) = args.get_mut(1)
+            && let Some(signed) = exponent.typ().to_signed()
+        {
+            // The `powi` exponent is a signed integer of any width; our integers are unsigned.
+            *exponent = exponent.clone().cast_to(signed).cast_to(Type::c_int());
         }
         args
     }
