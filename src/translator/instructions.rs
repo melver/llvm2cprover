@@ -17,7 +17,7 @@
 //! Unsupported instructions fail where they are encountered, which keeps
 //! diagnostics specific and avoids a second feature-classification pass.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use cprover_bindings::InternedString;
@@ -237,6 +237,38 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .collect()
     }
 
+    /// Returns the reachable blocks in RPO, rearranged so that each natural loop is contiguous
+    /// with its header first.
+    ///
+    /// CBMC identifies loops by backward `GOTO`s and needs their ranges to nest. Plain RPO can
+    /// place an outer loop's latch inside an inner loop's range, and CBMC then counts inner
+    /// iterations against the outer loop. Moving a loop's body up to its header keeps the RPO
+    /// property `blocks_in_rpo` relies on, because the header dominates the whole body.
+    fn blocks_in_lowering_order(&self) -> Vec<BasicBlock<'ctx>> {
+        let rpo = self.blocks_in_rpo();
+        let index: HashMap<BasicBlock<'ctx>, usize> =
+            rpo.iter().enumerate().map(|(i, &bb)| (bb, i)).collect();
+        let succs: Vec<Vec<usize>> = rpo
+            .iter()
+            .map(|bb| {
+                let term = unsafe { LLVMGetBasicBlockTerminator(bb.as_mut_ptr()) };
+                let n_succs = if term.is_null() {
+                    0
+                } else {
+                    unsafe { LLVMGetNumSuccessors(term) }
+                };
+                (0..n_succs)
+                    .filter_map(|i| unsafe { BasicBlock::new(LLVMGetSuccessor(term, i)) })
+                    .filter_map(|succ| index.get(&succ).copied())
+                    .collect()
+            })
+            .collect();
+        loop_contiguous_order(&succs)
+            .into_iter()
+            .map(|i| rpo[i])
+            .collect()
+    }
+
     fn lower(mut self) -> Result<()> {
         self.declare_parameters()?;
         let all_blocks = self.function.get_basic_blocks();
@@ -250,9 +282,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         // Lower blocks in RPO so that every SSA definition is available before
         // phi_edge_assignments tries to reference it on a successor edge.
-        let rpo_blocks = self.blocks_in_rpo();
+        let blocks = self.blocks_in_lowering_order();
         let mut body = Vec::new();
-        for block in rpo_blocks {
+        for block in blocks {
             body.push(self.lower_basic_block(block)?);
         }
         // Many SSA temps and hidden locals are only discovered while lowering instructions, so
@@ -4863,4 +4895,107 @@ fn is_rust_core_panic_path(rest: &str) -> bool {
         rest.strip_prefix(path)
             .is_some_and(|tail| tail.is_empty() || tail.starts_with("17h"))
     })
+}
+
+/// Permutation of the blocks `0..succs.len()`, given in RPO with their successor lists, that keeps
+/// each natural loop contiguous with its header first (see `blocks_in_lowering_order`).
+fn loop_contiguous_order(succs: &[Vec<usize>]) -> Vec<usize> {
+    let n = succs.len();
+    let mut preds = vec![Vec::new(); n];
+    for (u, ss) in succs.iter().enumerate() {
+        for &s in ss {
+            preds[s].push(u);
+        }
+    }
+    // Natural loop of header `h`: `h` plus every block reaching a retreating edge `u -> h`
+    // without passing `h`. Restricting to RPO index `>= h` bounds irreducible regions.
+    let mut loops: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for (u, ss) in succs.iter().enumerate() {
+        // In RPO, `u -> h` with `h <= u` is retreating: a back edge to header `h` if reducible.
+        for &h in ss.iter().filter(|&&h| h <= u) {
+            let body = loops.entry(h).or_insert_with(|| BTreeSet::from([h]));
+            // Walk predecessors back from the edge source; `h` is already in `body`, so stops there.
+            let mut work = vec![u];
+            while let Some(b) = work.pop() {
+                if b >= h && body.insert(b) {
+                    work.extend(&preds[b]);
+                }
+            }
+        }
+    }
+
+    fn place(
+        region: impl Iterator<Item = usize>,
+        loops: &BTreeMap<usize, BTreeSet<usize>>,
+        placed: &mut [bool],
+        order: &mut Vec<usize>,
+    ) {
+        for b in region {
+            if placed[b] {
+                continue;
+            }
+            placed[b] = true;
+            order.push(b);
+            // A header has the smallest RPO index in its loop, so it is reached before its body:
+            // emit the rest of the loop right after it (recursively, so inner loops nest).
+            if let Some(body) = loops.get(&b) {
+                place(body.iter().copied(), loops, placed, order);
+            }
+        }
+    }
+    let mut placed = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    place(0..n, &loops, &mut placed, &mut order);
+    order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loop_contiguous_order;
+
+    #[test]
+    fn acyclic_keeps_rpo() {
+        // Diamond: 0 -> {1, 2} -> 3.
+        assert_eq!(
+            loop_contiguous_order(&[vec![1, 2], vec![3], vec![3], vec![]]),
+            [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn nested_loop_body_moves_before_outer_latch() {
+        // loop_nest_unwind.ll in RPO: entry, outer.header, inner.header, outer.latch,
+        // inner.body, inner.latch, exit. The inner loop {2, 4, 5} must not contain 3.
+        let succs = [
+            vec![1, 6], // 0 entry
+            vec![2],    // 1 outer.header
+            vec![4, 3], // 2 inner.header
+            vec![1, 6], // 3 outer.latch
+            vec![5],    // 4 inner.body
+            vec![2],    // 5 inner.latch
+            vec![],     // 6 exit
+        ];
+        assert_eq!(loop_contiguous_order(&succs), [0, 1, 2, 4, 5, 3, 6]);
+    }
+
+    #[test]
+    fn self_loop_and_sibling_loops_keep_rpo() {
+        // 0 -> 1 (self loop) -> 2 <-> 3 -> 4.
+        let succs = [vec![1], vec![1, 2], vec![3], vec![2, 4], vec![]];
+        assert_eq!(loop_contiguous_order(&succs), [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn irreducible_cycle_is_a_permutation() {
+        // Two entries into the cycle 1 <-> 2; 2 -> 1 is retreating but 1 does not dominate 2.
+        let succs = [vec![1, 2], vec![2, 3], vec![1], vec![]];
+        assert_eq!(loop_contiguous_order(&succs), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn loop_exit_inside_rpo_range_moves_after_body() {
+        // 0 -> 1 header; 1 -> {2 exit, 3 body}; 3 -> 1. RPO may list the exit first.
+        let succs = [vec![1], vec![2, 3], vec![], vec![1]];
+        assert_eq!(loop_contiguous_order(&succs), [0, 1, 3, 2]);
+    }
 }
