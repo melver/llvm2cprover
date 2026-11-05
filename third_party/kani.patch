@@ -198,6 +198,141 @@ index 01148089e..1f10f885b 100644
              | VariadicCode { .. } => panic!("Can't zero init {self:?}"),
          }
      }
+diff --git a/cprover_bindings/src/irep/goto_binary_serde.rs b/cprover_bindings/src/irep/goto_binary_serde.rs
+index b4b1179b4..1da366123 100644
+--- a/cprover_bindings/src/irep/goto_binary_serde.rs
++++ b/cprover_bindings/src/irep/goto_binary_serde.rs
+@@ -98,11 +98,33 @@
+ /// - src/util/irep_hash_container.h
+ /// - src/util/irep_hash.h
+ pub fn write_goto_binary_file(filename: &Path, source: &crate::goto_program::SymbolTable) {
++    write_goto_binary_file_with_functions(filename, source, &[]);
++}
++
++/// One instruction of a GOTO function, in the layout of CBMC's `write_instructions_binary`.
++pub struct GotoInstruction {
++    pub code: Irep,
++    pub location: Irep,
++    /// CBMC's `goto_program_instruction_typet`.
++    pub kind: usize,
++    pub guard: Irep,
++    /// Unique per function; `None` for instructions that are not jump targets.
++    pub target_number: Option<usize>,
++    pub targets: Vec<usize>,
++    pub labels: Vec<InternedString>,
++}
++
++/// Like [write_goto_binary_file], but also writes converted GOTO function bodies.
++pub fn write_goto_binary_file_with_functions(
++    filename: &Path,
++    source: &crate::goto_program::SymbolTable,
++    functions: &[(InternedString, Vec<GotoInstruction>)],
++) {
+     let out_file = File::create(filename).unwrap();
+     let mut writer = BufWriter::new(out_file);
+     let mut serializer = GotoBinarySerializer::new(&mut writer);
+     let irep_symbol_table = &source.to_irep();
+-    serializer.write_file(irep_symbol_table);
++    serializer.write_file(irep_symbol_table, functions);
+ }
+ 
+ /// Reads a symbol table from a file expected to be in goto binary format in version 6.
+@@ -453,31 +475,21 @@ fn write_numbered_string_ref(&mut self, numbered_string: &NumberedString) {
+         self.write_usize_varenc(num);
+         if self.is_first_write_string(num) {
+             // first occurrence
+-            numbered_string.string.map(|raw_str| {
+-                for c in raw_str.chars() {
+-                    if c.is_ascii() {
+-                        // add escape character for backslashes and 0
+-                        if c == '0' || c == '\\' {
+-                            self.write_u8(b'\\');
+-                        }
+-                        self.write_u8(c as u8);
+-                    } else {
+-                        let mut buf = [0; 4];
+-                        c.encode_utf8(&mut buf);
+-                        for u in buf {
+-                            if u == 0 {
+-                                break;
+-                            }
+-                            self.write_u8(u);
+-                        }
+-                    }
+-                }
+-                // write terminator
+-                self.write_u8(0u8);
+-            });
++            numbered_string.string.map(|raw_str| self.write_raw_string(raw_str));
+         }
+     }
+ 
++    /// Writes a string inline, escaped and zero-terminated (CBMC's `write_gb_string`).
++    fn write_raw_string(&mut self, raw_str: &str) {
++        for b in raw_str.bytes() {
++            if b == 0 || b == b'\\' {
++                self.write_u8(b'\\');
++            }
++            self.write_u8(b);
++        }
++        self.write_u8(0);
++    }
++
+     /// Writes a numbered irep to the buffer. Writes the unique number of the
+     /// irep, and writes the actual irep contents only if was never written
+     /// before.
+@@ -563,10 +575,30 @@ fn write_symbol_table(&mut self, symbol_table: &SymbolTable) {
+         }
+     }
+ 
+-    /// Writes an empty function map to the byte stream.
+-    fn write_function_map(&mut self) {
+-        // Write empty GOTO functions map
+-        self.write_usize_varenc(0);
++    /// Writes the GOTO functions map to the byte stream (CBMC's `write_goto_functions_binary`).
++    fn write_function_map(&mut self, functions: &[(InternedString, Vec<GotoInstruction>)]) {
++        // CBMC's `instructiont::nil_target`.
++        const NIL_TARGET: usize = u32::MAX as usize;
++        self.write_usize_varenc(functions.len());
++        for (name, instructions) in functions {
++            name.map(|name| self.write_raw_string(name));
++            self.write_usize_varenc(instructions.len());
++            for instruction in instructions {
++                self.write_irep_ref(&instruction.code);
++                self.write_irep_ref(&instruction.location);
++                self.write_usize_varenc(instruction.kind);
++                self.write_irep_ref(&instruction.guard);
++                self.write_usize_varenc(instruction.target_number.unwrap_or(NIL_TARGET));
++                self.write_usize_varenc(instruction.targets.len());
++                for &target in &instruction.targets {
++                    self.write_usize_varenc(target);
++                }
++                self.write_usize_varenc(instruction.labels.len());
++                for label in &instruction.labels {
++                    self.write_string_ref(label);
++                }
++            }
++        }
+     }
+ 
+     /// Writes a GOTO binary file header to the byte stream.
+@@ -581,10 +613,14 @@ fn write_header(&mut self) {
+     }
+ 
+     /// Writes the symbol table using the GOTO binary file format to the byte stream.
+-    fn write_file(&mut self, symbol_table: &SymbolTable) {
++    fn write_file(
++        &mut self,
++        symbol_table: &SymbolTable,
++        functions: &[(InternedString, Vec<GotoInstruction>)],
++    ) {
+         self.write_header();
+         self.write_symbol_table(symbol_table);
+-        self.write_function_map();
++        self.write_function_map(functions);
+     }
+ }
+ 
 diff --git a/cprover_bindings/src/irep/to_irep.rs b/cprover_bindings/src/irep/to_irep.rs
 index cd263e2a3..37d257ecb 100644
 --- a/cprover_bindings/src/irep/to_irep.rs

@@ -2,6 +2,7 @@
 // description = "llvm.sadd.with.overflow from __builtin_add_overflow is modeled"
 // expected = "VERIFICATION SUCCESSFUL"
 // entry = "main"
+// esbmc_skip = "ESBMC mis-models CBMC overflow_result expressions"
 // ---
 
 extern void __CPROVER_assert(_Bool cond, const char* message);

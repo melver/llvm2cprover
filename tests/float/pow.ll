@@ -2,6 +2,7 @@
 ; description = "llvm.pow lowers to CBMC's pow/powf, scalar and per vector lane"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
+; esbmc_skip = "ESBMC has no pow models for CBMC binaries"
 ; ---
 ;
 ; CBMC's pow model is exact only on its special cases; elsewhere it over-approximates with a

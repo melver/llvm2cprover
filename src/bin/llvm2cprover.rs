@@ -125,6 +125,14 @@ struct Cli {
     )]
     emit_llvm: bool,
 
+    /// Also emit goto-converted function bodies, which verifiers other than CBMC require.
+    #[arg(long, conflicts_with_all = ["emit_llvm", "emit_asm_manifest"])]
+    goto_convert: bool,
+
+    /// Emit GOTO for ESBMC: implies --goto-convert; contract enforcement needs CBMC's DFCC.
+    #[arg(long, conflicts_with_all = ["emit_llvm", "emit_asm_manifest", "enforce_contract"])]
+    esbmc: bool,
+
     #[arg(long, value_enum, default_value_t = CliMachineModel::Auto)]
     machine_model: CliMachineModel,
 
@@ -204,6 +212,7 @@ fn main() -> std::process::ExitCode {
         unsound,
         report: cli.report,
         fp_groups: cli.fp_groups,
+        goto_convert: cli.goto_convert || cli.esbmc,
     };
 
     match translate(input_from_cli(cli.input), config) {

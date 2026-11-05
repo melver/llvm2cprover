@@ -2,6 +2,7 @@
 ; description = "Vector float intrinsics lower lane-wise: libm builtins per lane, unfused fmuladd as vector arithmetic"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
+; esbmc_skip = "ESBMC 8.6 crashes in Bitwuzla"
 ; ---
 ;
 ; The loop vectorizer emits these for Csmith --float programs (seeds 87, 303, 938). The fmuladd

@@ -2,6 +2,7 @@
 ; description = "llvm saturating integer arithmetic lowers through overflow checks"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
+; esbmc_skip = "ESBMC mis-models CBMC overflow_result expressions"
 ; ---
 
 @.msg = private unnamed_addr constant [11 x i8] c"saturating\00"

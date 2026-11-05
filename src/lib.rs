@@ -161,6 +161,9 @@ pub struct Config {
     /// fails an assertion and ends the path. Ungrouped callers see every type-compatible
     /// candidate. Groups name module functions after `rename_prefix`; unknown names are errors.
     pub fp_groups: Option<PathBuf>,
+    /// Also emit goto-converted function bodies (CBMC's `goto_convert`), as consumers other than
+    /// CBMC, notably ESBMC, require. CBMC uses them instead of converting on load.
+    pub goto_convert: bool,
 }
 
 /// Translate one LLVM module into a `.goto` binary.

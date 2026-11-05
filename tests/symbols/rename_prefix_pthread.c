@@ -8,6 +8,7 @@
 // clang_flags = ["-pthread"]
 // cbmc_flags = ["--no-standard-checks"]
 // translator_flags = ["--rename-prefix", "old_"]
+// esbmc_skip = "ESBMC has no pthread models for CBMC binaries"
 // ---
 
 #include "../concurrency/pthread_create_join.c"

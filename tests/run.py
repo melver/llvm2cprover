@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,7 @@ class TestCase:
     translator_flags: tuple[str, ...] = ()
     skip: bool = False
     skip_reason: str = ""
+    esbmc_skip: str = ""
     todo: str = ""
 
     @property
@@ -86,6 +88,7 @@ def load_test(path: Path) -> TestCase:
         translator_flags=tuple(metadata.get("translator_flags", [])),
         skip=bool(metadata.get("skip", False)),
         skip_reason=metadata.get("skip_reason", ""),
+        esbmc_skip=metadata.get("esbmc_skip", ""),
         todo=str(metadata.get("todo", "")),
     )
 
@@ -219,8 +222,10 @@ def translate_test(
     test: TestCase,
     args: argparse.Namespace,
     goto_path: Path,
+    mode_flags: tuple[str, ...] = (),
 ) -> tuple[str, subprocess.CompletedProcess[str]]:
     contract_flags = contract_args(test)
+    translator_flags = (*test.translator_flags, *mode_flags)
     if test.path.suffix == ".ll":
         return (
             "llvm2cprover",
@@ -231,7 +236,7 @@ def translate_test(
                     "--input-format",
                     "ll",
                     *contract_flags,
-                    *test.translator_flags,
+                    *translator_flags,
                     "-o",
                     str(goto_path),
                 ],
@@ -250,16 +255,49 @@ def translate_test(
         args,
         goto_path,
         contract_flags,
-        test.translator_flags,
+        translator_flags,
     )
 
 
-def run_cbmc(test: TestCase, args: argparse.Namespace, goto_path: Path) -> subprocess.CompletedProcess[str]:
+def run_cbmc(
+    test: TestCase, args: argparse.Namespace, goto_path: Path, extra: tuple[str, ...]
+) -> subprocess.CompletedProcess[str]:
     command = [args.cbmc, str(goto_path)]
     if test.entry:
         command.extend(["--function", test.entry])
     command.extend(test.cbmc_flags)
+    command.extend(extra)
     return run_command(command, cwd=ROOT)
+
+
+def run_esbmc(test: TestCase, args: argparse.Namespace, goto_path: Path) -> subprocess.CompletedProcess[str]:
+    # Without a CBMC-generated `__CPROVER__start`, ESBMC needs the entry point spelled out.
+    command = [args.esbmc_bin, "--binary", str(goto_path), "--function", test.entry or "main"]
+    command.extend(esbmc_flags(test.cbmc_flags))
+    return run_command(command, cwd=ROOT)
+
+
+def esbmc_flags(cbmc_flags: tuple[str, ...]) -> list[str]:
+    """Map CBMC options to ESBMC's. CBMC's standard checks are ESBMC's defaults plus these."""
+    standard = ["--overflow-check", "--ub-shift-check"]
+    flags = []
+    remaining = iter(cbmc_flags)
+    for flag in remaining:
+        if flag == "--unwind":
+            flags += [flag, next(remaining)]
+        elif flag == "--no-standard-checks":
+            standard = ["--no-bounds-check", "--no-pointer-check", "--no-div-by-zero-check"]
+        elif flag == "--pointer-check":
+            standard.remove("--no-pointer-check")
+        elif flag == "--memory-leak-check":
+            flags.append(flag)
+        elif flag != "--unwinding-assertions":  # ESBMC's default, as CBMC's
+            raise ValueError(f"no ESBMC equivalent for CBMC option {flag}")
+    return standard + flags
+
+
+def property_results(output: str) -> dict[str, str]:
+    return dict(re.findall(r"^\[(\S+)\] .*: (SUCCESS|FAILURE|UNKNOWN)$", output, re.MULTILINE))
 
 
 def selected_enforcement(test: TestCase) -> str | None:
@@ -372,12 +410,53 @@ def run_test(test: TestCase, args: argparse.Namespace) -> RunResult:
     if test.skip:
         summary = test.skip_reason or "skipped"
         return RunResult(True, (summary,), skipped=True)
+    if args.esbmc and "--enforce-contract" in test.translator_flags:
+        return RunResult(True, ("contract enforcement needs CBMC's DFCC",), skipped=True)
+    if args.esbmc and test.esbmc_skip:
+        return RunResult(True, (test.esbmc_skip,), skipped=True)
     goto_path = test.path.with_suffix(".goto")
-    tool, translate = translate_test(test, args, goto_path)
+    mode_flags: tuple[str, ...] = ()
+    if args.esbmc:
+        mode_flags = ("--esbmc",)
+    elif args.goto_convert:
+        mode_flags = ("--goto-convert",)
+    tool, translate = translate_test(test, args, goto_path, mode_flags)
     if test.expected == "TRANSLATION FAILED":
         return expect_translation_failure(translate)
     if translate.returncode != 0:
         return RunResult(False, command_details(tool, translate))
+    if args.esbmc:
+        esbmc = run_esbmc(test, args, goto_path)
+        output = merge_outputs(esbmc.stdout, esbmc.stderr)
+        # ESBMC verifies bodiless functions vacuously; a missing body must fail the test.
+        vacuous = "no body for function" in output or "no entry point to bridge" in output
+        if esbmc.returncode not in {0, 1} or vacuous or test.expected not in output:
+            return RunResult(False, command_details("esbmc", esbmc))
+        return RunResult(True)
+    # DFCC's instrumented output fails validation even for CBMC's own conversion.
+    validate = args.goto_convert and selected_enforcement(test) is None
+    tool, cbmc = verify_cbmc(test, args, goto_path, ("--validate-goto-model",) if validate else ())
+    if not verified(tool, cbmc) or test.expected not in merge_outputs(cbmc.stdout, cbmc.stderr):
+        return RunResult(False, command_details(tool, cbmc))
+    if args.goto_convert:
+        # Differential check: CBMC's own conversion of the symbol-table-only output is the oracle.
+        reference_path = test.path.with_suffix(".symtab.goto")
+        tool, reference = translate_test(test, args, reference_path)
+        if reference.returncode == 0:
+            tool, reference = verify_cbmc(test, args, reference_path, ())
+        if not verified(tool, reference):
+            return RunResult(False, command_details(tool, reference))
+        expected, actual = property_results(reference.stdout), property_results(cbmc.stdout)
+        if expected != actual:
+            diff = sorted(set(expected.items()) ^ set(actual.items()))
+            return RunResult(False, (f"property results differ (reference ^ converted): {diff}",))
+    return RunResult(True)
+
+
+def verify_cbmc(
+    test: TestCase, args: argparse.Namespace, goto_path: Path, extra: tuple[str, ...]
+) -> tuple[str, subprocess.CompletedProcess[str]]:
+    """Run CBMC on `goto_path`, after DFCC instrumentation when the test enforces a contract."""
     verification_path = goto_path
     enforcement = selected_enforcement(test)
     if enforcement is not None:
@@ -385,14 +464,12 @@ def run_test(test: TestCase, args: argparse.Namespace) -> RunResult:
             test, args, goto_path, enforcement
         )
         if instrumented.returncode != 0:
-            return RunResult(False, command_details(tool, instrumented))
-    cbmc = run_cbmc(test, args, verification_path)
-    if cbmc.returncode not in {0, 10}:
-        return RunResult(False, command_details("cbmc", cbmc))
-    output = "\n".join(part for part in (cbmc.stdout, cbmc.stderr) if part)
-    if test.expected in output:
-        return RunResult(True)
-    return RunResult(False, command_details("cbmc", cbmc))
+            return (tool, instrumented)
+    return ("cbmc", run_cbmc(test, args, verification_path, extra))
+
+
+def verified(tool: str, result: subprocess.CompletedProcess[str]) -> bool:
+    return tool == "cbmc" and result.returncode in {0, 10}
 
 
 def parse_args() -> argparse.Namespace:
@@ -407,6 +484,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cbmc", default="cbmc")
     parser.add_argument("--goto-cc", default="goto-cc")
     parser.add_argument("--goto-instrument", default="goto-instrument")
+    parser.add_argument("--esbmc-bin", default="esbmc")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--goto-convert",
+        action="store_true",
+        help="translate with --goto-convert and check CBMC results against CBMC's own conversion",
+    )
+    mode.add_argument("--esbmc", action="store_true", help="translate with --esbmc and verify with ESBMC")
     return parser.parse_args()
 
 
@@ -428,8 +513,7 @@ def main() -> int:
         status = "ok" if result.ok else "not ok"
         suffix = ""
         if result.skipped:
-            reason = test.skip_reason or "skipped"
-            suffix = f" # SKIP {reason}"
+            suffix = f" # SKIP {result.details[0]}"
         elif test.todo:
             suffix = f" # TODO {test.todo}"
         print(f"{status} {index} - {test.label}{suffix}", flush=True)

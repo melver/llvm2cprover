@@ -10,7 +10,7 @@
 //! 3. reject truly module-level unsupported constructs
 //! 4. build the symbol table and lower bodies
 //! 5. attach native contract metadata
-//! 6. serialize the final GOTO program
+//! 6. optionally goto-convert the bodies, and serialize the final GOTO program
 //!
 //! Unsupported-feature detection is intentionally distributed across the
 //! lowering code instead of maintained as a separate validator. That keeps the
@@ -24,7 +24,7 @@ use std::{fs, io::Read};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use cprover_bindings::goto_program::Location;
-use cprover_bindings::irep::goto_binary_serde::write_goto_binary_file;
+use cprover_bindings::irep::goto_binary_serde::write_goto_binary_file_with_functions;
 use inkwell::context::Context;
 use inkwell::llvm_sys::LLVMAtomicOrdering;
 use inkwell::llvm_sys::core::{
@@ -48,6 +48,7 @@ use crate::{Config, InputFormat};
 mod asm_manifest;
 mod fp_dispatch;
 pub mod globals;
+mod goto_convert;
 pub mod instructions;
 mod rename;
 mod report;
@@ -281,7 +282,12 @@ impl Translator {
             symbols.lookup_mut("free").expect("builtin free").name = UNUSED_FREE.into();
         }
         symbols::add_missing_parameter_symbols(&mut symbols);
-        write_goto_binary_file(output.as_path(), &symbols);
+        let functions = if self.config.goto_convert {
+            goto_convert::convert(&symbols)?
+        } else {
+            Vec::new()
+        };
+        write_goto_binary_file_with_functions(output.as_path(), &symbols, &functions);
         if let Some(path) = self.config.report.as_deref() {
             report::write_report(
                 path,

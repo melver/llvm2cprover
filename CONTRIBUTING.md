@@ -41,6 +41,11 @@ End-to-end tests live under `tests/<category>/` as standalone `.c`, `.cc`,
 llvm2cprover, runs CBMC, and checks the outcome against `expected`. Output is
 TAP. Run with `make test-e2e`.
 
+`make test-e2e-goto-convert` translates with `--goto-convert` and additionally
+requires CBMC's per-property results to match those of CBMC's own conversion.
+`make test-e2e-esbmc` verifies with ESBMC instead; `esbmc_skip = "reason"`
+skips a test there, and contract-enforcement tests are skipped automatically.
+
 ### Fuzzing (Optional)
 
 `tests/fuzz/csmith.py` differentially fuzzes the translator with

@@ -2,6 +2,7 @@
 ; description = "constant-expression float bitcasts reinterpret the bits, like the instruction"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
+; esbmc_skip = "ESBMC mis-evaluates byte_extract of NaN"
 ; ---
 ;
 ; LLVM cannot fold a bitcast of a global's address, so it stays a constant expression.

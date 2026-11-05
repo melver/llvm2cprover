@@ -2,6 +2,7 @@
 ; description = "dynamic alloca lowers as an exact variable-length stack object"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
+; esbmc_skip = "ESBMC gives a wrong verdict on the VLA bound"
 ; ---
 
 @.msg = private unnamed_addr constant [4 x i8] c"vla\00"

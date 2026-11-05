@@ -2,6 +2,7 @@
 ; description = "llvm.bitreverse reverses the bit order of iN values"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
+; esbmc_skip = "ESBMC gives a wrong verdict"
 ; ---
 ;
 ; Csmith seed 813 (-O2) emits `llvm.bitreverse.i1`.

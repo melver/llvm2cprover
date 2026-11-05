@@ -2,6 +2,7 @@
 ; description = "llvm.powi lowers to CBMC's __builtin_powi(f) with a signed exponent of any width"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
+; esbmc_skip = "ESBMC has no __builtin_powi models for CBMC binaries"
 ; ---
 ;
 ; CBMC's powi model is exact only on its special cases, so only those are asserted. Zero to a

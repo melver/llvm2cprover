@@ -3,6 +3,7 @@
 ; expected = "VERIFICATION FAILED"
 ; entry = "main"
 ; cbmc_flags = ["--no-standard-checks", "--pointer-check"]
+; esbmc_skip = "ESBMC misses the out-of-bounds access"
 ; ---
 
 declare i64 @__CPROVER_nondet_ulong()

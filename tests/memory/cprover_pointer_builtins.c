@@ -2,6 +2,7 @@
 // description = "CBMC pointer builtins lower to their expressions instead of bodiless calls"
 // expected = "VERIFICATION SUCCESSFUL"
 // entry = "main"
+// esbmc_skip = "ESBMC's CBMC adapter lacks is_dynamic_object"
 // ---
 //
 // CBMC's C typechecker turns these into expressions; through LLVM they arrive as calls and

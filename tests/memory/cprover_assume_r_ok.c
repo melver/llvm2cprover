@@ -2,6 +2,7 @@
 // description = "an assumed CBMC pointer builtin constrains later checks"
 // expected = "VERIFICATION SUCCESSFUL"
 // entry = "main"
+// esbmc_skip = "ESBMC mis-models __CPROVER_r_ok"
 // ---
 //
 // With the builtin as a bodiless nondet call, the assumption would constrain nothing.

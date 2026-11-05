@@ -4,6 +4,7 @@
 // entry = "main"
 // clang_flags = ["-pthread"]
 // cbmc_flags = ["--no-standard-checks"]
+// esbmc_skip = "ESBMC has no pthread models for CBMC binaries"
 // ---
 
 #include <pthread.h>

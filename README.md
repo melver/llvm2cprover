@@ -136,6 +136,21 @@ plain `model`; candidates with `requires`/`ensures` contracts are rejected.
 Group members are module function names after `--rename-prefix`, and a name
 that is not a function in the module is an error.
 
+### ESBMC and goto-conversion
+
+By default the `.goto` file holds structured function bodies in its symbol
+table, which CBMC (and `goto-cc`) goto-convert on load. `--goto-convert` also
+emits the converted instruction lists, which other consumers require; CBMC
+then uses them as they are. `--esbmc` implies `--goto-convert` for
+[ESBMC](https://github.com/esbmc/esbmc) (8.x or later reads CBMC binaries) and
+rejects `--enforce-contract`, whose frame checking needs CBMC's DFCC pass.
+ESBMC needs the entry point named explicitly:
+
+```sh
+llvm2cprover --esbmc example.bc -o example.goto
+esbmc --binary example.goto --function main
+```
+
 ## Soundness and limitations
 
 Translation fails when llvm2cprover cannot preserve the semantics of an LLVM
