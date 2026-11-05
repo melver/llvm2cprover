@@ -500,8 +500,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             _ => (false, false),
         };
         // Integer promotion makes most C `nsw` provably non-wrapping; check only the rest.
-        let nsw = nsw && analysis::may_wrap(instruction, true);
-        let nuw = nuw && analysis::may_wrap(instruction, false);
+        let (may_nsw, may_nuw) = if nsw || nuw {
+            analysis::may_wrap(instruction)
+        } else {
+            (false, false)
+        };
+        let (nsw, nuw) = (nsw && may_nsw, nuw && may_nuw);
         let value = match opcode {
             InstructionOpcode::Add
             | InstructionOpcode::Sub
