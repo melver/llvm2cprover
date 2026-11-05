@@ -2548,14 +2548,16 @@ mod tests {
         assert!(scalar_debug.contains("Lshr"));
         assert!(scalar_debug.contains("Ashr"));
         assert!(scalar_debug.contains("IntConstant(32)"));
-        assert!(scalar_debug.contains("Nondet"));
+        // An out-of-range distance is `poison`: a fresh local, not a `nondet` side effect.
+        assert!(scalar_debug.contains("scalar_shifts::$poison::poison"));
+        assert!(!scalar_debug.contains("Nondet"));
 
         let vector_debug = stmt_debug(&symbols, "vector_shifts");
         assert!(vector_debug.contains("Vector"));
         assert!(vector_debug.contains("Shl"));
         assert!(vector_debug.contains("Lshr"));
         assert!(vector_debug.contains("Ashr"));
-        assert!(vector_debug.contains("Nondet"));
+        assert!(vector_debug.contains("vector_shifts::$poison::poison"));
     }
 
     #[test]

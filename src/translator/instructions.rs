@@ -17,6 +17,7 @@
 //! Unsupported instructions fail where they are encountered, which keeps
 //! diagnostics specific and avoids a second feature-classification pass.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
@@ -129,6 +130,11 @@ struct FunctionLowerer<'a, 'ctx, 'c> {
     aggregates: HashMap<usize, Vec<Expr>>,
     prologue: Vec<Stmt>,
     next_tmp: usize,
+    /// Fresh `poison` locals handed out by [`Self::poison`], declared before the instruction
+    /// whose lowering uses them.
+    poison: RefCell<Vec<(String, Type)>>,
+    /// Number of `poison` locals created in this function, for unique names.
+    poison_count: Cell<usize>,
     // Stack of (stacksave value-ref key, VLA slot exprs allocated since that save).
     // Innermost active save is last; stackrestore pops up to its matching entry and
     // emits Stmt::dead for each tracked VLA slot.
@@ -168,6 +174,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             aggregates: HashMap::new(),
             prologue: Vec::new(),
             next_tmp: 0,
+            poison: RefCell::new(Vec::new()),
+            poison_count: Cell::new(0),
             stack_saves: Vec::new(),
         }
     }
@@ -292,6 +300,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         // collect the prologue after visiting every block. Otherwise recursive calls reuse one
         // symbol object instead of getting a fresh DECL per activation record.
         let mut prologue = std::mem::take(&mut self.prologue);
+        // `poison` from lowering outside an instruction (none is expected) lives per call.
+        let end = prologue.len();
+        self.declare_poison(&mut prologue, end, self.function_location());
         prologue.extend(body);
 
         self.symbols.update_fn_declaration_with_definition(
@@ -323,7 +334,9 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             if instruction.get_opcode() == InstructionOpcode::Phi {
                 continue;
             }
+            let start = body.len();
             self.lower_instruction(instruction, &mut body)?;
+            self.declare_poison(&mut body, start, self.instruction_location(instruction));
         }
         self.current_block = None;
         Ok(Stmt::block(body, self.block_location(block)).with_label(self.block_label(block)?))
@@ -593,7 +606,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             });
         }
         Ok(match wraps {
-            Some(wraps) => wraps.ternary(util::nondet_expr(value.typ().clone()), value),
+            Some(wraps) => wraps.ternary(self.poison(value.typ().clone()), value),
             None => value,
         })
     }
@@ -673,7 +686,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .cast_to(target.clone()),
             _ => unreachable!("shift opcode dispatched incorrectly"),
         };
-        Ok(in_range.ternary(shifted, util::nondet_expr(target)))
+        Ok(in_range.ternary(shifted, self.poison(target)))
     }
 
     fn lower_branch(
@@ -1342,7 +1355,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let in_range = above_lo.and(value.clone().lt(float(hi)));
         Ok(in_range.ternary(
             value.cast_to(int).cast_to(target.clone()),
-            util::nondet_expr(target.clone()),
+            self.poison(target.clone()),
         ))
     }
 
@@ -2770,7 +2783,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 value.cttz(true)
             };
             if zero_is_poison {
-                is_zero.ternary(util::nondet_expr(count.typ().clone()), count)
+                is_zero.ternary(self.poison(count.typ().clone()), count)
             } else {
                 count
             }
@@ -2794,7 +2807,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .ternary(neg.clone(), value.clone());
             if int_min_is_poison {
                 let is_min = neg.eq(value.clone()).and(value.neq(zero));
-                is_min.ternary(util::nondet_expr(abs.typ().clone()), abs)
+                is_min.ternary(self.poison(abs.typ().clone()), abs)
             } else {
                 abs
             }
@@ -4196,7 +4209,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         // undef in a function body means "any value" — unlike global undef which
         // follows C static-storage zero-init (handled in GlobalLowerer).
         if unsafe { LLVMIsUndef(value.as_value_ref()) } != 0 {
-            return Ok(util::nondet_expr(typ));
+            return Ok(self.poison(typ));
         }
         self.globals
             .lower_initializer(
@@ -4413,6 +4426,39 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         self.prologue.push(Stmt::decl(expr.clone(), None, location));
         self.values.insert(key, expr.clone());
         Ok(expr)
+    }
+
+    /// A fresh unconstrained value for `poison`, e.g. in `wraps ? poison : value`.
+    ///
+    /// It is a local declared right before the instruction (see [`Self::declare_poison`]), so
+    /// every execution sees a new value, rather than a `nondet` side effect: CBMC's goto-convert
+    /// splits a `?:` with a side effect in a branch into control flow, which symex then has to
+    /// fork and merge for every such operation.
+    fn poison(&self, typ: Type) -> Expr {
+        let index = self.poison_count.replace(self.poison_count.get() + 1);
+        // Sanitized LLVM names never contain `::`, so this cannot collide with them.
+        let name = format!("{}::$poison::poison{index}", self.function_name);
+        self.poison.borrow_mut().push((name.clone(), typ.clone()));
+        Expr::symbol_expression(name, typ)
+    }
+
+    /// Declare the locals [`Self::poison`] handed out at `body[start]`, where the lowering of the
+    /// instruction that uses them begins.
+    fn declare_poison(&mut self, body: &mut Vec<Stmt>, start: usize, location: Location) {
+        let decls = std::mem::take(self.poison.get_mut())
+            .into_iter()
+            .map(|(name, typ)| {
+                let base = name.rsplit("::").next().unwrap_or_default().to_owned();
+                let symbol = Symbol::variable(name, base, typ, location)
+                    .with_is_hidden(true)
+                    .with_is_state_var(false)
+                    .with_is_static_lifetime(false);
+                let expr = symbol.to_expr().with_location(location);
+                self.symbols.insert(symbol);
+                Stmt::decl(expr, None, location)
+            });
+        let decls: Vec<Stmt> = decls.collect();
+        body.splice(start..start, decls);
     }
 
     fn declare_hidden_local(&mut self, stem: &str, typ: Type, location: Location) -> Expr {
