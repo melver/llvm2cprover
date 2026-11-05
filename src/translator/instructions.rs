@@ -671,9 +671,22 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     ) -> Result<Expr> {
         let width = self.integer_width(&target)?;
         let lhs = lhs.cast_to(target.clone());
+        // A constant count needs no guard: the shift is either always defined or always poison.
+        // (A negative constant is a count of a signed type; leave it to the guard.)
+        let constant = rhs
+            .int_constant_value()
+            .filter(|count| *count >= BigInt::from(0u8))
+            .map(|count| count < BigInt::from(width));
         let rhs = rhs.cast_to(target.clone());
-        let in_range = rhs.clone().lt(Expr::int_constant(width, target.clone()));
-        let clamped_rhs = in_range.clone().ternary(rhs, target.zero());
+        let in_range = match constant {
+            Some(false) => return Ok(self.poison(target)),
+            Some(true) => None,
+            None => Some(rhs.clone().lt(Expr::int_constant(width, target.clone()))),
+        };
+        let clamped_rhs = match &in_range {
+            Some(in_range) => in_range.clone().ternary(rhs, target.zero()),
+            None => rhs,
+        };
         let shifted = match opcode {
             InstructionOpcode::Shl => {
                 let shifted = lhs.clone().shl(clamped_rhs.clone());
@@ -686,7 +699,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .cast_to(target.clone()),
             _ => unreachable!("shift opcode dispatched incorrectly"),
         };
-        Ok(in_range.ternary(shifted, self.poison(target)))
+        Ok(match in_range {
+            Some(in_range) => in_range.ternary(shifted, self.poison(target)),
+            None => shifted,
+        })
     }
 
     fn lower_branch(
