@@ -14,11 +14,12 @@ use inkwell::llvm_sys::LLVMOpcode;
 use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
     LLVMConstIntGetSExtValue, LLVMConstIntGetZExtValue, LLVMConstNull, LLVMCountIncoming,
-    LLVMGetAggregateElement, LLVMGetCalledValue, LLVMGetElementType, LLVMGetIncomingValue,
-    LLVMGetInstructionOpcode, LLVMGetIntTypeWidth, LLVMGetIntrinsicID, LLVMGetOperand,
-    LLVMGetTypeKind, LLVMGetVectorSize, LLVMIsAConstantAggregateZero, LLVMIsAConstantDataVector,
-    LLVMIsAConstantInt, LLVMIsAConstantVector, LLVMIsAFunction, LLVMIsAInstruction,
-    LLVMLookupIntrinsicID, LLVMTypeOf,
+    LLVMGetAggregateElement, LLVMGetCalledValue, LLVMGetConstOpcode, LLVMGetElementType,
+    LLVMGetIncomingValue, LLVMGetInstructionOpcode, LLVMGetIntTypeWidth, LLVMGetIntrinsicID,
+    LLVMGetOperand, LLVMGetTypeKind, LLVMGetVectorSize, LLVMIsAAllocaInst,
+    LLVMIsAConstantAggregateZero, LLVMIsAConstantDataVector, LLVMIsAConstantExpr,
+    LLVMIsAConstantInt, LLVMIsAConstantVector, LLVMIsAFunction, LLVMIsAGlobalVariable,
+    LLVMIsAInstruction, LLVMLookupIntrinsicID, LLVMTypeOf,
 };
 use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::values::{AsValueRef, InstructionValue};
@@ -103,6 +104,40 @@ pub(super) fn may_wrap(instruction: InstructionValue<'_>) -> (bool, bool) {
     };
     // `exact` holds the parts of the mathematically exact result that fit `width`.
     (exact.signed.is_none(), exact.unsigned.is_none())
+}
+
+/// Whether pointers `a` and `b` provably point into different objects: each is derived (through
+/// GEPs and casts) from a distinct `alloca` or global variable. `false` when that is unknown.
+pub(super) fn distinct_objects(a: LLVMValueRef, b: LLVMValueRef) -> bool {
+    match (underlying_object(a), underlying_object(b)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
+/// The `alloca` or global variable `pointer` is derived from by GEPs and casts, if any.
+fn underlying_object(mut pointer: LLVMValueRef) -> Option<LLVMValueRef> {
+    for _ in 0..MAX_DEPTH {
+        unsafe {
+            if !LLVMIsAAllocaInst(pointer).is_null() || !LLVMIsAGlobalVariable(pointer).is_null() {
+                return Some(pointer);
+            }
+            let opcode = if !LLVMIsAInstruction(pointer).is_null() {
+                LLVMGetInstructionOpcode(pointer)
+            } else if !LLVMIsAConstantExpr(pointer).is_null() {
+                LLVMGetConstOpcode(pointer)
+            } else {
+                return None;
+            };
+            match opcode {
+                LLVMOpcode::LLVMGetElementPtr
+                | LLVMOpcode::LLVMBitCast
+                | LLVMOpcode::LLVMAddrSpaceCast => pointer = LLVMGetOperand(pointer, 0),
+                _ => return None,
+            }
+        }
+    }
+    None
 }
 
 /// Widest integer the analysis models (ranges are `i128`/`u128`).
@@ -659,7 +694,10 @@ mod tests {
     use inkwell::context::Context;
     use inkwell::memory_buffer::MemoryBuffer;
 
-    use super::{loop_contiguous_order, may_wrap};
+    use inkwell::llvm_sys::core::LLVMGetOperand;
+    use inkwell::values::AsValueRef;
+
+    use super::{distinct_objects, loop_contiguous_order, may_wrap};
 
     /// `may_wrap` (signed, unsigned) for each named instruction of `@f` in `ir`.
     fn wraps(ir: &str) -> Vec<(String, bool, bool)> {
@@ -694,6 +732,49 @@ mod tests {
             .map(|&(n, s, u)| (n.to_owned(), s, u))
             .collect();
         assert_eq!(wraps(&ir), expected);
+    }
+
+    /// `distinct_objects` for the destination and source of each `memcpy` in `@f`, in order.
+    fn distinct(body: &str) -> Vec<bool> {
+        let ir = format!(
+            "@g = global [8 x i8] zeroinitializer\n@h = global [8 x i8] zeroinitializer\n\
+             declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\
+             define void @f(ptr %p, ptr %q) {{\n{body}\n  ret void\n}}\n"
+        );
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "test");
+        let module = context.create_module_from_ir(buffer).expect("valid IR");
+        let function = module.get_function("f").expect("@f");
+        function
+            .get_basic_blocks()
+            .into_iter()
+            .flat_map(|block| block.get_instructions())
+            .filter(|i| i.get_opcode() == inkwell::values::InstructionOpcode::Call)
+            .map(|i| unsafe {
+                let call = i.as_value_ref();
+                distinct_objects(LLVMGetOperand(call, 0), LLVMGetOperand(call, 1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn memcpy_objects() {
+        let copy = |dst: &str, src: &str| {
+            format!("  call void @llvm.memcpy.p0.p0.i64(ptr {dst}, ptr {src}, i64 4, i1 false)\n")
+        };
+        let body = [
+            "  %a = alloca [8 x i8]\n  %b = alloca [8 x i8]\n".to_owned(),
+            "  %a4 = getelementptr i8, ptr %a, i64 4\n".to_owned(),
+            copy("%a", "%b"),
+            copy("%a4", "@g"),
+            copy("getelementptr (i8, ptr @g, i64 4)", "@h"),
+            // The same object (possibly overlapping), or a pointer of unknown origin.
+            copy("%a", "%a4"),
+            copy("%p", "%b"),
+            copy("%p", "%q"),
+        ]
+        .concat();
+        assert_eq!(distinct(&body), [true, true, true, false, false, false]);
     }
 
     #[test]

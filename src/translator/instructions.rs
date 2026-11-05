@@ -2662,12 +2662,18 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             // LLVM allows `src == dst` (clang emits it for `*p = *p;`), while C `memcpy` forbids
             // any overlap. Guard the call so the equal case is the no-op LLVM promises, without
             // lowering to `memmove`, which would also accept the partial overlap LLVM forbids.
+            // Distinct objects cannot be equal, so they need no guard (and no branch).
             let [dst, src, _, ..] = args else {
                 return Err(self
                     .unsupported_intrinsic(callee_name, "missing memcpy operands")
                     .with_location(loc)
                     .into());
             };
+            let operand = |i| unsafe { LLVMGetOperand(instruction.as_value_ref(), i) };
+            if analysis::distinct_objects(operand(0), operand(1)) {
+                self.lower_builtin_call(BuiltinFn::Memcpy, &args[..3], instruction, body)?;
+                return Ok(true);
+            }
             let neq = self.lower_scalar_icmp_value(IntPredicate::NE, dst.clone(), src.clone())?;
             let mut call = vec![];
             self.lower_builtin_call(BuiltinFn::Memcpy, &args[..3], instruction, &mut call)?;

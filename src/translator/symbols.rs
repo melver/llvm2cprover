@@ -2561,6 +2561,32 @@ mod tests {
     }
 
     #[test]
+    fn memcpy_between_distinct_objects_needs_no_guard() {
+        let symbols = build_symbols_from_ir(
+            br#"
+            @g = global [4 x i32] zeroinitializer
+            declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+
+            define void @distinct() {
+            entry:
+              %a = alloca [4 x i32]
+              call void @llvm.memcpy.p0.p0.i64(ptr %a, ptr @g, i64 16, i1 false)
+              ret void
+            }
+
+            define void @unknown(ptr %p) {
+            entry:
+              call void @llvm.memcpy.p0.p0.i64(ptr %p, ptr @g, i64 16, i1 false)
+              ret void
+            }
+        "#,
+        );
+        // `dst != src` guards the call only when the operands may be the same object.
+        assert!(!stmt_debug(&symbols, "distinct").contains("Ifthenelse"));
+        assert!(stmt_debug(&symbols, "unknown").contains("Ifthenelse"));
+    }
+
+    #[test]
     fn adds_parameter_symbols_for_bodiless_functions() {
         let mut symbols = build_symbols_from_ir(
             br#"
