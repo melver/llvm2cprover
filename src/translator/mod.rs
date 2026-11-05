@@ -45,6 +45,7 @@ use crate::contracts;
 use crate::util;
 use crate::{Config, InputFormat};
 
+mod analysis;
 mod asm_manifest;
 mod fp_dispatch;
 pub mod globals;
