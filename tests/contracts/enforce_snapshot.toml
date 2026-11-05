@@ -2,6 +2,7 @@
 # Copyright 2026 The llvm2cprover Authors
 
 [functions.increment]
+requires = "requires_increment"
 snapshot = "snapshot_increment"
 ensures = "ensures_increment"
 assigns = ["assigns_increment"]

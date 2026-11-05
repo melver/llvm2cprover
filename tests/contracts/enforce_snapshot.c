@@ -8,6 +8,8 @@
 
 int value;
 
+// `++value` is signed overflow (UB, poison in LLVM) at INT_MAX, so the contract excludes it.
+int requires_increment(void) { return value < __INT_MAX__; }
 int increment(void) { return ++value; }
 
 int snapshot_increment(void) { return value; }

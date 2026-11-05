@@ -32,10 +32,10 @@ use inkwell::attributes::AttributeLoc;
 use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::core::{
     LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
-    LLVMGetMaskValue, LLVMGetNormalDest, LLVMGetNumArgOperands, LLVMGetNumClauses,
-    LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetSuccessor,
-    LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantDataSequential, LLVMIsAConstantExpr,
-    LLVMIsAGlobalVariable, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
+    LLVMGetMaskValue, LLVMGetNSW, LLVMGetNUW, LLVMGetNormalDest, LLVMGetNumArgOperands,
+    LLVMGetNumClauses, LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetOperand,
+    LLVMGetSuccessor, LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantDataSequential,
+    LLVMIsAConstantExpr, LLVMIsAGlobalVariable, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
 };
 use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
@@ -475,6 +475,16 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let result = self.declare_instruction_result(instruction)?;
         let target = result.typ().clone();
         let opcode = instruction.get_opcode();
+        let (nsw, nuw) = match opcode {
+            InstructionOpcode::Add
+            | InstructionOpcode::Sub
+            | InstructionOpcode::Mul
+            | InstructionOpcode::Shl => unsafe {
+                let value = instruction.as_value_ref();
+                (LLVMGetNSW(value) != 0, LLVMGetNUW(value) != 0)
+            },
+            _ => (false, false),
+        };
         let value = match opcode {
             InstructionOpcode::Add
             | InstructionOpcode::Sub
@@ -484,9 +494,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             | InstructionOpcode::SDiv
             | InstructionOpcode::SRem => {
                 let (lhs, rhs) = (lhs.cast_to(target.clone()), rhs.cast_to(target.clone()));
+                let signed = matches!(opcode, InstructionOpcode::SDiv | InstructionOpcode::SRem);
                 let arith = |lhs: Expr, rhs: Expr| -> Result<Expr> {
-                    if !matches!(opcode, InstructionOpcode::SDiv | InstructionOpcode::SRem) {
-                        return Ok(Self::int_arith(opcode, lhs, rhs));
+                    if !signed {
+                        let value = Self::int_arith(opcode, lhs.clone(), rhs.clone());
+                        return self.poison_on_wrap(opcode, nsw, nuw, lhs, rhs, value);
                     }
                     let typ = lhs.typ().clone();
                     let (lhs, rhs) = (self.signed_view(lhs)?, self.signed_view(rhs)?);
@@ -497,11 +509,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                     }
                     .cast_to(typ))
                 };
-                let signed = matches!(opcode, InstructionOpcode::SDiv | InstructionOpcode::SRem);
                 // GOTO cannot cast a vector as a whole to a 1-bit (`<N x i1>`) or signed lane
-                // type, so go lane by lane.
+                // type, and overflow predicates are scalar, so go lane by lane.
                 if let Some(lane) = target.base_type().filter(|_| target.is_vector())
-                    && (signed || lane.is_c_bool())
+                    && (signed || nsw || nuw || lane.is_c_bool())
                 {
                     self.map_lanes(&target, |i| {
                         arith(
@@ -530,12 +541,57 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .cast_to(target.clone())
                 .bitxor(rhs.cast_to(target.clone())),
             InstructionOpcode::Shl | InstructionOpcode::LShr | InstructionOpcode::AShr => {
-                self.lower_shift_value(opcode, lhs, rhs, target)?
+                self.lower_shift_value(opcode, nsw, nuw, lhs, rhs, target)?
             }
             _ => unreachable!("binary opcode dispatched incorrectly"),
         };
         body.push(Stmt::assign(result, value, loc));
         Ok(())
+    }
+
+    /// Replace `value`, the wrapping result of `lhs opcode rhs`, by nondet where an `nsw`/`nuw`
+    /// flag makes it `poison`: when the operation wraps in the signed/unsigned interpretation.
+    ///
+    /// Like other `poison`, this is not immediate UB (at `-O2`, clang hoists `mul nsw` above the
+    /// guard that discards its result), so lowering it to an assertion would raise false alarms.
+    fn poison_on_wrap(
+        &self,
+        opcode: InstructionOpcode,
+        nsw: bool,
+        nuw: bool,
+        lhs: Expr,
+        rhs: Expr,
+        value: Expr,
+    ) -> Result<Expr> {
+        let mut wraps: Option<Expr> = None;
+        for signed in [true, false]
+            .into_iter()
+            .filter(|&s| if s { nsw } else { nuw })
+        {
+            let int = self.int_type(lhs.typ(), signed)?;
+            let (l, r) = (lhs.clone().cast_to(int.clone()), rhs.clone().cast_to(int));
+            let wrap = match opcode {
+                InstructionOpcode::Add => l.add_overflow_p(r),
+                InstructionOpcode::Sub => l.sub_overflow_p(r),
+                InstructionOpcode::Mul => l.mul_overflow_p(r),
+                // `shl` wraps iff shifting `value` back does not recover `lhs` (with the sign bit
+                // for `nsw`); `value` itself was shifted unsigned, so no signed `<<` is checked.
+                InstructionOpcode::Shl => {
+                    let back = value.clone().cast_to(l.typ().clone());
+                    let back = if signed { back.ashr(r) } else { back.lshr(r) };
+                    back.neq(l)
+                }
+                _ => unreachable!("only add/sub/mul/shl carry nsw/nuw"),
+            };
+            wraps = Some(match wraps {
+                Some(wraps) => wraps.or(wrap),
+                None => wrap,
+            });
+        }
+        Ok(match wraps {
+            Some(wraps) => wraps.ternary(util::nondet_expr(value.typ().clone()), value),
+            None => value,
+        })
     }
 
     /// Integer `add`/`sub`/`mul`/`udiv`/`urem` on two scalars (or non-`i1` vectors) of one type.
@@ -571,6 +627,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     fn lower_shift_value(
         &self,
         opcode: InstructionOpcode,
+        nsw: bool,
+        nuw: bool,
         lhs: Expr,
         rhs: Expr,
         target: Type,
@@ -579,26 +637,32 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             Some(lane) if target.is_vector() => self.map_lanes(&target, |i| {
                 let lhs_lane = self.aggregate_component(lhs.clone(), i)?;
                 let rhs_lane = self.aggregate_component(rhs.clone(), i)?;
-                self.lower_scalar_shift_value(opcode, lhs_lane, rhs_lane, lane.clone())
+                self.lower_scalar_shift_value(opcode, nsw, nuw, lhs_lane, rhs_lane, lane.clone())
             }),
-            _ => self.lower_scalar_shift_value(opcode, lhs, rhs, target),
+            _ => self.lower_scalar_shift_value(opcode, nsw, nuw, lhs, rhs, target),
         }
     }
 
     fn lower_scalar_shift_value(
         &self,
         opcode: InstructionOpcode,
+        nsw: bool,
+        nuw: bool,
         lhs: Expr,
         rhs: Expr,
         target: Type,
     ) -> Result<Expr> {
         let width = self.integer_width(&target)?;
+        let lhs = lhs.cast_to(target.clone());
         let rhs = rhs.cast_to(target.clone());
         let in_range = rhs.clone().lt(Expr::int_constant(width, target.clone()));
         let clamped_rhs = in_range.clone().ternary(rhs, target.zero());
         let shifted = match opcode {
-            InstructionOpcode::Shl => lhs.cast_to(target.clone()).shl(clamped_rhs),
-            InstructionOpcode::LShr => lhs.cast_to(target.clone()).lshr(clamped_rhs),
+            InstructionOpcode::Shl => {
+                let shifted = lhs.clone().shl(clamped_rhs.clone());
+                self.poison_on_wrap(opcode, nsw, nuw, lhs, clamped_rhs, shifted)?
+            }
+            InstructionOpcode::LShr => lhs.lshr(clamped_rhs),
             InstructionOpcode::AShr => self
                 .signed_view(lhs)?
                 .ashr(clamped_rhs)

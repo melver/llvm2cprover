@@ -6,6 +6,8 @@
 // translator_flags = ["--enforce-contract", "increment"]
 // ---
 
+// `value + 1` is signed overflow (UB, poison in LLVM) at INT_MAX, so the contract excludes it.
+int requires_increment(int value) { return value < __INT_MAX__; }
 int increment(int value) { return value + 1; }
 
 int ensures_increment(int value, int result) { return result == value + 1; }
