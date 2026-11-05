@@ -1,5 +1,5 @@
 diff --git a/cprover_bindings/Cargo.toml b/cprover_bindings/Cargo.toml
-index 60362ad3e..7ab822071 100644
+index a810ffb14..f5854ecad 100644
 --- a/cprover_bindings/Cargo.toml
 +++ b/cprover_bindings/Cargo.toml
 @@ -26,5 +26,3 @@ rustc-hash = "2.1.1"
@@ -28,7 +28,7 @@ index a12014e90..6d6bd2217 100644
      /// A type that is only `!Send` because it contains types specific to a thread local [INTERNER]
      /// (e.g. [InternedString]s). This forces users to annotate that the types they want to wrap in [WithInterner]
 diff --git a/cprover_bindings/src/goto_program/expr.rs b/cprover_bindings/src/goto_program/expr.rs
-index 72c01338c..0c8a44723 100644
+index 3f04249cb..6693734b2 100644
 --- a/cprover_bindings/src/goto_program/expr.rs
 +++ b/cprover_bindings/src/goto_program/expr.rs
 @@ -98,11 +98,11 @@ pub enum ExprValue {
@@ -45,7 +45,7 @@ index 72c01338c..0c8a44723 100644
      /// `function(arguments)`
      FunctionCall {
          function: Expr,
-@@ -609,25 +609,23 @@ pub fn empty_union(typ: Type, st: &SymbolTable) -> Self {
+@@ -757,25 +757,23 @@ pub fn empty_union(typ: Type, st: &SymbolTable) -> Self {
      }
  
      /// `3.14f`
@@ -334,10 +334,10 @@ index b4b1179b4..1da366123 100644
  }
  
 diff --git a/cprover_bindings/src/irep/to_irep.rs b/cprover_bindings/src/irep/to_irep.rs
-index cd263e2a3..37d257ecb 100644
+index 5ae646571..8b92893cd 100644
 --- a/cprover_bindings/src/irep/to_irep.rs
 +++ b/cprover_bindings/src/irep/to_irep.rs
-@@ -265,7 +265,7 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
+@@ -266,7 +266,7 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
                  }
              }
              ExprValue::Float16Constant(i) => {
@@ -346,7 +346,7 @@ index cd263e2a3..37d257ecb 100644
                  Irep {
                      id: IrepId::Constant,
                      sub: vec![],
-@@ -273,7 +273,7 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
+@@ -274,7 +274,7 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
                  }
              }
              ExprValue::Float128Constant(i) => {
@@ -355,7 +355,7 @@ index cd263e2a3..37d257ecb 100644
                  Irep {
                      id: IrepId::Constant,
                      sub: vec![],
-@@ -720,6 +720,14 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
+@@ -790,6 +790,14 @@ fn to_irep(&self, mm: &MachineModel) -> Irep {
                      named_sub: linear_map![(IrepId::Size, size.to_irep(mm))],
                  }
              }

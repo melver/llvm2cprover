@@ -149,8 +149,10 @@ impl Function<'_> {
                 dest,
                 loop_invariants,
                 loop_modifies,
+                loop_decreases,
             } => {
-                if loop_invariants.is_some() || loop_modifies.is_some() {
+                if loop_invariants.is_some() || loop_modifies.is_some() || loop_decreases.is_some()
+                {
                     bail!("loop contracts on `goto {dest}` are not supported");
                 }
                 self.scope_closed = true;
