@@ -10,6 +10,7 @@ import argparse
 import fnmatch
 import re
 import subprocess
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 import tomllib
@@ -296,8 +297,31 @@ def esbmc_flags(cbmc_flags: tuple[str, ...]) -> list[str]:
     return standard + flags
 
 
-def property_results(output: str) -> dict[str, str]:
-    return dict(re.findall(r"^\[(\S+)\] .*: (SUCCESS|FAILURE|UNKNOWN)$", output, re.MULTILINE))
+# Classes of the checks CBMC's goto_check generates. Which duplicates it emits depends on where its
+# deduplication restarts, and CBMC's goto-convert splits `c ? nondet : v` into control flow that
+# restarts it, so these are compared by presence. Other properties come from the translator's own
+# assertions, which goto_check leaves alone, and are counted exactly.
+GOTO_CHECK_CLASSES = {
+    "array_bounds", "bit_count", "division-by-zero", "enum-range-check",
+    "float-division-by-zero", "memory-leak", "NaN", "overflow", "pointer",
+    "pointer_arithmetic", "pointer_dereference", "pointer_primitives", "undefined-shift",
+}
+
+
+def property_results(output: str) -> Counter[tuple[str, str, str]]:
+    # Property names carry per-function counters, which shift with any duplicate, so compare by
+    # name stem (function and class), location and description, and verdict.
+    results: Counter[tuple[str, str, str]] = Counter()
+    for name, what, status in re.findall(
+        r"^\[(\S+)\] (.*): (SUCCESS|FAILURE|UNKNOWN)$", output, re.MULTILINE
+    ):
+        stem = re.sub(r"\.\d+$", "", name)
+        key = (stem, what, status)
+        if stem.rsplit(".", 1)[-1] in GOTO_CHECK_CLASSES:
+            results[key] = 1
+        else:
+            results[key] += 1
+    return results
 
 
 def selected_enforcement(test: TestCase) -> str | None:
@@ -448,7 +472,7 @@ def run_test(test: TestCase, args: argparse.Namespace) -> RunResult:
             return RunResult(False, command_details(tool, reference))
         expected, actual = property_results(reference.stdout), property_results(cbmc.stdout)
         if expected != actual:
-            diff = sorted(set(expected.items()) ^ set(actual.items()))
+            diff = sorted(((expected - actual) + (actual - expected)).elements())
             return RunResult(False, (f"property results differ (reference ^ converted): {diff}",))
     return RunResult(True)
 

@@ -12,7 +12,10 @@
 //!   kills the locals of every block it leaves. Labels may only appear outside nested blocks,
 //!   and no top-level declaration may follow a label or `goto`, so CBMC's scope tree reduces to a
 //!   stack and a `goto` always leaves every nested block and never enters a scope.
-//! - `nondet` is the only side effect expressions may contain; CBMC would hoist any other.
+//! - `nondet` is the only side effect expressions may contain; CBMC would hoist any other. CBMC
+//!   also splits a `?:`, `&&` or `||` with a `nondet` operand into control flow through a
+//!   temporary; keeping it inline is equivalent (symex draws a fresh value per evaluation) but
+//!   can change how `goto_check` deduplicates later checks.
 //! - Bodiless callees that CBMC's conversion rewrites by name are lowered the same way or rejected
 //!   ([`is_cbmc_special_call`]), and SV-COMP's `__VERIFIER_atomic_*` function bodies are atomic.
 
@@ -381,7 +384,8 @@ impl Function<'_> {
     }
 }
 
-/// Whether CBMC's `clean_expr` would rewrite `irep` (`needs_cleaning`), leaving `nondet` alone.
+/// Whether CBMC's `clean_expr` would hoist a side effect out of `irep` (`needs_cleaning`). `nondet`
+/// stays in place, apart from the equivalent `?:`/`&&`/`||` split noted in the module docs.
 fn needs_cleaning(irep: &Irep) -> bool {
     let rewritten_side_effect = irep.id == IrepId::SideEffect
         && irep.lookup(IrepId::Statement).map(|s| &s.id) != Some(&IrepId::Nondet);
