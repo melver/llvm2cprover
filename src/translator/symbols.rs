@@ -1647,10 +1647,11 @@ mod tests {
 
         let debug = stmt_debug(&symbols, "f");
         assert!(debug.contains("FunctionCall"));
-        assert!(debug.contains("memcpy"));
-        // LLVM permits `dst == src`; C `memcpy` does not, so the call must be guarded.
-        assert!(debug.contains("Ifthenelse"));
-        assert!(debug.contains("Notequal"));
+        // LLVM permits `dst == src`; C `memcpy` does not. Only partial overlap is asserted, and
+        // the copy is CBMC's `memmove`, without a branch on `dst != src`.
+        assert!(debug.contains("memmove"));
+        assert!(debug.contains("memcpy src/dst overlap"));
+        assert!(!debug.contains("Ifthenelse"));
     }
 
     #[test]
@@ -2579,32 +2580,6 @@ mod tests {
         assert!(vector_debug.contains("Lshr"));
         assert!(vector_debug.contains("Ashr"));
         assert!(vector_debug.contains("vector_shifts::$poison::poison"));
-    }
-
-    #[test]
-    fn memcpy_between_distinct_objects_needs_no_guard() {
-        let symbols = build_symbols_from_ir(
-            br#"
-            @g = global [4 x i32] zeroinitializer
-            declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
-
-            define void @distinct() {
-            entry:
-              %a = alloca [4 x i32]
-              call void @llvm.memcpy.p0.p0.i64(ptr %a, ptr @g, i64 16, i1 false)
-              ret void
-            }
-
-            define void @unknown(ptr %p) {
-            entry:
-              call void @llvm.memcpy.p0.p0.i64(ptr %p, ptr @g, i64 16, i1 false)
-              ret void
-            }
-        "#,
-        );
-        // `dst != src` guards the call only when the operands may be the same object.
-        assert!(!stmt_debug(&symbols, "distinct").contains("Ifthenelse"));
-        assert!(stmt_debug(&symbols, "unknown").contains("Ifthenelse"));
     }
 
     #[test]

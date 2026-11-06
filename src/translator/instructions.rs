@@ -2718,24 +2718,36 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 return Ok(true);
             }
             // LLVM allows `src == dst` (clang emits it for `*p = *p;`), while C `memcpy` forbids
-            // any overlap. Guard the call so the equal case is the no-op LLVM promises, without
-            // lowering to `memmove`, which would also accept the partial overlap LLVM forbids.
-            // Distinct objects cannot be equal, so they need no guard (and no branch).
-            let [dst, src, _, ..] = args else {
+            // any overlap. So check only the partial overlap LLVM also forbids, and copy with
+            // CBMC's `memmove`, which is its `memcpy` minus the overlap check. Guarding the call
+            // on `dst != src` instead would be a branch symex cannot decide when it does not know
+            // `dst`, merging both outcomes into every later read of `dst`'s object.
+            let [dst, src, len, ..] = args else {
                 return Err(self
                     .unsupported_intrinsic(callee_name, "missing memcpy operands")
                     .with_location(loc)
                     .into());
             };
-            let operand = |i| unsafe { LLVMGetOperand(instruction.as_value_ref(), i) };
-            if analysis::distinct_objects(operand(0), operand(1)) {
-                self.lower_builtin_call(BuiltinFn::Memcpy, &args[..3], instruction, body)?;
-                return Ok(true);
-            }
-            let neq = self.lower_scalar_icmp_value(IntPredicate::NE, dst.clone(), src.clone())?;
-            let mut call = vec![];
-            self.lower_builtin_call(BuiltinFn::Memcpy, &args[..3], instruction, &mut call)?;
-            body.push(Stmt::if_then_else(neq, Stmt::block(call, loc), None, loc));
+            let bytes = Type::unsigned_int(8).to_pointer();
+            let (dst, src) = (
+                dst.clone().cast_to(bytes.clone()),
+                src.clone().cast_to(bytes),
+            );
+            let len = len.clone().cast_to(Type::size_t());
+            let disjoint = dst
+                .clone()
+                .same_object(src.clone())
+                .not()
+                .or(dst.clone().eq(src.clone()))
+                .or(src.clone().ge(dst.clone().plus(len.clone())))
+                .or(dst.ge(src.plus(len)));
+            body.push(Stmt::assert(
+                disjoint,
+                "precondition",
+                "memcpy src/dst overlap",
+                loc,
+            ));
+            self.lower_builtin_call(BuiltinFn::Memmove, &args[..3], instruction, body)?;
             return Ok(true);
         }
 

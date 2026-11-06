@@ -1,5 +1,5 @@
 ; ---
-; description = "llvm.memcpy between distinct objects (lowered without the self-copy guard) copies exactly"
+; description = "llvm.memcpy between distinct objects copies exactly"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
 ; ---
