@@ -2984,6 +2984,11 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             ("llvm.sqrt.", BuiltinFn::Sqrt, BuiltinFn::Sqrtf),
             ("llvm.pow.", BuiltinFn::Pow, BuiltinFn::Powf),
             ("llvm.powi.", BuiltinFn::Powi, BuiltinFn::Powif),
+            ("llvm.exp.", BuiltinFn::Exp, BuiltinFn::Expf),
+            ("llvm.exp2.", BuiltinFn::Exp2, BuiltinFn::Exp2f),
+            ("llvm.log.", BuiltinFn::Log, BuiltinFn::Logf),
+            ("llvm.log2.", BuiltinFn::Log2, BuiltinFn::Log2f),
+            ("llvm.log10.", BuiltinFn::Log10, BuiltinFn::Log10f),
             ("llvm.fma.", BuiltinFn::Fma, BuiltinFn::Fmaf),
             ("llvm.fmuladd.", BuiltinFn::Fma, BuiltinFn::Fmaf),
             (
