@@ -1,31 +1,118 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The llvm2cprover Authors
 
-//! Facts about the input LLVM IR that lowering consults.
+//! Read-only queries about the input LLVM IR that lowering consults.
 //!
-//! Analyses are queries: they do not rewrite IR and know nothing about GOTO. Each one only ever
-//! proves a property (e.g. that an operation cannot wrap); an inconclusive answer must leave the
-//! lowering as it would be without the analysis, so a weak analysis costs performance, not
-//! soundness.
+//! Queries do not rewrite IR and know nothing about GOTO, so each is unit-testable in isolation.
+//! Some fix structure lowering depends on (block order); the rest only prove properties (e.g. that
+//! an operation cannot wrap), and an inconclusive answer must leave the lowering as it would be
+//! without the analysis, so a weak analysis costs performance, not soundness.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::LLVMOpcode;
 use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
     LLVMConstIntGetSExtValue, LLVMConstIntGetZExtValue, LLVMConstNull, LLVMCountIncoming,
-    LLVMGetAggregateElement, LLVMGetCalledValue, LLVMGetElementType, LLVMGetIncomingValue,
-    LLVMGetInstructionOpcode, LLVMGetIntTypeWidth, LLVMGetIntrinsicID, LLVMGetOperand,
-    LLVMGetTypeKind, LLVMGetVectorSize, LLVMIsAConstantAggregateZero, LLVMIsAConstantDataVector,
-    LLVMIsAConstantInt, LLVMIsAConstantVector, LLVMIsAFunction, LLVMIsAInstruction,
-    LLVMLookupIntrinsicID, LLVMTypeOf,
+    LLVMGetAggregateElement, LLVMGetBasicBlockTerminator, LLVMGetCalledValue, LLVMGetElementType,
+    LLVMGetIncomingValue, LLVMGetInstructionOpcode, LLVMGetIntTypeWidth, LLVMGetIntrinsicID,
+    LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetSuccessor, LLVMGetTypeKind, LLVMGetVectorSize,
+    LLVMIsAConstantAggregateZero, LLVMIsAConstantDataVector, LLVMIsAConstantInt,
+    LLVMIsAConstantVector, LLVMIsAFunction, LLVMIsAInstruction, LLVMLookupIntrinsicID, LLVMTypeOf,
 };
-use inkwell::llvm_sys::prelude::LLVMValueRef;
-use inkwell::values::{AsValueRef, InstructionValue};
+use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
+use inkwell::values::{AsValueRef, FunctionValue, InstructionValue};
+
+/// The reachable blocks of `function` in RPO, rearranged so that each natural loop is contiguous
+/// with its header first. This is the order blocks are lowered in.
+///
+/// CBMC identifies loops by backward `GOTO`s and needs their ranges to nest. Plain RPO can
+/// place an outer loop's latch inside an inner loop's range, and CBMC then counts inner
+/// iterations against the outer loop. Moving a loop's body up to its header keeps the RPO
+/// property `blocks_in_rpo` relies on, because the header dominates the whole body.
+pub(super) fn lowering_order(function: FunctionValue<'_>) -> Vec<BasicBlock<'_>> {
+    let rpo = blocks_in_rpo(function);
+    let index: HashMap<BasicBlock<'_>, usize> =
+        rpo.iter().enumerate().map(|(i, &bb)| (bb, i)).collect();
+    let succs: Vec<Vec<usize>> = rpo
+        .iter()
+        .map(|bb| {
+            let term = unsafe { LLVMGetBasicBlockTerminator(bb.as_mut_ptr()) };
+            let n_succs = if term.is_null() {
+                0
+            } else {
+                unsafe { LLVMGetNumSuccessors(term) }
+            };
+            (0..n_succs)
+                .filter_map(|i| unsafe { BasicBlock::new(LLVMGetSuccessor(term, i)) })
+                .filter_map(|succ| index.get(&succ).copied())
+                .collect()
+        })
+        .collect();
+    loop_contiguous_order(&succs)
+        .into_iter()
+        .map(|i| rpo[i])
+        .collect()
+}
+
+/// The reachable blocks of `function` in reverse post-order (RPO).
+///
+/// RPO guarantees every dominator is visited before the blocks it dominates.
+/// That is required so that when lowering resolves an incoming `phi` value
+/// `[%v, %pred]`, the definition of `%v` has already been lowered. The IR
+/// textual order produced by the optimizer may place loop-exit blocks before
+/// the loop body, breaking the assumption that definitions precede their uses
+/// in block order.
+fn blocks_in_rpo(function: FunctionValue<'_>) -> Vec<BasicBlock<'_>> {
+    let entry = match function.get_first_basic_block() {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+
+    let mut post_order: Vec<LLVMBasicBlockRef> = Vec::new();
+    let mut visited: HashSet<LLVMBasicBlockRef> = HashSet::new();
+
+    // Stack entries: (block, terminator, next-successor-index).
+    // Storing the terminator avoids re-fetching it on every iteration.
+    // Marking blocks visited at push-time prevents them from being pushed twice.
+    let entry_ptr = entry.as_mut_ptr();
+    let entry_term = unsafe { LLVMGetBasicBlockTerminator(entry_ptr) };
+    visited.insert(entry_ptr);
+    let mut stack: Vec<(LLVMBasicBlockRef, LLVMValueRef, u32)> = vec![(entry_ptr, entry_term, 0)];
+
+    while let Some((bb, term, next_succ)) = stack.last_mut() {
+        let (bb, term) = (*bb, *term);
+        let n_succs = if term.is_null() {
+            0
+        } else {
+            unsafe { LLVMGetNumSuccessors(term) }
+        };
+        let idx = *next_succ;
+        if idx < n_succs {
+            *next_succ += 1;
+            let succ = unsafe { LLVMGetSuccessor(term, idx) };
+            if visited.insert(succ) {
+                let succ_term = unsafe { LLVMGetBasicBlockTerminator(succ) };
+                stack.push((succ, succ_term, 0));
+            }
+        } else {
+            post_order.push(bb);
+            stack.pop();
+        }
+    }
+
+    // RPO = reverse of post-order.  Map raw refs back to inkwell wrappers.
+    post_order
+        .into_iter()
+        .rev()
+        .map(|bb| unsafe { BasicBlock::new(bb).expect("valid basic block") })
+        .collect()
+}
 
 /// Permutation of the blocks `0..succs.len()`, given in RPO with their successor lists, that keeps
-/// each natural loop contiguous with its header first (see `blocks_in_lowering_order`).
-pub(super) fn loop_contiguous_order(succs: &[Vec<usize>]) -> Vec<usize> {
+/// each natural loop contiguous with its header first (see [`lowering_order`]).
+fn loop_contiguous_order(succs: &[Vec<usize>]) -> Vec<usize> {
     let n = succs.len();
     let mut preds = vec![Vec::new(); n];
     for (u, ss) in succs.iter().enumerate() {
@@ -668,7 +755,9 @@ mod tests {
     use inkwell::context::Context;
     use inkwell::memory_buffer::MemoryBuffer;
 
-    use super::{loop_contiguous_order, may_wrap, sole_user_is_next};
+    use super::{
+        blocks_in_rpo, loop_contiguous_order, lowering_order, may_wrap, sole_user_is_next,
+    };
 
     /// `may_wrap` (signed, unsigned) for each named instruction of `@f` in `ir`.
     fn wraps(ir: &str) -> Vec<(String, bool, bool)> {
@@ -703,6 +792,32 @@ mod tests {
             .map(|&(n, s, u)| (n.to_owned(), s, u))
             .collect();
         assert_eq!(wraps(&ir), expected);
+    }
+
+    #[test]
+    fn blocks_in_rpo_then_loops_contiguous() {
+        // Textual order puts the exit before the loop body; `dead` is unreachable.
+        let ir = "define void @f(i1 %c) {\nentry:\n  br label %header\nexit:\n  ret void\n\
+                  dead:\n  br label %exit\nheader:\n  br i1 %c, label %body, label %exit\n\
+                  body:\n  br label %header\n}\n";
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "test");
+        let module = context.create_module_from_ir(buffer).expect("valid IR");
+        let function = module.get_function("f").unwrap();
+        let names = |blocks: Vec<inkwell::basic_block::BasicBlock<'_>>| {
+            blocks
+                .iter()
+                .map(|block| block.get_name().to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(blocks_in_rpo(function)),
+            ["entry", "header", "exit", "body"]
+        );
+        assert_eq!(
+            names(lowering_order(function)),
+            ["entry", "header", "body", "exit"]
+        );
     }
 
     #[test]

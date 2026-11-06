@@ -18,7 +18,7 @@
 //! diagnostics specific and avoids a second feature-classification pass.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::Result;
 use cprover_bindings::InternedString;
@@ -32,13 +32,13 @@ use inkwell::IntPredicate;
 use inkwell::attributes::AttributeLoc;
 use inkwell::basic_block::BasicBlock;
 use inkwell::llvm_sys::core::{
-    LLVMGetBasicBlockTerminator, LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause,
-    LLVMGetMaskValue, LLVMGetNSW, LLVMGetNUW, LLVMGetNormalDest, LLVMGetNumArgOperands,
-    LLVMGetNumClauses, LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetOperand,
-    LLVMGetSuccessor, LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantDataSequential,
-    LLVMIsAConstantExpr, LLVMIsAGlobalVariable, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
+    LLVMGetCalledFunctionType, LLVMGetCalledValue, LLVMGetClause, LLVMGetMaskValue, LLVMGetNSW,
+    LLVMGetNUW, LLVMGetNormalDest, LLVMGetNumArgOperands, LLVMGetNumClauses,
+    LLVMGetNumOperandBundles, LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetSuccessor,
+    LLVMGetSwitchCaseValue, LLVMGetUnwindDest, LLVMIsAConstantDataSequential, LLVMIsAConstantExpr,
+    LLVMIsAGlobalVariable, LLVMIsAInlineAsm, LLVMIsCleanup, LLVMIsUndef,
 };
-use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
+use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::types::{AnyType, AnyTypeEnum, BasicTypeEnum, FunctionType};
 use inkwell::values::{
     AnyValue, AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue, GlobalValue,
@@ -191,93 +191,6 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         self.replacements.get(callee_name).map(String::as_str)
     }
 
-    /// Returns the function's basic blocks in reverse post-order (RPO).
-    ///
-    /// RPO guarantees every dominator is visited before the blocks it dominates.
-    /// That is required so that when `phi_edge_assignments` resolves an incoming
-    /// SSA value `[%v, %pred]`, the definition of `%v` has already been lowered
-    /// and is present in `self.values`.  The IR textual order produced by the
-    /// optimizer may place loop-exit blocks before the loop body, breaking the
-    /// assumption that definitions precede their uses in block order.
-    fn blocks_in_rpo(&self) -> Vec<BasicBlock<'ctx>> {
-        let entry = match self.function.get_first_basic_block() {
-            Some(b) => b,
-            None => return Vec::new(),
-        };
-
-        let mut post_order: Vec<LLVMBasicBlockRef> = Vec::new();
-        let mut visited: HashSet<LLVMBasicBlockRef> = HashSet::new();
-
-        // Stack entries: (block, terminator, next-successor-index).
-        // Storing the terminator avoids re-fetching it on every iteration.
-        // Marking blocks visited at push-time prevents them from being pushed twice.
-        let entry_ptr = entry.as_mut_ptr();
-        let entry_term = unsafe { LLVMGetBasicBlockTerminator(entry_ptr) };
-        visited.insert(entry_ptr);
-        let mut stack: Vec<(LLVMBasicBlockRef, LLVMValueRef, u32)> =
-            vec![(entry_ptr, entry_term, 0)];
-
-        while let Some((bb, term, next_succ)) = stack.last_mut() {
-            let (bb, term) = (*bb, *term);
-            let n_succs = if term.is_null() {
-                0
-            } else {
-                unsafe { LLVMGetNumSuccessors(term) }
-            };
-            let idx = *next_succ;
-            if idx < n_succs {
-                *next_succ += 1;
-                let succ = unsafe { LLVMGetSuccessor(term, idx) };
-                if visited.insert(succ) {
-                    let succ_term = unsafe { LLVMGetBasicBlockTerminator(succ) };
-                    stack.push((succ, succ_term, 0));
-                }
-            } else {
-                post_order.push(bb);
-                stack.pop();
-            }
-        }
-
-        // RPO = reverse of post-order.  Map raw refs back to inkwell wrappers.
-        post_order
-            .into_iter()
-            .rev()
-            .map(|bb| unsafe { BasicBlock::new(bb).expect("valid basic block") })
-            .collect()
-    }
-
-    /// Returns the reachable blocks in RPO, rearranged so that each natural loop is contiguous
-    /// with its header first.
-    ///
-    /// CBMC identifies loops by backward `GOTO`s and needs their ranges to nest. Plain RPO can
-    /// place an outer loop's latch inside an inner loop's range, and CBMC then counts inner
-    /// iterations against the outer loop. Moving a loop's body up to its header keeps the RPO
-    /// property `blocks_in_rpo` relies on, because the header dominates the whole body.
-    fn blocks_in_lowering_order(&self) -> Vec<BasicBlock<'ctx>> {
-        let rpo = self.blocks_in_rpo();
-        let index: HashMap<BasicBlock<'ctx>, usize> =
-            rpo.iter().enumerate().map(|(i, &bb)| (bb, i)).collect();
-        let succs: Vec<Vec<usize>> = rpo
-            .iter()
-            .map(|bb| {
-                let term = unsafe { LLVMGetBasicBlockTerminator(bb.as_mut_ptr()) };
-                let n_succs = if term.is_null() {
-                    0
-                } else {
-                    unsafe { LLVMGetNumSuccessors(term) }
-                };
-                (0..n_succs)
-                    .filter_map(|i| unsafe { BasicBlock::new(LLVMGetSuccessor(term, i)) })
-                    .filter_map(|succ| index.get(&succ).copied())
-                    .collect()
-            })
-            .collect();
-        analysis::loop_contiguous_order(&succs)
-            .into_iter()
-            .map(|i| rpo[i])
-            .collect()
-    }
-
     fn lower(mut self) -> Result<()> {
         self.declare_parameters()?;
         let all_blocks = self.function.get_basic_blocks();
@@ -291,7 +204,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
 
         // Lower blocks in RPO so that every SSA definition is available before
         // phi_edge_assignments tries to reference it on a successor edge.
-        let blocks = self.blocks_in_lowering_order();
+        let blocks = analysis::lowering_order(self.function);
         let mut body = Vec::new();
         for block in blocks {
             body.push(self.lower_basic_block(block)?);
