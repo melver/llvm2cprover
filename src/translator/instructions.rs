@@ -887,6 +887,19 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         })?;
         let lhs = self.lower_operand(instruction, 0)?;
         let rhs = self.lower_operand(instruction, 1)?;
+        // CBMC symex narrows a pointer's value set (and propagates constants) only from a GOTO
+        // guard that is the comparison itself, not a `c_bool` temporary holding it. So a compare
+        // whose only use is the `br` right after it becomes that branch's condition directly.
+        if analysis::sole_user_is_next(instruction)
+            .is_some_and(|user| user.get_opcode() == InstructionOpcode::CondBr)
+        {
+            let value = self.lower_scalar_icmp_value(pred, lhs, rhs)?;
+            self.values.insert(
+                instruction.as_value_ref() as usize,
+                value.with_location(loc),
+            );
+            return Ok(());
+        }
         let result = self.declare_instruction_result(instruction)?;
         let value = if instruction.get_type().is_vector_type() {
             self.lower_vector_icmp_value(pred, lhs, rhs, result.typ().clone())?

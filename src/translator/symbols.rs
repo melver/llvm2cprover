@@ -1654,6 +1654,27 @@ mod tests {
     }
 
     #[test]
+    fn single_use_compare_is_the_branch_condition() {
+        let symbols = build_symbols_from_ir(
+            br#"
+            define i32 @f(ptr %p) {
+            entry:
+              %isnull = icmp eq ptr %p, null
+              br i1 %isnull, label %a, label %b
+            a:
+              ret i32 0
+            b:
+              ret i32 1
+            }
+        "#,
+        );
+        // CBMC narrows `p`'s value set only on a guard that is the comparison itself.
+        let debug = stmt_debug(&symbols, "f");
+        assert!(debug.contains("Ifthenelse"));
+        assert!(!debug.contains("isnull"));
+    }
+
+    #[test]
     fn lowers_memmove_intrinsic_call() {
         let symbols = build_symbols_from_ir(
             br#"

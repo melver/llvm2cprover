@@ -140,6 +140,15 @@ fn underlying_object(mut pointer: LLVMValueRef) -> Option<LLVMValueRef> {
     None
 }
 
+/// The instruction right after `instruction`, if it is the only user of `instruction`'s result.
+/// Nothing runs between the two, so the result can be recomputed there from unchanged operands.
+pub(super) fn sole_user_is_next(instruction: InstructionValue<'_>) -> Option<InstructionValue<'_>> {
+    let next = instruction.get_next_instruction()?;
+    let only = instruction.get_first_use()?;
+    (only.get_next_use().is_none() && only.get_user().as_value_ref() == next.as_value_ref())
+        .then_some(next)
+}
+
 /// Widest integer the analysis models (ranges are `i128`/`u128`).
 const MAX_WIDTH: u32 = 128;
 
@@ -697,7 +706,7 @@ mod tests {
     use inkwell::llvm_sys::core::LLVMGetOperand;
     use inkwell::values::AsValueRef;
 
-    use super::{distinct_objects, loop_contiguous_order, may_wrap};
+    use super::{distinct_objects, loop_contiguous_order, may_wrap, sole_user_is_next};
 
     /// `may_wrap` (signed, unsigned) for each named instruction of `@f` in `ir`.
     fn wraps(ir: &str) -> Vec<(String, bool, bool)> {
@@ -775,6 +784,29 @@ mod tests {
         ]
         .concat();
         assert_eq!(distinct(&body), [true, true, true, false, false, false]);
+    }
+
+    #[test]
+    fn sole_user_is_next_instruction() {
+        let ir = "define i1 @f(i32 %x) {\n  %next = icmp eq i32 %x, 0\n  %a = xor i1 %next, true\n  \
+                  %later = icmp eq i32 %x, 1\n  %skip = icmp eq i32 %x, 2\n  \
+                  %b = and i1 %later, %skip\n  %twice = icmp eq i32 %x, 3\n  \
+                  %c = and i1 %twice, %twice\n  %d = or i1 %a, %b\n  %e = or i1 %d, %c\n  \
+                  ret i1 %e\n}\n";
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "test");
+        let module = context.create_module_from_ir(buffer).expect("valid IR");
+        let block = module
+            .get_function("f")
+            .unwrap()
+            .get_first_basic_block()
+            .unwrap();
+        let named = |name: &str| block.get_instruction_with_name(name).unwrap();
+        assert_eq!(sole_user_is_next(named("next")), Some(named("a")));
+        assert_eq!(sole_user_is_next(named("skip")), Some(named("b")));
+        // Used, but not by the next instruction; or used twice by it.
+        assert_eq!(sole_user_is_next(named("later")), None);
+        assert_eq!(sole_user_is_next(named("twice")), None);
     }
 
     #[test]
