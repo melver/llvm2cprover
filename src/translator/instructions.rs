@@ -1317,7 +1317,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             // float to), so convert through the signedness- and width-correct integer type.
             InstructionOpcode::SIToFP => self.signed_view(value)?.cast_to(target.clone()),
             InstructionOpcode::FPToSI | InstructionOpcode::FPToUI => {
-                self.fp_to_int(opcode == InstructionOpcode::FPToSI, value, target)?
+                self.fp_to_int(opcode == InstructionOpcode::FPToSI, value, target, false)?
             }
             InstructionOpcode::ZExt
             | InstructionOpcode::Trunc
@@ -1331,13 +1331,14 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         })
     }
 
-    /// Lower `fptosi` (`signed`) or `fptoui` of a scalar float to `target`.
+    /// Lower `fptosi` (`signed`) or `fptoui` of a scalar float to `target`, or with `saturate`
+    /// their `llvm.fpto[su]i.sat` intrinsics.
     ///
     /// The result is `poison` unless the value truncated toward zero fits `target`, i.e. unless
     /// `lo - 1 < value < hi`. Out-of-range values (and NaN) become nondet, as literal `poison`
     /// does. `lo` and `hi` are powers of two, so exact in any float type; `lo - 1` is exact iff it
     /// fits the significand, and otherwise no float lies strictly between it and `lo`.
-    fn fp_to_int(&self, signed: bool, value: Expr, target: &Type) -> Result<Expr> {
+    fn fp_to_int(&self, signed: bool, value: Expr, target: &Type, saturate: bool) -> Result<Expr> {
         let int = self.int_type(target, signed)?;
         let width = self.integer_width(&int)?;
         let precision = match value.typ() {
@@ -1373,10 +1374,26 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             value.clone().ge(float(lo))
         };
         let in_range = above_lo.and(value.clone().lt(float(hi)));
-        Ok(in_range.ternary(
-            value.cast_to(int).cast_to(target.clone()),
-            self.poison(target.clone()),
-        ))
+        // `llvm.fpto[su]i.sat` clamps to the nearest bound instead, and maps NaN to 0.
+        let out_of_range = if saturate {
+            let (min, max) = if signed {
+                (
+                    self.integer_signed_min_value(&int)?,
+                    self.integer_signed_max_value(&int)?,
+                )
+            } else {
+                (int.zero(), self.integer_max_value(&int)?)
+            };
+            let zero = float(BigInt::from(0u8));
+            let clamped = value
+                .clone()
+                .gt(zero.clone())
+                .ternary(max, value.clone().lt(zero).ternary(min, int.zero()));
+            clamped.cast_to(target.clone())
+        } else {
+            self.poison(target.clone())
+        };
+        Ok(in_range.ternary(value.cast_to(int).cast_to(target.clone()), out_of_range))
     }
 
     fn lower_bitcast_value(
@@ -2549,6 +2566,34 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             || callee_name.starts_with("llvm.ssub.sat")
         {
             self.lower_saturating_intrinsic(callee_name, instruction, args, body)?;
+            return Ok(true);
+        }
+
+        if let Some(signed) = if callee_name.starts_with("llvm.fptosi.sat.") {
+            Some(true)
+        } else if callee_name.starts_with("llvm.fptoui.sat.") {
+            Some(false)
+        } else {
+            None
+        } {
+            let [value] = args else {
+                return Err(self
+                    .unsupported_intrinsic(callee_name, "expects one operand")
+                    .into());
+            };
+            let target = self.types.lower_instruction_result(instruction)?;
+            let value = match target.base_type() {
+                Some(lane) if target.is_vector() => self.map_lanes(&target, |i| {
+                    self.fp_to_int(
+                        signed,
+                        self.aggregate_component(value.clone(), i)?,
+                        lane,
+                        true,
+                    )
+                })?,
+                _ => self.fp_to_int(signed, value.clone(), &target, true)?,
+            };
+            self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
 
