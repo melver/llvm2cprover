@@ -5076,3 +5076,6 @@ fn is_rust_core_panic_path(rest: &str) -> bool {
             .is_some_and(|tail| tail.is_empty() || tail.starts_with("17h"))
     })
 }
+
+#[cfg(test)]
+mod tests;
