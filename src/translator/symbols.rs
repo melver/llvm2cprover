@@ -23,8 +23,8 @@ use inkwell::llvm_sys::prelude::LLVMValueRef;
 use inkwell::module::Module;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{
-    AsValueRef, BasicValueEnum, CallSiteValue, FunctionValue, GlobalValue, InstructionOpcode,
-    InstructionValue,
+    AsValueRef, BasicValue, BasicValueEnum, CallSiteValue, FunctionValue, GlobalValue,
+    InstructionOpcode, InstructionValue,
 };
 
 use crate::UnsoundOptions;
@@ -378,9 +378,34 @@ impl SymbolBuilder {
 
     fn collect_load_hint<'ctx>(&mut self, instruction: InstructionValue<'ctx>) -> Result<bool> {
         let pointee = self.lowerer.lower_any(instruction.get_type())?;
-        Ok(self
-            .pointer_operand(instruction, 0)
-            .is_some_and(|value| self.note_value_pointee(value, pointee)))
+        let Some(slot) = self.pointer_operand(instruction, 0) else {
+            return Ok(false);
+        };
+        let mut changed = self.note_value_pointee(slot, pointee);
+        // A pointer reloaded from memory points to what was stored there, e.g. through an `-O0`
+        // stack slot, so each pointer stored to the same slot gets the reloaded pointee.
+        let Some(reloaded) = self
+            .lowerer
+            .pointer_pointee(instruction.as_value_ref() as usize)
+        else {
+            return Ok(changed);
+        };
+        let mut next = slot.get_first_use();
+        while let Some(slot_use) = next {
+            next = slot_use.get_next_use();
+            let user = slot_use.get_user();
+            if !user.is_instruction_value() {
+                continue;
+            }
+            let store = user.into_instruction_value();
+            if store.get_opcode() == InstructionOpcode::Store
+                && self.pointer_operand(store, 1) == Some(slot)
+                && let Some(stored) = self.pointer_operand(store, 0)
+            {
+                changed |= self.note_value_pointee(stored, reloaded.clone());
+            }
+        }
+        Ok(changed)
     }
 
     fn collect_store_hint<'ctx>(&mut self, instruction: InstructionValue<'ctx>) -> Result<bool> {
@@ -1885,6 +1910,51 @@ mod tests {
             params[0].typ().base_type(),
             Some(&Type::unsigned_int(32_u32))
         );
+    }
+
+    #[test]
+    fn types_allocation_reloaded_through_stack_slot() {
+        // `-O0` shape: the result goes through a stack slot; only the reloaded pointer is used
+        // as `%struct.S`. The call result gets that pointee, so `sizeof(S)` is annotated.
+        let symbols = build_symbols_from_ir(
+            br#"
+            %struct.S = type { i64, ptr }
+            declare ptr @malloc(i64)
+
+            define ptr @f() {
+            entry:
+              %slot = alloca ptr
+              %p = call ptr @malloc(i64 16)
+              store ptr %p, ptr %slot
+              %q = load ptr, ptr %slot
+              %field = getelementptr inbounds %struct.S, ptr %q, i32 0, i32 1
+              store ptr null, ptr %field
+              ret ptr %q
+            }
+        "#,
+        );
+        let debug = stmt_debug(&symbols, "f");
+        assert!(debug.contains("size_of_annotation: Some(StructTag(\"tag-struct.S\"))"));
+    }
+
+    #[test]
+    fn leaves_packed_struct_allocation_untyped() {
+        // A packed struct may have unaligned members, which CBMC mishandles on straddling stores.
+        let symbols = build_symbols_from_ir(
+            br#"
+            %struct.P = type <{ i8, i64 }>
+            declare ptr @malloc(i64)
+
+            define ptr @f() {
+            entry:
+              %p = call ptr @malloc(i64 9)
+              %field = getelementptr inbounds %struct.P, ptr %p, i32 0, i32 1
+              store i64 0, ptr %field
+              ret ptr %p
+            }
+        "#,
+        );
+        assert!(!stmt_debug(&symbols, "f").contains("size_of_annotation: Some"));
     }
 
     #[test]

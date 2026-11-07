@@ -40,6 +40,8 @@ enum PointerHint {
 pub struct TypeLowerer {
     aggregate_symbols: Vec<Symbol>,
     named_structs: BTreeSet<String>,
+    /// Tags of structs lowered from packed LLVM structs, whose members may be unaligned.
+    packed_structs: BTreeSet<String>,
     anonymous_structs: HashMap<usize, String>,
     next_anonymous_struct: usize,
     pointer_hints: HashMap<usize, PointerHint>,
@@ -359,7 +361,19 @@ impl TypeLowerer {
             }
         };
 
-        Ok(Type::struct_tag(tag))
+        let typ_out = Type::struct_tag(tag);
+        if typ.is_packed()
+            && let Some(tag) = typ_out.tag()
+        {
+            self.packed_structs.insert(tag.to_string());
+        }
+        Ok(typ_out)
+    }
+
+    /// Whether `typ` is a struct lowered from a packed LLVM struct, whose members may be unaligned.
+    pub fn is_packed_struct(&self, typ: &Type) -> bool {
+        typ.tag()
+            .is_some_and(|tag| self.packed_structs.contains(&tag.to_string()))
     }
 
     /// Return the bit width that CBMC's `sizeof` sums for `typ` after lowering.

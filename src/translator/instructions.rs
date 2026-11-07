@@ -2090,6 +2090,57 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(Expr::cast_arguments_to_target_equivalent_function_parameter_types(function, args, mm))
     }
 
+    /// Annotate a constant argument equal to `sizeof(T)` with `T`, when the call's result is known
+    /// to point to a non-packed struct `T`.
+    ///
+    /// CBMC gives a heap object the type annotated on its size, as its C front end does for
+    /// `malloc(sizeof(T))`, and splits a struct-typed object into per-field symbols; otherwise the
+    /// object is a byte array, which CBMC splits only up to `--max-field-sensitivity-array-size`.
+    /// Constant propagation carries the annotation through allocation wrappers into the allocator;
+    /// everything else ignores it.
+    fn annotate_allocation_size(
+        &self,
+        instruction: InstructionValue<'ctx>,
+        arguments: Vec<Expr>,
+    ) -> Vec<Expr> {
+        let Some(pointee) = self
+            .types
+            .pointer_pointee(instruction.as_value_ref() as usize)
+            .filter(|pointee| {
+                // CBMC (through at least 6.11.0) drops bytes of a store that straddles an
+                // unaligned member of a packed struct object; a byte array has no such members.
+                pointee.is_struct_tag()
+                    && !self.types.is_packed_struct(pointee)
+                    && pointee
+                        .tag()
+                        .and_then(|tag| self.symbols.lookup(tag))
+                        .is_some_and(|symbol| symbol.typ.is_struct())
+            })
+        else {
+            return arguments;
+        };
+        let size = BigInt::from(pointee.sizeof(self.symbols));
+        // Rebuild a cast constant in the parameter type: CBMC folds the cast into a fresh constant,
+        // which would drop the annotation.
+        arguments
+            .into_iter()
+            .map(|arg| {
+                let value = match arg.value() {
+                    ExprValue::Typecast(inner) => inner.int_constant_value(),
+                    _ => arg.int_constant_value(),
+                };
+                match value {
+                    Some(value) if value == size && arg.typ().is_integer() => {
+                        Expr::int_constant(value, arg.typ().clone())
+                            .with_location(*arg.location())
+                            .with_size_of_annotation(pointee.clone())
+                    }
+                    _ => arg,
+                }
+            })
+            .collect()
+    }
+
     fn emit_call_result(
         &mut self,
         instruction: InstructionValue<'ctx>,
@@ -2099,6 +2150,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         loc: Location,
     ) -> Result<()> {
         let arguments = self.cast_call_arguments(&function, arguments, loc)?;
+        let arguments = self.annotate_allocation_size(instruction, arguments);
         if instruction.get_type().is_void_type() {
             body.push(Stmt::function_call(None, function, arguments, loc));
             return Ok(());
