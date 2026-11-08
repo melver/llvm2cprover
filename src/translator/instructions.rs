@@ -2623,16 +2623,18 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
-        if let Some(max) = callee_name
+        if let Some((max, num)) = callee_name
             .strip_prefix("llvm.")
             .and_then(|name| name.split('.').next())
             .and_then(|name| match name {
-                "maximum" => Some(true),
-                "minimum" => Some(false),
+                "maximum" => Some((true, false)),
+                "minimum" => Some((false, false)),
+                "maximumnum" => Some((true, true)),
+                "minimumnum" => Some((false, true)),
                 _ => None,
             })
         {
-            let value = self.lower_fminimum_maximum(callee_name, max, args)?;
+            let value = self.lower_fminimum_maximum(callee_name, max, num, args)?;
             self.assign_result(instruction, body, value)?;
             return Ok(true);
         }
@@ -2948,11 +2950,19 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             })
     }
 
-    /// `llvm.maximum` (`max`) or `llvm.minimum`, lane-wise for vectors.
+    /// `llvm.maximum` (`max`) or `llvm.minimum`, lane-wise for vectors; `num` selects
+    /// `llvm.maximumnum`/`llvm.minimumnum`.
     ///
-    /// Unlike `fmax`/`fmin` (`llvm.maxnum`/`llvm.minnum`), these return NaN if either operand is
-    /// NaN and order -0 below +0. Equal operands differ only in that sign, read from the sign bit.
-    fn lower_fminimum_maximum(&self, callee_name: &str, max: bool, args: &[Expr]) -> Result<Expr> {
+    /// Unlike `fmax`/`fmin` (`llvm.maxnum`/`llvm.minnum`), these order -0 below +0. Equal operands
+    /// differ only in that sign, read from the sign bit. `maximum`/`minimum` return NaN if either
+    /// operand is NaN; the `num` variants return the other operand (NaN only if both are).
+    fn lower_fminimum_maximum(
+        &self,
+        callee_name: &str,
+        max: bool,
+        num: bool,
+        args: &[Expr],
+    ) -> Result<Expr> {
         let [lhs, rhs] = args else {
             return Err(self
                 .unsupported_intrinsic(callee_name, "expects two operands")
@@ -2983,8 +2993,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             };
             let pick = ordered.ternary(a.clone(), b.clone());
             let pick = a.clone().feq(b.clone()).ternary(tie, pick);
-            let pick = b.clone().is_nan().ternary(b.clone(), pick);
-            a.clone().is_nan().ternary(a, pick)
+            let (on_a_nan, on_b_nan) = if num {
+                (b.clone(), a.clone())
+            } else {
+                (a.clone(), b.clone())
+            };
+            let pick = b.is_nan().ternary(on_b_nan, pick);
+            a.is_nan().ternary(on_a_nan, pick)
         })
     }
 
