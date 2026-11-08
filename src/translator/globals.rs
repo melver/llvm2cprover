@@ -12,11 +12,11 @@ use cprover_bindings::goto_program::{Expr, Location, SymbolTable, Type};
 use inkwell::llvm_sys::LLVMOpcode;
 use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
-    LLVMGetAggregateElement, LLVMGetConstOpcode, LLVMGetGEPSourceElementType, LLVMGetIntTypeWidth,
-    LLVMGetNumOperands, LLVMGetOperand, LLVMGetTypeKind, LLVMIsAConstantExpr,
-    LLVMIsAGlobalVariable,
+    LLVMConstBitCast, LLVMConstIntGetZExtValue, LLVMGetAggregateElement, LLVMGetConstOpcode,
+    LLVMGetGEPSourceElementType, LLVMGetIntTypeWidth, LLVMGetNumOperands, LLVMGetOperand,
+    LLVMGetTypeKind, LLVMIsAConstantExpr, LLVMIsAConstantInt, LLVMIsAGlobalVariable,
 };
-use inkwell::types::BasicTypeEnum;
+use inkwell::types::{AsTypeRef, BasicTypeEnum};
 use inkwell::values::{
     AnyValue, ArrayValue, AsValueRef, BasicValueEnum, FloatValue, FunctionValue, GlobalValue,
     IntValue, PointerValue, StructValue, VectorValue,
@@ -258,7 +258,17 @@ impl GlobalLowerer {
             .ok_or_else(|| self.unsupported(symbol, "expected constant float initializer"))?;
 
         match value.get_type().get_bit_width() {
-            32 => Ok(Expr::float_constant(constant as f32)),
+            // `get_constant` widens to f64, which quiets a signaling NaN: take the exact bits.
+            32 => {
+                let i32_type = value.get_type().get_context().i32_type();
+                let bits =
+                    unsafe { LLVMConstBitCast(value.as_value_ref(), i32_type.as_type_ref()) };
+                if unsafe { LLVMIsAConstantInt(bits) }.is_null() {
+                    return Err(self.unsupported(symbol, "expected foldable f32 constant"));
+                }
+                let bits = unsafe { LLVMConstIntGetZExtValue(bits) } as u32;
+                Ok(Expr::float_constant_from_bitpattern(bits))
+            }
             64 => Ok(Expr::double_constant(constant)),
             bits => Err(self.unsupported(
                 symbol,
