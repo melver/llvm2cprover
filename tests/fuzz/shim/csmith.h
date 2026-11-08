@@ -33,6 +33,19 @@ static void transparent_crc(uint64_t val, char *vname, int flag) { (void)vname; 
 // `void *`, not csmith's `char *`: `--float` passes `float *`, which clang rejects for `char *`.
 static void transparent_crc_bytes(void *ptr, int nbytes, char *vname, int flag) {
     (void)vname; (void)flag;
+    // Csmith hashes only floats here. A NaN's sign and payload are unspecified (LLVM LangRef),
+    // so hash every NaN alike.
+    // Copy rather than dereference: `ptr` need not be aligned.
+    if (nbytes == sizeof(float)) {
+        float v;
+        __builtin_memcpy_inline(&v, ptr, sizeof(v));
+        if (__builtin_isnan(v)) { crc32_mix(0x7FC00000u); return; }
+    }
+    if (nbytes == sizeof(double)) {
+        double v;
+        __builtin_memcpy_inline(&v, ptr, sizeof(v));
+        if (__builtin_isnan(v)) { crc32_mix(0x7FF8000000000000u); return; }
+    }
     for (int i = 0; i < nbytes; i++) crc32_mix(((unsigned char *)ptr)[i]);
 }
 
