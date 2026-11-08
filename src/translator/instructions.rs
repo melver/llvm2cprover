@@ -2955,7 +2955,8 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
     ///
     /// Unlike `fmax`/`fmin` (`llvm.maxnum`/`llvm.minnum`), these order -0 below +0. Equal operands
     /// differ only in that sign, read from the sign bit. `maximum`/`minimum` return NaN if either
-    /// operand is NaN; the `num` variants return the other operand (NaN only if both are).
+    /// operand is NaN; the `num` variants return the other operand (NaN only if both are). A NaN
+    /// result is always quiet.
     fn lower_fminimum_maximum(
         &self,
         callee_name: &str,
@@ -2969,9 +2970,10 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .into());
         };
         let typ = lhs.typ();
-        let bits = match typ.base_type().filter(|_| typ.is_vector()).unwrap_or(typ) {
-            Type::Float => 32_u64,
-            Type::Double => 64,
+        let lane = typ.base_type().filter(|_| typ.is_vector()).unwrap_or(typ);
+        let (bits, mantissa) = match lane {
+            Type::Float => (32_u64, 23),
+            Type::Double => (64, 52),
             other => {
                 return Err(self
                     .unsupported_intrinsic(callee_name, format!("unsupported operand {other:?}"))
@@ -2980,6 +2982,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         };
         let int = Type::signed_int(bits);
         let negative = |x: Expr| x.transmute_to(int.clone(), self.symbols).lt(int.zero());
+        // A NaN result is quiet (LangRef): set the quiet bit of a passed-through NaN operand.
+        let quiet = |x: Expr| {
+            x.transmute_to(int.clone(), self.symbols)
+                .bitor(Expr::int_constant(1_i64 << (mantissa - 1), int.clone()))
+                .transmute_to(lane.clone(), self.symbols)
+        };
         self.zip_lanes(typ, lhs, rhs, |a, b| {
             let tie = if max {
                 negative(a.clone()).ternary(b.clone(), a.clone())
@@ -2993,12 +3001,15 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             };
             let pick = ordered.ternary(a.clone(), b.clone());
             let pick = a.clone().feq(b.clone()).ternary(tie, pick);
-            let (on_a_nan, on_b_nan) = if num {
-                (b.clone(), a.clone())
+            let pick = b
+                .clone()
+                .is_nan()
+                .ternary(if num { a.clone() } else { quiet(b.clone()) }, pick);
+            let on_a_nan = if num {
+                b.clone().is_nan().ternary(quiet(b.clone()), b)
             } else {
-                (a.clone(), b.clone())
+                quiet(a.clone())
             };
-            let pick = b.is_nan().ternary(on_b_nan, pick);
             a.is_nan().ternary(on_a_nan, pick)
         })
     }
