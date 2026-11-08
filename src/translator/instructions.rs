@@ -839,7 +839,40 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 ),
                 IntPredicate::EQ | IntPredicate::NE => (lhs, rhs),
                 // CBMC pointer `<`/`<=`/`>`/`>=` asserts `__CPROVER_same_object` and compares only
-                // `POINTER_OFFSET`. LLVM `icmp` compares pointer values as integers.
+                // `POINTER_OFFSET`, and `goto_check` instruments it with validity checks that
+                // LLVM `icmp` does not imply. LLVM `icmp` compares pointer values as integers.
+                // Offsets within `[0, OBJECT_SIZE]` of one object order like addresses, and symex
+                // folds them for known pointees where `(size_t)a + 8 < (size_t)a + 137` stays
+                // symbolic; anything else keeps the integer comparison. Integer addresses at or
+                // above 2^(63 - object_bits) forge CBMC object tags and are not modeled faithfully.
+                IntPredicate::UGT | IntPredicate::UGE | IntPredicate::ULT | IntPredicate::ULE => {
+                    // A negative offset casts above any `OBJECT_SIZE`, so one unsigned bound
+                    // suffices.
+                    let in_bounds = |p: &Expr| {
+                        // A built-in location keeps `goto_check` from asserting `p` valid.
+                        let size = p
+                            .clone()
+                            .object_size()
+                            .with_location(Location::builtin_function("icmp", None));
+                        p.clone().pointer_offset().cast_to(Type::size_t()).le(size)
+                    };
+                    let guard = lhs
+                        .clone()
+                        .same_object(rhs.clone())
+                        .and(in_bounds(&lhs))
+                        .and(in_bounds(&rhs));
+                    let as_off = self.lower_scalar_icmp_value(
+                        pred,
+                        lhs.clone().pointer_offset(),
+                        rhs.clone().pointer_offset(),
+                    )?;
+                    let as_int = self.lower_scalar_icmp_value(
+                        pred,
+                        lhs.cast_to(Type::size_t()),
+                        rhs.cast_to(Type::size_t()),
+                    )?;
+                    return Ok(guard.ternary(as_off, as_int));
+                }
                 _ => (lhs.cast_to(Type::size_t()), rhs.cast_to(Type::size_t())),
             }
         } else {

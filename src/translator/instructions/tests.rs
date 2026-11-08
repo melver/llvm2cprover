@@ -221,6 +221,9 @@ fn lowers_relational_pointer_comparisons_via_size_t() {
     let rel_debug = stmt_debug(&symbols, "rel");
     assert!(rel_debug.contains("SizeT"));
     assert!(rel_debug.contains("SSizeT"));
+    // Unsigned predicates compare in-bounds same-object offsets, so symex can fold them.
+    assert!(rel_debug.contains("PointerOffset"));
+    assert!(rel_debug.contains("ObjectSize"));
 }
 
 #[test]

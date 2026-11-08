@@ -19,6 +19,7 @@ target triple = "x86_64-unknown-linux-gnu"
 
 declare void @__CPROVER_assert(i1, ptr)
 declare i1 @__CPROVER_nondet_bool()
+declare i64 @__CPROVER_nondet_u64()
 
 define i32 @main() {
 entry:
@@ -104,6 +105,33 @@ entry:
   %veq1 = icmp eq i1 %vcmp1, %p_slt
   %vok = and i1 %vcmp0, %veq1
   call void @__CPROVER_assert(i1 %vok, ptr null)
+
+  ; Empty-slice iterator `begin < end` on dangling or null pointers: defined in
+  ; LLVM, so no pointer-relation validity check may fire.
+  %dangling = select i1 %c1, ptr inttoptr (i64 4 to ptr), ptr null
+  %more = icmp ult ptr %dangling, %dangling
+  %done = xor i1 %more, true
+  call void @__CPROVER_assert(i1 %done, ptr null)
+
+  ; Integer addresses below 2^(63 - object_bits) (see pointer_icmp_forged_tag.ll
+  ; for higher ones) and wild same-object offsets order like integers.
+  %x = call i64 @__CPROVER_nondet_u64()
+  %y = call i64 @__CPROVER_nondet_u64()
+  %xm = and i64 %x, 140737488355327
+  %ym = and i64 %y, 140737488355327
+  %px = inttoptr i64 %xm to ptr
+  %py = inttoptr i64 %ym to ptr
+  %p_xy = icmp ult ptr %px, %py
+  %i_xy = icmp ult i64 %xm, %ym
+  %eq_xy = icmp eq i1 %p_xy, %i_xy
+  call void @__CPROVER_assert(i1 %eq_xy, ptr null)
+  %wild = getelementptr i8, ptr @arr, i64 %x
+  %p_wild = icmp ult ptr @arr, %wild
+  %arr_i = ptrtoint ptr @arr to i64
+  %wild_i = ptrtoint ptr %wild to i64
+  %i_wild = icmp ult i64 %arr_i, %wild_i
+  %eq_wild = icmp eq i1 %p_wild, %i_wild
+  call void @__CPROVER_assert(i1 %eq_wild, ptr null)
 
   ret i32 0
 }
