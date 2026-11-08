@@ -2623,6 +2623,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.is.fpclass.") {
+            let target = self.types.lower_instruction_result(instruction)?;
+            let value = self.lower_is_fpclass(callee_name, args, &target)?;
+            self.assign_result(instruction, body, value)?;
+            return Ok(true);
+        }
+
         if let Some((max, num)) = callee_name
             .strip_prefix("llvm.")
             .and_then(|name| name.split('.').next())
@@ -3012,6 +3019,80 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             };
             a.is_nan().ternary(on_a_nan, pick)
         })
+    }
+
+    /// `llvm.is.fpclass`: whether the operand is in any class of the constant mask, lane-wise for
+    /// vectors. Mask bits 0..9 are sNaN, qNaN, -inf, -normal, -subnormal, -zero, +zero,
+    /// +subnormal, +normal, +inf; each is decided from the IEEE bit fields.
+    fn lower_is_fpclass(&self, callee_name: &str, args: &[Expr], target: &Type) -> Result<Expr> {
+        let [value, mask] = args else {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "expects two operands")
+                .into());
+        };
+        let mask = mask
+            .int_constant_value()
+            .and_then(|mask| u32::try_from(mask).ok())
+            .ok_or_else(|| self.unsupported_intrinsic(callee_name, "non-constant class mask"))?;
+        let typ = value.typ();
+        let (bits, mantissa) = match typ.base_type().filter(|_| typ.is_vector()).unwrap_or(typ) {
+            Type::Float => (32_u32, 23_u32),
+            Type::Double => (64, 52),
+            other => {
+                return Err(self
+                    .unsupported_intrinsic(callee_name, format!("unsupported operand {other:?}"))
+                    .into());
+            }
+        };
+        let uint = Type::unsigned_int(bits);
+        let constant = |c: u64| Expr::int_constant(c, uint.clone());
+        let classify = |x: Expr| {
+            let x = x.transmute_to(uint.clone(), self.symbols);
+            let exp_max = (1_u64 << (bits - 1 - mantissa)) - 1;
+            let exp = x
+                .clone()
+                .lshr(constant(mantissa.into()))
+                .bitand(constant(exp_max));
+            let frac = x.clone().bitand(constant((1_u64 << mantissa) - 1));
+            let quiet = x.clone().bitand(constant(1_u64 << (mantissa - 1)));
+            let neg = x.ge(constant(1_u64 << (bits - 1)));
+            let (exp_zero, exp_ones) = (
+                exp.clone().eq(constant(0)),
+                exp.clone().eq(constant(exp_max)),
+            );
+            let frac_zero = frac.clone().eq(constant(0));
+            let nan = exp_ones.clone().and(frac_zero.clone().not());
+            let inf = exp_ones.clone().and(frac_zero.clone());
+            let normal = exp_zero.clone().not().and(exp_ones.not());
+            let subnormal = exp_zero.clone().and(frac_zero.clone().not());
+            let zero = exp_zero.and(frac_zero);
+            let unsigned = [
+                nan.clone().and(quiet.clone().eq(constant(0))),
+                nan.and(quiet.neq(constant(0))),
+            ];
+            let signed = [inf, normal, subnormal, zero];
+            let classes = unsigned
+                .into_iter()
+                .chain(signed.iter().map(|c| neg.clone().and(c.clone())))
+                .chain(
+                    signed
+                        .iter()
+                        .rev()
+                        .map(|c| neg.clone().not().and(c.clone())),
+                );
+            classes
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, class)| class)
+                .reduce(Expr::or)
+                .unwrap_or_else(Expr::bool_false)
+        };
+        match target.base_type() {
+            Some(lane) if target.is_vector() => self.map_lanes(target, |i| {
+                Ok(classify(self.aggregate_component(value.clone(), i)?).cast_to(lane.clone()))
+            }),
+            _ => Ok(classify(value.clone())),
+        }
     }
 
     fn float_builtin(&self, callee_name: &str) -> Option<(BuiltinFn, BuiltinFn)> {
