@@ -206,10 +206,15 @@ pub(super) fn sole_user_is_next(instruction: InstructionValue<'_>) -> Option<Ins
         .then_some(next)
 }
 
-/// The number of pointer slots of a zero-initialized `[N x i8]` global that is only ever loaded
-/// from and stored to as `ptr`, at offsets that are multiples of the pointer size; `None` if any
-/// use is anything else. Rustc emits a zeroed `static` of (optional) pointers this way, and typing
-/// it as `[N / size x ptr]` lets CBMC track each slot's value set instead of one for all bytes.
+/// The number of pointer slots of a zero-initialized `[N x i8]` global that is loaded from and
+/// stored to only as `ptr`, at offsets that are multiples of the pointer size; `None` otherwise.
+/// Rustc emits a zeroed `static` of (optional) pointers this way, and typing it as
+/// `[N / size x ptr]` lets CBMC track each slot's value set instead of one for all bytes.
+///
+/// CBMC models byte-level access to an object of any type and the size and initializer do not
+/// change, so the type never affects soundness, only which accesses CBMC handles cheaply. Uses that
+/// pass the address on (call arguments, stores of the address) are therefore ignored: an access
+/// behind them is still correct, if slower.
 pub(super) fn pointer_slots(global: GlobalValue<'_>, target: &TargetData) -> Option<u32> {
     let size = u64::from(target.get_pointer_byte_size(None));
     let typ = global.get_value_type();
@@ -227,13 +232,13 @@ pub(super) fn pointer_slots(global: GlobalValue<'_>, target: &TargetData) -> Opt
         return None;
     }
     let mut accessed = false;
-    (pointer_only_uses(global.as_value_ref(), target, size, &mut accessed) && accessed)
+    (pointer_only_accesses(global.as_value_ref(), target, size, &mut accessed) && accessed)
         .then(|| (bytes / size) as u32)
 }
 
-/// Whether every use of `value`, an address at a multiple of `size` into the global, is a `ptr`
-/// load or store through it or a GEP that keeps it at such an offset with the same property.
-fn pointer_only_uses(
+/// Whether every load or store through `value`, an address at a multiple of `size` into the
+/// global, is a `ptr` access, following GEPs that keep such an offset.
+fn pointer_only_accesses(
     value: LLVMValueRef,
     target: &TargetData,
     size: u64,
@@ -247,15 +252,14 @@ fn pointer_only_uses(
         let ok = if !unsafe { LLVMIsALoadInst(user) }.is_null() {
             *accessed = true;
             is_pointer(user)
-        } else if !unsafe { LLVMIsAStoreInst(user) }.is_null() {
+        } else if !unsafe { LLVMIsAStoreInst(user) }.is_null() && operand(1) == value {
             *accessed = true;
-            operand(1) == value && operand(0) != value && is_pointer(operand(0))
-        } else if is_gep(user) {
-            operand(0) == value
-                && gep_keeps_multiple(user, target, size)
-                && pointer_only_uses(user, target, size, accessed)
+            is_pointer(operand(0))
+        } else if is_gep(user) && operand(0) == value {
+            gep_keeps_multiple(user, target, size)
+                && pointer_only_accesses(user, target, size, accessed)
         } else {
-            false
+            true
         };
         if !ok {
             return false;
@@ -1294,16 +1298,19 @@ mod tests {
                         %s = getelementptr [8 x i8], ptr @t, i64 %i\n  %v = load ptr, ptr %s\n\
                         %v0 = load ptr, ptr @t";
         assert_eq!(slots(zeroed, accesses), Some(4));
+        // Passing a slot's address on does not access it: a call argument and a stored address.
+        let escapes = "  %v = load ptr, ptr @t\n  call void @g(ptr getelementptr (i8, ptr @t, i64 8))\n\
+                       store ptr @t, ptr %p";
+        assert_eq!(slots(zeroed, escapes), Some(4));
         let rejected = [
-            // Not a pointer access, a misaligned offset, a byte-scaled index, an escape, and the
-            // table's own address stored into it.
+            // Not a pointer access, also behind a GEP; a misaligned offset; a byte-scaled index.
             "  %v = load i64, ptr @t",
+            "  %v = load i32, ptr getelementptr (i8, ptr @t, i64 8)",
             "  store ptr %p, ptr getelementptr (i8, ptr @t, i64 4)",
             "  %s = getelementptr i8, ptr @t, i64 %i\n  %v = load ptr, ptr %s",
-            "  call void @g(ptr @t)",
-            "  store ptr @t, ptr @t",
-            // No access at all.
+            // No access at all, only escapes.
             "",
+            "  call void @g(ptr @t)",
         ];
         for body in rejected {
             assert_eq!(slots(zeroed, body), None, "{body}");

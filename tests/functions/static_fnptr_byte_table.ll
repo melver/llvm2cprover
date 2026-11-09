@@ -1,5 +1,5 @@
 ; ---
-; description = "Indirect call through a zeroed byte-array table of function pointers calls only the stored target"
+; description = "Indirect call through a zeroed byte-array table of function pointers, whose slot address is also passed to a call, calls only the stored target"
 ; expected = "VERIFICATION SUCCESSFUL"
 ; entry = "main"
 ; cbmc_flags = ["--unwind", "9", "--unwinding-assertions"]
@@ -8,7 +8,9 @@
 ; `[104 x i8]`. Accessed only as pointers at pointer-aligned offsets, it is typed
 ; as `[13 x ptr]`: as one 104-byte array (above CBMC's default
 ; --max-field-sensitivity-array-size) the slot's value set would hold every
-; pointer stored in the table, and symex would enter all 13 functions.
+; pointer stored in the table, and symex would enter all 13 functions. Passing a
+; slot's address to `is_some` (rustc's by-reference `&self` call for
+; `debug_assert!(T[i].is_some())`) does not access the slot and keeps the typing.
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
@@ -16,6 +18,13 @@ target triple = "x86_64-unknown-linux-gnu"
 @table = internal global [104 x i8] zeroinitializer, align 8
 declare i32 @__CPROVER_nondet_int()
 declare void @__CPROVER_assert(i1, ptr)
+
+define internal zeroext i1 @is_some(ptr noalias readonly align 8 dereferenceable(8) %self) {
+entry:
+  %p = load ptr, ptr %self, align 8
+  %r = icmp ne ptr %p, null
+  ret i1 %r
+}
 
 define internal i32 @f0(i32 %x) {
 entry:
@@ -214,6 +223,8 @@ entry:
   store ptr @f10, ptr getelementptr inbounds nuw (i8, ptr @table, i64 80), align 8
   store ptr @f11, ptr getelementptr inbounds nuw (i8, ptr @table, i64 88), align 8
   store ptr @f12, ptr getelementptr inbounds nuw (i8, ptr @table, i64 96), align 8
+  %some = call zeroext i1 @is_some(ptr getelementptr inbounds nuw (i8, ptr @table, i64 40))
+  call void @__CPROVER_assert(i1 %some, ptr null)
   %slot = getelementptr inbounds nuw [8 x i8], ptr @table, i64 5
   %fp = load ptr, ptr %slot, align 8
   %x = call i32 @__CPROVER_nondet_int()
