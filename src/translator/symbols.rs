@@ -31,6 +31,7 @@ use crate::UnsoundOptions;
 use crate::contracts::{ContractMap, InlineAsmSite};
 use crate::util;
 
+use super::analysis;
 use super::globals::GlobalLowerer;
 use super::instructions::InstructionLowerer;
 use super::report::ReportCollector;
@@ -115,10 +116,17 @@ impl SymbolBuilder {
             {
                 continue;
             }
-            let typ = self
+            let slots = self
                 .lowerer
-                .lower_any(global.get_value_type())
-                .map_err(|diag| diag.with_symbol(name.clone()))?;
+                .target_data()
+                .and_then(|target| analysis::pointer_slots(global, target));
+            let typ = match slots {
+                Some(slots) => Type::void_pointer().array_of(slots),
+                None => self
+                    .lowerer
+                    .lower_any(global.get_value_type())
+                    .map_err(|diag| diag.with_symbol(name.clone()))?,
+            };
             self.insert_pending_aggregate_symbols(&mut symbols);
             let mut symbol = Symbol::static_variable(name.clone(), name, typ, Location::none())
                 .with_is_extern(global.is_declaration());
@@ -1222,6 +1230,27 @@ mod tests {
         );
 
         assert!(format!("{:?}", expr_value(&symbols, "p")).contains("g"));
+    }
+
+    #[test]
+    fn types_zeroed_byte_table_of_pointers_as_pointer_array() {
+        let symbols = build_symbols_from_ir(
+            br#"
+            target datalayout = "e-m:e-i64:64-n8:16:32:64-S128"
+            @t = internal global [16 x i8] zeroinitializer
+
+            define ptr @f(ptr %p) {
+              store ptr %p, ptr getelementptr (i8, ptr @t, i64 8)
+              %v = load ptr, ptr @t
+              ret ptr %v
+            }
+        "#,
+        );
+
+        let typ = &symbols.lookup("t").expect("@t").typ;
+        assert_eq!(typ.len(), Some(2));
+        assert!(typ.base_type().is_some_and(Type::is_pointer), "{typ:?}");
+        assert!(format!("{:?}", expr_value(&symbols, "t")).contains("Array"));
     }
 
     #[test]

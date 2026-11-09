@@ -63,6 +63,11 @@ impl TypeLowerer {
         self.target_data = Some(TargetData::create(data_layout));
     }
 
+    /// The module's data layout, if it has one.
+    pub(super) fn target_data(&self) -> Option<&TargetData> {
+        self.target_data.as_ref()
+    }
+
     /// Lower any LLVM type into its GOTO representation.
     pub fn lower_any<'ctx>(
         &mut self,

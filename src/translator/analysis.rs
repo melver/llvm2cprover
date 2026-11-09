@@ -15,14 +15,19 @@ use inkwell::llvm_sys::LLVMOpcode;
 use inkwell::llvm_sys::LLVMTypeKind;
 use inkwell::llvm_sys::core::{
     LLVMConstIntGetSExtValue, LLVMConstIntGetZExtValue, LLVMConstNull, LLVMCountIncoming,
-    LLVMGetAggregateElement, LLVMGetBasicBlockTerminator, LLVMGetCalledValue, LLVMGetElementType,
-    LLVMGetIncomingValue, LLVMGetInstructionOpcode, LLVMGetIntTypeWidth, LLVMGetIntrinsicID,
-    LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetSuccessor, LLVMGetTypeKind, LLVMGetVectorSize,
-    LLVMIsAConstantAggregateZero, LLVMIsAConstantDataVector, LLVMIsAConstantInt,
-    LLVMIsAConstantVector, LLVMIsAFunction, LLVMIsAInstruction, LLVMLookupIntrinsicID, LLVMTypeOf,
+    LLVMGetAggregateElement, LLVMGetBasicBlockTerminator, LLVMGetCalledValue, LLVMGetConstOpcode,
+    LLVMGetElementType, LLVMGetFirstUse, LLVMGetGEPSourceElementType, LLVMGetIncomingValue,
+    LLVMGetInstructionOpcode, LLVMGetIntTypeWidth, LLVMGetIntrinsicID, LLVMGetNextUse,
+    LLVMGetNumOperands, LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetSuccessor, LLVMGetTypeKind,
+    LLVMGetUser, LLVMGetVectorSize, LLVMIsAConstantAggregateZero, LLVMIsAConstantDataVector,
+    LLVMIsAConstantExpr, LLVMIsAConstantInt, LLVMIsAConstantVector, LLVMIsAFunction,
+    LLVMIsAGetElementPtrInst, LLVMIsAInstruction, LLVMIsALoadInst, LLVMIsAStoreInst, LLVMIsNull,
+    LLVMLookupIntrinsicID, LLVMStructGetTypeAtIndex, LLVMTypeOf,
 };
-use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMValueRef};
-use inkwell::values::{AsValueRef, FunctionValue, InstructionValue};
+use inkwell::llvm_sys::prelude::{LLVMBasicBlockRef, LLVMTypeRef, LLVMValueRef};
+use inkwell::llvm_sys::target::{LLVMABISizeOfType, LLVMOffsetOfElement};
+use inkwell::targets::TargetData;
+use inkwell::values::{AsValueRef, FunctionValue, GlobalValue, InstructionValue};
 
 /// The reachable blocks of `function` in RPO, rearranged so that each natural loop is contiguous
 /// with its header first. This is the order blocks are lowered in.
@@ -199,6 +204,128 @@ pub(super) fn sole_user_is_next(instruction: InstructionValue<'_>) -> Option<Ins
     let only = instruction.get_first_use()?;
     (only.get_next_use().is_none() && only.get_user().as_value_ref() == next.as_value_ref())
         .then_some(next)
+}
+
+/// The number of pointer slots of a zero-initialized `[N x i8]` global that is only ever loaded
+/// from and stored to as `ptr`, at offsets that are multiples of the pointer size; `None` if any
+/// use is anything else. Rustc emits a zeroed `static` of (optional) pointers this way, and typing
+/// it as `[N / size x ptr]` lets CBMC track each slot's value set instead of one for all bytes.
+pub(super) fn pointer_slots(global: GlobalValue<'_>, target: &TargetData) -> Option<u32> {
+    let size = u64::from(target.get_pointer_byte_size(None));
+    let typ = global.get_value_type();
+    if !typ.is_array_type() {
+        return None;
+    }
+    let array = typ.into_array_type();
+    let bytes = u64::from(array.len());
+    let init = global.get_initializer()?;
+    if !array.get_element_type().is_int_type()
+        || array.get_element_type().into_int_type().get_bit_width() != 8
+        || bytes % size != 0
+        || unsafe { LLVMIsNull(init.as_value_ref()) } == 0
+    {
+        return None;
+    }
+    let mut accessed = false;
+    (pointer_only_uses(global.as_value_ref(), target, size, &mut accessed) && accessed)
+        .then(|| (bytes / size) as u32)
+}
+
+/// Whether every use of `value`, an address at a multiple of `size` into the global, is a `ptr`
+/// load or store through it or a GEP that keeps it at such an offset with the same property.
+fn pointer_only_uses(
+    value: LLVMValueRef,
+    target: &TargetData,
+    size: u64,
+    accessed: &mut bool,
+) -> bool {
+    let mut next = unsafe { LLVMGetFirstUse(value) };
+    while !next.is_null() {
+        let user = unsafe { LLVMGetUser(next) };
+        next = unsafe { LLVMGetNextUse(next) };
+        let operand = |i| unsafe { LLVMGetOperand(user, i) };
+        let ok = if !unsafe { LLVMIsALoadInst(user) }.is_null() {
+            *accessed = true;
+            is_pointer(user)
+        } else if !unsafe { LLVMIsAStoreInst(user) }.is_null() {
+            *accessed = true;
+            operand(1) == value && operand(0) != value && is_pointer(operand(0))
+        } else if is_gep(user) {
+            operand(0) == value
+                && gep_keeps_multiple(user, target, size)
+                && pointer_only_uses(user, target, size, accessed)
+        } else {
+            false
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `typ` is a scalable vector or a (nested) array of them. GEPs cannot index structs
+/// containing scalable vectors, so arrays are the only other way to reach one.
+fn contains_scalable_vector(mut typ: LLVMTypeRef) -> bool {
+    while unsafe { LLVMGetTypeKind(typ) } == LLVMTypeKind::LLVMArrayTypeKind {
+        typ = unsafe { LLVMGetElementType(typ) };
+    }
+    (unsafe { LLVMGetTypeKind(typ) }) == LLVMTypeKind::LLVMScalableVectorTypeKind
+}
+
+fn is_pointer(value: LLVMValueRef) -> bool {
+    (unsafe { LLVMGetTypeKind(LLVMTypeOf(value)) }) == LLVMTypeKind::LLVMPointerTypeKind
+}
+
+fn is_gep(value: LLVMValueRef) -> bool {
+    !unsafe { LLVMIsAGetElementPtrInst(value) }.is_null()
+        || (!unsafe { LLVMIsAConstantExpr(value) }.is_null()
+            && unsafe { LLVMGetConstOpcode(value) } == LLVMOpcode::LLVMGetElementPtr)
+}
+
+/// Whether the byte offset added by `gep` is a multiple of `size`: its constant part is, and each
+/// variable index scales by a multiple of it. Only the offset modulo `size` is tracked.
+fn gep_keeps_multiple(gep: LLVMValueRef, target: &TargetData, size: u64) -> bool {
+    let td = target.as_mut_ptr();
+    let mut typ = unsafe { LLVMGetGEPSourceElementType(gep) };
+    // LLVM aborts on the size of a scalable vector; every type below is nested in `typ`.
+    if contains_scalable_vector(typ) {
+        return false;
+    }
+    let size = i128::from(size);
+    let mut offset: i128 = 0;
+    for i in 1..unsafe { LLVMGetNumOperands(gep) } as u32 {
+        let index = unsafe { LLVMGetOperand(gep, i) };
+        // Wider constants would not fit `LLVMConstIntGetSExtValue`; treat them as variable.
+        let constant = (!unsafe { LLVMIsAConstantInt(index) }.is_null()
+            && unsafe { LLVMGetIntTypeWidth(LLVMTypeOf(index)) } <= 64)
+            .then(|| i128::from(unsafe { LLVMConstIntGetSExtValue(index) }));
+        let stride = if i == 1 {
+            unsafe { LLVMABISizeOfType(td, typ) }
+        } else {
+            match unsafe { LLVMGetTypeKind(typ) } {
+                LLVMTypeKind::LLVMArrayTypeKind => {
+                    typ = unsafe { LLVMGetElementType(typ) };
+                    unsafe { LLVMABISizeOfType(td, typ) }
+                }
+                LLVMTypeKind::LLVMStructTypeKind => {
+                    let Some(field) = constant else { return false };
+                    let field_offset = unsafe { LLVMOffsetOfElement(td, typ, field as u32) };
+                    offset = (offset + i128::from(field_offset)) % size;
+                    typ = unsafe { LLVMStructGetTypeAtIndex(typ, field as u32) };
+                    continue;
+                }
+                _ => return false,
+            }
+        };
+        let stride = i128::from(stride) % size;
+        match constant {
+            Some(c) => offset = (offset + c % size * stride) % size,
+            None if stride == 0 => {}
+            None => return false,
+        }
+    }
+    offset.rem_euclid(size) == 0
 }
 
 /// Widest integer the analysis models (ranges are `i128`/`u128`).
@@ -754,9 +881,11 @@ fn constant_values(value: LLVMValueRef) -> Option<Vec<u64>> {
 mod tests {
     use inkwell::context::Context;
     use inkwell::memory_buffer::MemoryBuffer;
+    use inkwell::targets::TargetData;
 
     use super::{
-        blocks_in_rpo, loop_contiguous_order, lowering_order, may_wrap, sole_user_is_next,
+        blocks_in_rpo, loop_contiguous_order, lowering_order, may_wrap, pointer_slots,
+        sole_user_is_next,
     };
 
     /// `may_wrap` (signed, unsigned) for each named instruction of `@f` in `ir`.
@@ -1142,5 +1271,63 @@ mod tests {
         // 0 -> 1 header; 1 -> {2 exit, 3 body}; 3 -> 1. RPO may list the exit first.
         let succs = [vec![1], vec![2, 3], vec![], vec![1]];
         assert_eq!(loop_contiguous_order(&succs), [0, 1, 3, 2]);
+    }
+
+    /// `pointer_slots` of `@t` declared as `global` and used by the body of `@f`.
+    fn slots(global: &str, body: &str) -> Option<u32> {
+        let ir = format!(
+            "target datalayout = \"e-m:e-i64:64-n8:16:32:64-S128\"\n@t = {global}\n\
+             declare void @g(ptr)\ndefine void @f(ptr %p, i64 %i) {{\n{body}\n  ret void\n}}\n"
+        );
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "test");
+        let module = context.create_module_from_ir(buffer).expect("valid IR");
+        let target = TargetData::create(module.get_data_layout().as_str().to_str().unwrap());
+        pointer_slots(module.get_global("t").expect("@t"), &target)
+    }
+
+    #[test]
+    fn pointer_slots_of_zeroed_byte_table() {
+        let zeroed = "internal global [32 x i8] zeroinitializer";
+        // Constant byte offsets and a dynamic index scaled by the pointer size.
+        let accesses = "  store ptr %p, ptr getelementptr (i8, ptr @t, i64 8)\n\
+                        %s = getelementptr [8 x i8], ptr @t, i64 %i\n  %v = load ptr, ptr %s\n\
+                        %v0 = load ptr, ptr @t";
+        assert_eq!(slots(zeroed, accesses), Some(4));
+        let rejected = [
+            // Not a pointer access, a misaligned offset, a byte-scaled index, an escape, and the
+            // table's own address stored into it.
+            "  %v = load i64, ptr @t",
+            "  store ptr %p, ptr getelementptr (i8, ptr @t, i64 4)",
+            "  %s = getelementptr i8, ptr @t, i64 %i\n  %v = load ptr, ptr %s",
+            "  call void @g(ptr @t)",
+            "  store ptr @t, ptr @t",
+            // No access at all.
+            "",
+        ];
+        for body in rejected {
+            assert_eq!(slots(zeroed, body), None, "{body}");
+        }
+        // A scalable vector has no fixed size, also as an array element.
+        let scalable = "  %s = getelementptr [4 x <vscale x 4 x i32>], ptr @t, i64 0, i64 1\n\
+                        %v = load ptr, ptr %s";
+        assert_eq!(slots(zeroed, scalable), None);
+        // Non-zero initializer, non-byte element, size not a multiple of the pointer size.
+        let load = "  %v = load ptr, ptr @t";
+        assert_eq!(
+            slots(
+                "internal global [8 x i8] c\"\\01\\00\\00\\00\\00\\00\\00\\00\"",
+                load
+            ),
+            None
+        );
+        assert_eq!(
+            slots("internal global [4 x i16] zeroinitializer", load),
+            None
+        );
+        assert_eq!(
+            slots("internal global [12 x i8] zeroinitializer", load),
+            None
+        );
     }
 }
