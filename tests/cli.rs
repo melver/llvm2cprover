@@ -1006,3 +1006,74 @@ g = ["dispatch", "modeled_candidate", "plain_candidate"]
         ])
     );
 }
+
+#[test]
+fn pre_passes_optimize_before_lowering_and_are_reported() {
+    let input = input_file(
+        r#"
+define i64 @f() {
+entry:
+  %tmp = alloca i64, align 8
+  store i64 7, ptr %tmp, align 8
+  %v = load i64, ptr %tmp, align 8
+  ret i64 %v
+}
+"#,
+    );
+    let llvm2cprover = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_llvm2cprover"));
+        command.args(["--input-format", "ll"]);
+        command
+    };
+
+    // SROA promotes the stack slot, so the emitted module no longer contains it.
+    let bitcode = input.with_extension("bc");
+    let emit = llvm2cprover()
+        .args(["--pre-passes", "sroa", "--emit-llvm", "-o"])
+        .arg(&bitcode)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    assert!(
+        emit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let context = inkwell::context::Context::create();
+    let module = inkwell::module::Module::parse_bitcode_from_path(&bitcode, &context)
+        .expect("--emit-llvm must write bitcode");
+    assert!(!module.print_to_string().to_string().contains("alloca"));
+
+    let goto = input.with_extension("goto");
+    let report = input.with_extension("json");
+    let translate = llvm2cprover()
+        .args(["--pre-passes", "sroa", "--report"])
+        .arg(&report)
+        .arg("-o")
+        .arg(&goto)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    assert!(
+        translate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&translate.stderr)
+    );
+    let report_json: Value =
+        serde_json::from_slice(&fs::read(&report).expect("report written")).expect("report JSON");
+    assert_eq!(report_json["pre_passes"], "sroa");
+
+    // An unknown pass fails closed instead of translating the unoptimized module.
+    let bogus = llvm2cprover()
+        .args(["--pre-passes", "no-such-pass", "-o"])
+        .arg(&goto)
+        .arg(&input)
+        .output()
+        .expect("failed to run llvm2cprover");
+    assert!(!bogus.status.success());
+    assert!(String::from_utf8_lossy(&bogus.stderr).contains("unknown pass name"));
+
+    for path in [input, bitcode, goto, report] {
+        let _ = fs::remove_file(path);
+    }
+}

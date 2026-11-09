@@ -139,8 +139,8 @@ pub struct Config {
     /// External declarations, LLVM intrinsics, and verifier/runtime symbols remain unprefixed.
     /// Manifests keep naming original LLVM symbols and are mapped along with the module.
     pub rename_prefix: Option<String>,
-    /// Write the module after the LLVM IR transformations (`rename_prefix`) as bitcode to
-    /// `output`, which is then required, instead of lowering it to GOTO.
+    /// Write the module after the LLVM IR transformations (`pre_passes`, `rename_prefix`) as
+    /// bitcode to `output`, which is then required, instead of lowering it to GOTO.
     pub emit_llvm: bool,
     /// Machine model used for emitted GOTO types and builtins. `Auto` infers from the module.
     pub machine_model: MachineModel,
@@ -164,6 +164,13 @@ pub struct Config {
     /// Also emit goto-converted function bodies (CBMC's `goto_convert`), as consumers other than
     /// CBMC, notably ESBMC, require. CBMC uses them instead of converting on load.
     pub goto_convert: bool,
+    /// LLVM pass pipeline (`opt -passes=` syntax, e.g. `sroa`) run on the parsed module before
+    /// any other step.
+    ///
+    /// The result verifies the optimized module, not the input: passes may remove undefined
+    /// behavior that verification would otherwise report (SROA drops out-of-bounds constant
+    /// accesses to allocas) or refine `undef` to fewer behaviors.
+    pub pre_passes: Option<String>,
 }
 
 /// Translate one LLVM module into a `.goto` binary.

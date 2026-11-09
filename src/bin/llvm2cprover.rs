@@ -84,7 +84,8 @@ struct Cli {
             "rename_prefix",
             "machine_model",
             "unsound",
-            "report"
+            "report",
+            "pre_passes"
         ]
     )]
     emit_asm_manifest: bool,
@@ -108,6 +109,11 @@ struct Cli {
     /// Lower indirect calls to a dispatch restricted by these function groups (TOML, `[groups]`).
     #[arg(long, requires = "entry")]
     fp_groups: Option<PathBuf>,
+
+    /// Run this LLVM pass pipeline (`opt -passes=` syntax, e.g. `sroa`) first; the optimized
+    /// module is what gets verified, so passes may remove undefined behavior from it.
+    #[arg(long, value_name = "PIPELINE")]
+    pre_passes: Option<String>,
 
     /// Write the transformed LLVM module as bitcode to -o instead of GOTO.
     #[arg(
@@ -213,6 +219,7 @@ fn main() -> std::process::ExitCode {
         report: cli.report,
         fp_groups: cli.fp_groups,
         goto_convert: cli.goto_convert || cli.esbmc,
+        pre_passes: cli.pre_passes,
     };
 
     match translate(input_from_cli(cli.input), config) {

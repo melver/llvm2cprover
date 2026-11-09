@@ -124,6 +124,8 @@ struct TranslationReport {
     machine_model: &'static str,
     target_triple: String,
     data_layout: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_passes: Option<String>,
     undefined_functions: Vec<String>,
     approximations: Vec<Approximation>,
     inline_asm_models: Vec<InlineAsmAssumption>,
@@ -151,6 +153,7 @@ pub(crate) fn write_report(
     path: &Path,
     module: &Module<'_>,
     machine_model: MachineModel,
+    pre_passes: Option<&str>,
     contracts: &ContractMap,
     enforced_contracts: &BTreeSet<String>,
     symbols: &SymbolTable,
@@ -175,6 +178,7 @@ pub(crate) fn write_report(
             .as_str()
             .to_string_lossy()
             .into_owned(),
+        pre_passes: pre_passes.map(str::to_owned),
         undefined_functions: undefined_functions(
             module,
             contracts,

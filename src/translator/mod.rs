@@ -18,6 +18,7 @@
 //! places.
 
 use std::collections::BTreeSet;
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::path::PathBuf;
 use std::{fs, io::Read};
@@ -32,9 +33,12 @@ use inkwell::llvm_sys::core::{
     LLVMGetInstructionParent, LLVMGetNextUse, LLVMGetNumOperands, LLVMGetOperand, LLVMGetOrdering,
     LLVMGetUser, LLVMIsACallInst, LLVMIsAGlobalAlias, LLVMIsAInstruction, LLVMIsAInvokeInst,
 };
+use inkwell::llvm_sys::error::{LLVMDisposeErrorMessage, LLVMGetErrorMessage};
 use inkwell::llvm_sys::prelude::LLVMValueRef;
+use inkwell::llvm_sys::transforms::pass_builder::LLVMRunPasses;
 use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::Module;
+use inkwell::passes::PassBuilderOptions;
 use inkwell::values::{
     AsValueRef, BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, InstructionValue,
     Operand,
@@ -179,6 +183,9 @@ impl Translator {
         let bytes = read_input(&input)?;
         let context = Context::create();
         let module = parse_module(&context, &input, self.config.input_format, &bytes)?;
+        if let Some(passes) = self.config.pre_passes.as_deref() {
+            run_passes(&module, passes)?;
+        }
         let mut contracts = contracts::load_contracts(&self.config.contracts)?;
         if self.config.enforce_contract.len() > 1 {
             bail!("exactly one --enforce-contract target may be selected per translation");
@@ -294,6 +301,7 @@ impl Translator {
                 path,
                 &module,
                 resolved_machine_model,
+                self.config.pre_passes.as_deref(),
                 &contracts,
                 &self.config.enforce_contract,
                 &symbols,
@@ -687,6 +695,35 @@ fn parse_module<'ctx>(
             .map_err(|err| anyhow!("failed to parse LLVM IR: {err}")),
         InputFormat::Auto => unreachable!("input format should be resolved before parsing"),
     }
+}
+
+/// Run the LLVM pass pipeline `passes` on `module` and verify the result.
+///
+/// No target machine: the pipeline gets LLVM's target-independent cost model, which suffices for
+/// the scalar and memory passes this is meant for.
+fn run_passes(module: &Module<'_>, passes: &str) -> Result<()> {
+    let options = PassBuilderOptions::create();
+    options.set_verify_each(true);
+    let pipeline = CString::new(passes).context("--pre-passes contains a NUL byte")?;
+    let error = unsafe {
+        LLVMRunPasses(
+            module.as_mut_ptr(),
+            pipeline.as_ptr(),
+            std::ptr::null_mut(),
+            options.as_mut_ptr(),
+        )
+    };
+    if !error.is_null() {
+        let message = unsafe { LLVMGetErrorMessage(error) };
+        let text = unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { LLVMDisposeErrorMessage(message) };
+        bail!("--pre-passes `{passes}` failed: {text}");
+    }
+    module
+        .verify()
+        .map_err(|err| anyhow!("--pre-passes `{passes}` produced invalid IR: {err}"))
 }
 
 fn reject_module_inline_asm(module: &Module<'_>) -> Result<()> {

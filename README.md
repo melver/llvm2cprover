@@ -103,10 +103,27 @@ original LLVM symbols, so one manifest serves every variant; `--entry`,
 A manifest name that is not an original symbol is used as written, so a
 manifest may also name the prefixed symbols of one specific variant.
 
+### LLVM pre-passes
+
+`--pre-passes <pipeline>` runs an LLVM pass pipeline, in `opt -passes=` syntax,
+on the parsed module before anything else, with the LLVM llvm2cprover links.
+It helps where unoptimized IR defeats CBMC's constant propagation, e.g. a
+stack temporary larger than `--max-field-sensitivity-array-size` that is
+copied into an object (`sroa` removes the temporary):
+
+```sh
+llvm2cprover --pre-passes sroa input.bc -o input.goto
+```
+
+The optimized module is what gets verified. Passes may remove undefined
+behavior that verification would otherwise report (SROA drops out-of-bounds
+constant-offset accesses to stack slots) or refine `undef`; keep pipelines
+small. An invalid pipeline is an error. The report records the pipeline.
+
 ### Emitting LLVM IR
 
 `--emit-llvm` writes the module after llvm2cprover's LLVM IR transformations
-(currently `--rename-prefix`) as bitcode to the required `-o` instead of
+(`--pre-passes`, then `--rename-prefix`) as bitcode to the required `-o` instead of
 lowering it to GOTO, like other LLVM tools. GOTO-only options (`--entry`,
 `--contracts`, `--report`, ...) are rejected with it:
 
@@ -419,6 +436,7 @@ after successful translation. It includes:
 - contracts used for ordinary instrumentation or replacement
 - the selected enforcement obligation
 - the resolved machine model, raw target triple, and data layout
+- the `--pre-passes` pipeline, if any
 
 The report has a numeric `schema_version`. Contract entries identify their
 `reliance` as `instrumentation`, `replacement`, or `enforcement`. The current
