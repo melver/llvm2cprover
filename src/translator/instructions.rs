@@ -2212,7 +2212,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                 .is_none_or(|symbol| symbol.is_extern),
             _ => true,
         };
-        let canonicalize = self.contains_c_bool(result.typ()) && calls_extern;
+        let canonicalize = util::contains_c_bool(result.typ(), self.symbols) && calls_extern;
         if result.typ() == &return_type && !canonicalize {
             body.push(Stmt::function_call(Some(result), function, arguments, loc));
             return Ok(());
@@ -2253,29 +2253,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(())
     }
 
-    /// Whether `typ` is or contains (as a lane, element, or field) LLVM `i1`'s `c_bool`.
-    fn contains_c_bool(&self, typ: &Type) -> bool {
-        if typ.is_c_bool() {
-            return true;
-        }
-        if typ.is_struct_tag() {
-            return typ.lookup_components(self.symbols).is_some_and(|fields| {
-                fields
-                    .iter()
-                    .any(|field| self.contains_c_bool(&field.typ()))
-            });
-        }
-        typ.base_type()
-            .is_some_and(|lane| (typ.is_array() || typ.is_vector()) && self.contains_c_bool(lane))
-    }
-
     /// `value` with every `c_bool` component normalized to 0 or 1, as LLVM `i1` requires.
     fn canonical_bools(&self, value: Expr) -> Result<Expr> {
         let typ = value.typ().clone();
         if typ.is_c_bool() {
             return Ok(value.cast_to(Type::bool()).cast_to(typ));
         }
-        if !self.contains_c_bool(&typ) {
+        if !util::contains_c_bool(&typ, self.symbols) {
             return Ok(value);
         }
         let components = self
@@ -3452,15 +3436,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                         .into());
                 }
                 let lhs = self.declare_instruction_result(instruction)?;
-                let typ = lhs.typ().clone();
-                let value = if !typ.is_c_bool() && self.contains_c_bool(&typ) {
-                    // `nondet_expr` constrains only a scalar `c_bool`, as CBMC's `nondet_*` does.
-                    let tmp = self.declare_hidden_local("nondet", typ.clone(), loc);
-                    body.push(Stmt::assign(tmp.clone(), util::nondet_expr(typ), loc));
-                    self.canonical_bools(tmp)?
-                } else {
-                    util::nondet_expr(typ)
-                };
+                let value = util::nondet_expr(lhs.typ().clone(), self.symbols);
                 body.push(Stmt::assign(lhs, value, loc));
                 return Ok(true);
             }
@@ -4209,7 +4185,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         let value = self.map_lanes(result.typ(), |lane| {
             let mask = unsafe { LLVMGetMaskValue(instruction.as_value_ref(), lane as u32) };
             if mask < 0 {
-                return Ok(util::nondet_expr(elem_type.clone()));
+                return Ok(util::nondet_expr(elem_type.clone(), self.symbols));
             }
             let index = mask as u64;
             if index < vector1_len {
@@ -4514,7 +4490,7 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         Ok(if return_type == Type::empty() {
             Stmt::ret(None, loc)
         } else {
-            Stmt::ret(Some(util::nondet_expr(return_type)), loc)
+            Stmt::ret(Some(util::nondet_expr(return_type, self.symbols)), loc)
         })
     }
 

@@ -232,7 +232,7 @@ impl Function<'_> {
                     if name.starts_with("nondet_") || name.starts_with("__VERIFIER_nondet_") =>
                 {
                     if let Some(lhs) = lhs {
-                        let nondet = util::nondet_expr(lhs.typ().clone());
+                        let nondet = util::nondet_expr(lhs.typ().clone(), self.symbols);
                         self.code(ASSIGN, &Stmt::assign(lhs.clone(), nondet, loc));
                     }
                 }

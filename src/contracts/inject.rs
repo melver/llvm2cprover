@@ -663,7 +663,10 @@ fn synthesize_assigns_stub(
         .cloned()
         .unwrap_or_else(Type::empty);
     if return_type != Type::empty() {
-        body.push(Stmt::ret(Some(util::nondet_expr(return_type)), loc));
+        body.push(Stmt::ret(
+            Some(util::nondet_expr(return_type, symbols)),
+            loc,
+        ));
     } else {
         body.push(Stmt::ret(None, loc));
     }
@@ -732,7 +735,7 @@ fn synthesize_replacement(
     if let Some(result) = &result {
         body.push(Stmt::assign(
             result.clone(),
-            util::nondet_expr(return_type),
+            util::nondet_expr(return_type, symbols),
             loc,
         ));
     }
@@ -894,7 +897,7 @@ fn assigns_helper_calls(
         ));
         statements.push(Stmt::assign(
             lvalue.clone(),
-            util::nondet_expr(lvalue.typ().clone()),
+            util::nondet_expr(lvalue.typ().clone(), symbols),
             loc,
         ));
     }

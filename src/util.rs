@@ -320,13 +320,55 @@ pub fn parameter_base_names(function: FunctionValue<'_>) -> Vec<String> {
     names
 }
 
-/// Build a nondeterministic expression of `typ`, constraining `c_bool` to `{0, 1}`.
-pub fn nondet_expr(typ: Type) -> Expr {
+/// Build a nondeterministic expression of `typ`, constraining every `c_bool`, also inside an
+/// aggregate, to `{0, 1}`.
+pub fn nondet_expr(typ: Type, symbols: &SymbolTable) -> Expr {
     if typ.is_c_bool() {
-        Expr::nondet(Type::bool()).cast_to(typ)
-    } else {
-        Expr::nondet(typ)
+        return Expr::nondet(Type::bool()).cast_to(typ);
     }
+    if !contains_c_bool(&typ, symbols) {
+        return Expr::nondet(typ);
+    }
+    // CBMC leaves a `c_bool` inside an aggregate nondet unconstrained, so build the aggregate
+    // from per-component nondets instead.
+    if typ.is_struct_tag() {
+        let fields = typ
+            .lookup_components(symbols)
+            .expect("contains_c_bool found the fields");
+        let values = fields
+            .iter()
+            .filter(|field| !field.is_padding())
+            .map(|field| nondet_expr(field.typ(), symbols))
+            .collect();
+        return Expr::struct_expr_from_values(typ, values, symbols);
+    }
+    let (Some(lane), Some(len)) = (typ.base_type(), typ.len()) else {
+        unreachable!("contains_c_bool only descends into structs, arrays and vectors");
+    };
+    let lanes = (0..len)
+        .map(|_| nondet_expr(lane.clone(), symbols))
+        .collect();
+    if typ.is_vector() {
+        Expr::vector_expr(typ, lanes)
+    } else {
+        Expr::array_expr(typ, lanes)
+    }
+}
+
+/// Whether `typ` is or contains (as a lane, element, or field) LLVM `i1`'s `c_bool`.
+pub fn contains_c_bool(typ: &Type, symbols: &SymbolTable) -> bool {
+    if typ.is_c_bool() {
+        return true;
+    }
+    if typ.is_struct_tag() {
+        return typ.lookup_components(symbols).is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|field| contains_c_bool(&field.typ(), symbols))
+        });
+    }
+    typ.base_type()
+        .is_some_and(|lane| (typ.is_array() || typ.is_vector()) && contains_c_bool(lane, symbols))
 }
 
 /// Recover a best-effort source location for one LLVM instruction.
