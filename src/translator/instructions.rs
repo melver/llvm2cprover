@@ -2566,6 +2566,12 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             return Ok(true);
         }
 
+        if callee_name.starts_with("llvm.experimental.cttz.elts.") {
+            let value = self.lower_cttz_elts(callee_name, instruction, args)?;
+            self.assign_result(instruction, body, value)?;
+            return Ok(true);
+        }
+
         if callee_name.starts_with("llvm.vector.reduce.") {
             self.lower_vector_reduce_intrinsic(callee_name, instruction, args, body)?;
             return Ok(true);
@@ -3491,6 +3497,62 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             _ => cmp(lhs.clone(), rhs.clone())?,
         };
         self.assign_result(instruction, body, value)
+    }
+
+    /// `llvm.experimental.cttz.elts`: the index of the first nonzero lane of an integer vector, or
+    /// the lane count if all are zero. With the `is_zero_poison` flag, an all-false mask yields poison
+    /// (nondet), as for `llvm.cttz`.
+    fn lower_cttz_elts(
+        &mut self,
+        callee_name: &str,
+        instruction: InstructionValue<'ctx>,
+        args: &[Expr],
+    ) -> Result<Expr> {
+        let [mask, _] = args else {
+            return Err(self
+                .unsupported_intrinsic(callee_name, "expects two operands")
+                .into());
+        };
+        let zero_is_poison = self.intrinsic_poison_flag(callee_name, args)?;
+        let len = mask
+            .typ()
+            .len()
+            .filter(|_| {
+                mask.typ().is_vector()
+                    && mask
+                        .typ()
+                        .base_type()
+                        .is_some_and(|lane| lane.is_integer() || lane.is_c_bool())
+            })
+            .ok_or_else(|| {
+                self.unsupported_intrinsic(callee_name, "expects a fixed integer vector")
+            })?;
+        let result = self.types.lower_instruction_result(instruction)?;
+        // A return type too narrow for the lane count is undefined behavior for every input.
+        let width = if result.is_c_bool() {
+            Some(1)
+        } else {
+            result.width()
+        };
+        if width.is_none_or(|width| width < 64 && len >> width != 0) {
+            return Err(self
+                .unsupported_intrinsic(
+                    callee_name,
+                    format!("return type too narrow for {len} lanes"),
+                )
+                .into());
+        }
+        let none = if zero_is_poison {
+            self.poison(result.clone())
+        } else {
+            Expr::int_constant(len, result.clone())
+        };
+        (0..len as usize).rev().try_fold(none, |rest, lane| {
+            let set = self
+                .aggregate_component(mask.clone(), lane)?
+                .cast_to(Type::bool());
+            Ok(set.ternary(Expr::int_constant(lane, result.clone()), rest))
+        })
     }
 
     /// `llvm.vector.reduce.<op>` over integer lanes: a left fold with the scalar operator. Integer
