@@ -2201,7 +2201,19 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             .with_symbol(self.function_name.clone())
             .with_location(loc)
         })?;
-        if result.typ() == &return_type {
+        // CBMC (as of 6.11) leaves any `c_bool` in a bodiless callee's nondet return value
+        // unconstrained, unlike its own `nondet_*` and entry-argument nondets, so an `i1` could be
+        // true for a branch and not equal `true`. Normalizing is idempotent, so a CBMC that fixes
+        // this inconsistency stays correct.
+        let calls_extern = match function.value() {
+            ExprValue::Symbol { identifier } => self
+                .symbols
+                .lookup(*identifier)
+                .is_none_or(|symbol| symbol.is_extern),
+            _ => true,
+        };
+        let canonicalize = self.contains_c_bool(result.typ()) && calls_extern;
+        if result.typ() == &return_type && !canonicalize {
             body.push(Stmt::function_call(Some(result), function, arguments, loc));
             return Ok(());
         }
@@ -2231,12 +2243,47 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
             arguments,
             loc,
         ));
-        body.push(Stmt::assign(
-            result.clone(),
-            tmp.cast_to(result.typ().clone()),
-            loc,
-        ));
+        let value = tmp.cast_to(result.typ().clone());
+        let value = if canonicalize {
+            self.canonical_bools(value)?
+        } else {
+            value
+        };
+        body.push(Stmt::assign(result.clone(), value, loc));
         Ok(())
+    }
+
+    /// Whether `typ` is or contains (as a lane, element, or field) LLVM `i1`'s `c_bool`.
+    fn contains_c_bool(&self, typ: &Type) -> bool {
+        if typ.is_c_bool() {
+            return true;
+        }
+        if typ.is_struct_tag() {
+            return typ.lookup_components(self.symbols).is_some_and(|fields| {
+                fields
+                    .iter()
+                    .any(|field| self.contains_c_bool(&field.typ()))
+            });
+        }
+        typ.base_type()
+            .is_some_and(|lane| (typ.is_array() || typ.is_vector()) && self.contains_c_bool(lane))
+    }
+
+    /// `value` with every `c_bool` component normalized to 0 or 1, as LLVM `i1` requires.
+    fn canonical_bools(&self, value: Expr) -> Result<Expr> {
+        let typ = value.typ().clone();
+        if typ.is_c_bool() {
+            return Ok(value.cast_to(Type::bool()).cast_to(typ));
+        }
+        if !self.contains_c_bool(&typ) {
+            return Ok(value);
+        }
+        let components = self
+            .aggregate_components(value)?
+            .into_iter()
+            .map(|component| self.canonical_bools(component))
+            .collect::<Result<_>>()?;
+        self.rebuild_aggregate(typ, components)
     }
 
     fn invoke_args(&mut self, instruction: InstructionValue<'ctx>) -> Result<Vec<Expr>> {
@@ -3405,11 +3452,16 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
                         .into());
                 }
                 let lhs = self.declare_instruction_result(instruction)?;
-                body.push(Stmt::assign(
-                    lhs.clone(),
-                    util::nondet_expr(lhs.typ().clone()),
-                    loc,
-                ));
+                let typ = lhs.typ().clone();
+                let value = if !typ.is_c_bool() && self.contains_c_bool(&typ) {
+                    // `nondet_expr` constrains only a scalar `c_bool`, as CBMC's `nondet_*` does.
+                    let tmp = self.declare_hidden_local("nondet", typ.clone(), loc);
+                    body.push(Stmt::assign(tmp.clone(), util::nondet_expr(typ), loc));
+                    self.canonical_bools(tmp)?
+                } else {
+                    util::nondet_expr(typ)
+                };
+                body.push(Stmt::assign(lhs, value, loc));
                 return Ok(true);
             }
             "same_object" => {
