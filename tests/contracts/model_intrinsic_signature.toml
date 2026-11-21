@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 The llvm2cprover Authors
+
+[functions."llvm.x86.sse2.pmovmskb.128"]
+model = "model_pmovmskb128"

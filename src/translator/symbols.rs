@@ -136,7 +136,8 @@ impl SymbolBuilder {
 
         for function in module.get_functions() {
             let name = function.get_name().to_string_lossy().into_owned();
-            if name.starts_with("llvm.") {
+            // A modeled intrinsic keeps its declaration so its model's signature is validated.
+            if name.starts_with("llvm.") && contracts.function(&name).is_none() {
                 continue;
             }
             if cone
@@ -739,9 +740,6 @@ impl<'ctx> ConeBuilder<'_, 'ctx> {
     }
 
     fn mark_function_reachable(&mut self, name: &str) {
-        if name.starts_with("llvm.") {
-            return;
-        }
         if self.reachable_functions.insert(name.to_owned())
             && let Some(contract) = self.contracts.function(name)
         {

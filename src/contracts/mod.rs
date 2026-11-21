@@ -137,6 +137,8 @@ pub struct FunctionContract {
     /// `ensures` receives that value after the target parameters and before the target result.
     pub snapshot: Option<String>,
     /// Helper function used instead of the original callee.
+    ///
+    /// Required for an LLVM intrinsic target, where it replaces any built-in lowering.
     pub model: Option<String>,
     /// Compiled, observationally read-only helpers describing writable locations.
     ///
@@ -391,6 +393,12 @@ fn validate_function_contract(path: &Path, name: &str, contract: &FunctionContra
             path.display()
         );
     }
+    if name.starts_with("llvm.") && contract.model.is_none() {
+        bail!(
+            "{}: contract for intrinsic `{name}` must define `model`",
+            path.display()
+        );
+    }
     if contract.snapshot.is_some() && contract.ensures.is_none() {
         bail!(
             "{}: contract for `{name}` defines `snapshot` without `ensures`",
@@ -493,6 +501,19 @@ mod tests {
                 .to_string()
                 .contains("defines `snapshot` without `ensures`")
         );
+    }
+
+    #[test]
+    fn rejects_intrinsic_contract_without_model() {
+        let error = super::parse_contracts(
+            r#"
+            [functions."llvm.ctpop.i32"]
+            requires = "requires_ctpop"
+            "#,
+        )
+        .expect_err("an intrinsic contract without a model must fail");
+
+        assert!(error.to_string().contains("must define `model`"));
     }
 
     #[test]

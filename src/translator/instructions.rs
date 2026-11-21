@@ -2462,6 +2462,13 @@ impl<'a, 'ctx, 'c> FunctionLowerer<'a, 'ctx, 'c> {
         args: &[Expr],
         body: &mut Vec<Stmt>,
     ) -> Result<bool> {
+        if callee_name.starts_with("llvm.")
+            && !self.suppress_contracts
+            && self.contracts.function(callee_name).is_some()
+        {
+            // An explicit manifest `model` takes precedence over the built-in lowering.
+            return Ok(false);
+        }
         let loc = self.instruction_location(instruction);
         if callee_name == "__cxa_throw" {
             let exn = args.first().cloned().ok_or_else(|| {

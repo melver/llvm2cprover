@@ -175,6 +175,7 @@ construct. In particular:
 
 - unmatched stateful inline assembly always fails closed; exact manifest
   mappings can route it to compiled model functions
+- unsupported LLVM intrinsics fail closed; a manifest `model` can stand in
 - non-assembly `callbr`, unwind-capable inline assembly, and overlapping
   inline-assembly mappings fail closed
 - contract replacement rejects address-taken targets, indirect uses, and
@@ -377,6 +378,15 @@ model = "__model_read_counter"
 
 Models are trusted assumptions, not contract proofs. Any model or unresolved
 helper relied upon by a translation is recorded by `--report`.
+
+A model can also stand in for an LLVM intrinsic, named exactly as declared in
+the module, including any overload suffix. It takes precedence over a built-in
+lowering, and is the only directive an intrinsic accepts:
+
+```toml
+[functions."llvm.x86.sse2.pmovmskb.128"]
+model = "__model_pmovmskb128"
+```
 
 ## Inline-assembly models
 
