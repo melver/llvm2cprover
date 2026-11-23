@@ -10,7 +10,7 @@ description = "LLVM to GOTO-C translator"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cprover_bindings = { path = "third_party/kani/cprover_bindings" }
-inkwell = { git = "https://github.com/TheDan64/inkwell.git", rev = "3cf0506a4167f149b8fb56fb9714571f927a2306", features = ["llvm23-1"] }
+inkwell = { version = "0.11.0", features = ["llvm23-1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.0"
