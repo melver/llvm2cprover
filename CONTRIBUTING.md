@@ -39,7 +39,9 @@ End-to-end tests live under `tests/<category>/` as standalone `.c`, `.cc`,
 
 `tests/run.py` discovers these files, compiles them, translates via
 llvm2cprover, runs CBMC, and checks the outcome against `expected`. Output is
-TAP. Run with `make test-e2e`.
+TAP. Run with `make test-e2e`. Outputs (`*.goto`) are written next to each
+test; `--tmpdir DIR` mirrors them under `DIR` instead, e.g. for a read-only
+checkout.
 
 `make test-e2e-goto-convert` translates with `--goto-convert` and additionally
 requires CBMC's per-property results to match those of CBMC's own conversion.

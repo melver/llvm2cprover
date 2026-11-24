@@ -247,7 +247,8 @@ def translate_test(
     compile_spec = compile_command(test, args)
     assert compile_spec is not None
     tool, input_format, command = compile_spec
-    module = run_binary_command(command, cwd=ROOT)
+    # rustc creates its temporary directory in the working directory when writing to stdout.
+    module = run_binary_command(command, cwd=args.tmpdir or ROOT)
     if module.returncode != 0:
         return (tool, decode_result(module))
     return translate_module(
@@ -430,6 +431,15 @@ def trim_output(label: str, text: str, limit: int = 20) -> list[str]:
     return head
 
 
+def output_path(test: TestCase, args: argparse.Namespace, suffix: str) -> Path:
+    """Where a test's `suffix` output goes: next to the test, or mirrored under `--tmpdir`."""
+    if args.tmpdir is None:
+        return test.path.with_suffix(suffix)
+    path = args.tmpdir / test.path.relative_to(TESTS).with_suffix(suffix)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def run_test(test: TestCase, args: argparse.Namespace) -> RunResult:
     if test.skip:
         summary = test.skip_reason or "skipped"
@@ -438,7 +448,7 @@ def run_test(test: TestCase, args: argparse.Namespace) -> RunResult:
         return RunResult(True, ("contract enforcement needs CBMC's DFCC",), skipped=True)
     if args.esbmc and test.esbmc_skip:
         return RunResult(True, (test.esbmc_skip,), skipped=True)
-    goto_path = test.path.with_suffix(".goto")
+    goto_path = output_path(test, args, ".goto")
     mode_flags: tuple[str, ...] = ()
     if args.esbmc:
         mode_flags = ("--esbmc",)
@@ -464,7 +474,7 @@ def run_test(test: TestCase, args: argparse.Namespace) -> RunResult:
         return RunResult(False, command_details(tool, cbmc))
     if args.goto_convert:
         # Differential check: CBMC's own conversion of the symbol-table-only output is the oracle.
-        reference_path = test.path.with_suffix(".symtab.goto")
+        reference_path = output_path(test, args, ".symtab.goto")
         tool, reference = translate_test(test, args, reference_path)
         if reference.returncode == 0:
             tool, reference = verify_cbmc(test, args, reference_path, ())
@@ -509,6 +519,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goto-cc", default="goto-cc")
     parser.add_argument("--goto-instrument", default="goto-instrument")
     parser.add_argument("--esbmc-bin", default="esbmc")
+    parser.add_argument(
+        "--tmpdir",
+        type=lambda path: Path(path).resolve(),
+        help="write *.goto outputs here instead of next to each test",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--goto-convert",
@@ -521,6 +536,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.tmpdir is not None:
+        args.tmpdir.mkdir(parents=True, exist_ok=True)
     tests = discover_tests(args.filter)
     print("TAP version 14")
     if not tests:
