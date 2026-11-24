@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 The llvm2cprover Authors
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # llvm-sys needs an exact LLVM major.minor; clang and rustc must not emit newer bitcode.
+  LLVM_VERSION: 23.1.6
+  RUST_VERSION: 1.99.1
+  CBMC_VERSION: 6.11.0
+
+jobs:
+  make:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/llvm
+          key: llvm-${{ env.LLVM_VERSION }}
+
+      # The release tarball is ~2 GB compressed and 12 GB extracted; keep only what the build
+      # (llvm-config, headers, static libraries) and the tests (clang) need. The key pins
+      # immutable content, so the cache needs no maintenance; stale versions age out.
+      - if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/llvm
+          curl -fsSL --retry 3 "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz" |
+            tar -xJ -C ~/llvm --strip-components=1 --wildcards \
+              '*/bin/clang' '*/bin/clang-[0-9]*' '*/bin/llvm-config' \
+              '*/include/llvm' '*/include/llvm-c' '*/lib/*.a' '*/lib/clang'
+
+      - run: echo "$HOME/llvm/bin" >> "$GITHUB_PATH"
+
+      - run: |
+          curl -fsSLO --retry 3 "https://github.com/diffblue/cbmc/releases/download/cbmc-${CBMC_VERSION}/ubuntu-24.04-cbmc-${CBMC_VERSION}-Linux.deb"
+          sudo apt-get install -y "./ubuntu-24.04-cbmc-${CBMC_VERSION}-Linux.deb"
+
+      - run: make
